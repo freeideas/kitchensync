@@ -133,6 +133,64 @@ try writer.print("message", .{});                     // always need format args
 - Provide stateless pattern matching functions
 - Support the GlobFilter struct used by sync engine
 
+## Directory Operations and Performance
+
+### Current Implementation
+KitchenSync uses Zig's standard library directory iteration which provides:
+- Directory iterator with `entry.name` and `entry.kind`
+- Requires separate `openFileAbsolute()` and `stat()` calls for file metadata
+- Cross-platform compatibility through Zig abstractions
+
+### Performance Considerations
+For each file comparison, the current implementation:
+1. Opens both source and destination files (`openFileAbsolute`)
+2. Calls `stat()` on each file to get size and modification time
+3. Makes comparison decision based on metadata
+
+This results in 2 system calls per file, which can be slow for large directory trees.
+
+### Optimization Opportunities
+For improved performance with large directory trees, see [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md) which provides:
+- Platform-specific implementations using `FindFirstFile/FindNextFile` (Windows) and `getdents64` (Linux)
+- Batch metadata retrieval to minimize system calls
+- Complete working code examples for both platforms
+
+**Important**: Any optimization should maintain the streaming architecture - never load entire directory listings into memory.
+
+### Directory Traversal Pattern
+```zig
+// CRITICAL: Check entry type before file operations
+if (entry.kind == .directory) {
+    // Handle directories: add to tracking, then recurse
+    const dir_info = try allocator.create(FileInfo);
+    dir_info.* = FileInfo{
+        .path = try allocator.dupe(u8, entry_path),
+        .size = 0,  // Directories have no meaningful size
+        .mtime = 0, // Or get directory mtime if needed
+        .is_dir = true,
+    };
+    try processed_paths.put(rel_path_owned);
+    
+    // Recursively traverse the directory
+    try traverseDirectory(allocator, root_path, entry_path, config);
+} else {
+    // Handle files: open for stat collection
+    const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
+        // Log error and continue
+        continue;
+    };
+    defer file.close();
+    const stat = try file.stat();
+    // ... process file stats
+}
+```
+
+**Key Points:**
+- Always check `entry.kind` before attempting file operations
+- Never use `openFileAbsolute()` on directories - will fail with `IsDir` error
+- Directories need recursive traversal, files need stat collection
+- Both directories and files should be tracked for deletion detection
+
 ## Data Structures
 
 ### Config
@@ -404,48 +462,6 @@ const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
 
 This pattern ensures antivirus software, file locks, or permission issues don't stop the entire synchronization.
 
-### Directory vs File Handling (CRITICAL)
-**NEVER use `openFileAbsolute()` on directories** - this will fail with `IsDir` error on Windows and other platforms:
-
-```zig
-// WRONG - Will fail on all directories with "IsDir" error:
-const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-    // This fails for every directory: autologon, cmdbin, etc.
-    continue;
-};
-
-// RIGHT - Check entry type first:
-if (entry.kind == .directory) {
-    // Handle directories: add to file map with is_dir: true, then recurse
-    const dir_info = try allocator.create(FileInfo);
-    dir_info.* = FileInfo{
-        .path = try allocator.dupe(u8, entry_path),
-        .size = 0,  // Directories have no meaningful size
-        .mtime = 0, // Or get directory mtime if needed
-        .is_dir = true,
-    };
-    try files.put(rel_path_owned, dir_info);
-    
-    // Then recursively traverse the directory
-    try traverseDirectory(allocator, root_path, entry_path, files, config);
-} else {
-    // Handle files: open for stat collection
-    const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-        // Log error and continue
-        continue;
-    };
-    defer file.close();
-    const stat = try file.stat();
-    // ... process file stats
-}
-```
-
-**Key Points:**
-- Always check `entry.kind` before attempting file operations
-- Directories need recursive traversal, files need stat collection
-- Both directories and files should be added to the FileInfo map
-- Use `is_dir: true` for directories in FileInfo structure
-
 - Note: Files excluded by patterns or timestamps are not counted. Tracking exclusions would require processing all files in excluded directories rather than skipping them efficiently, adding complexity without significant user benefit.
 
 ### `src/fileops.zig` (~150 lines)
@@ -650,7 +666,7 @@ pub fn formatArchiveTimestamp(allocator: *Allocator, nanos: i128) ![]u8 {
 - Document ownership clearly in function signatures
 
 ### HashMap and Dynamic Array Cleanup Pattern (CRITICAL)
-**⚠️  IMPLEMENTATION TIP: This is the #1 source of memory leaks in this project.**
+**⚠  IMPLEMENTATION TIP: This is the #1 source of memory leaks in this project.**
 
 **Important clarification**: With the streaming architecture, HashMaps are NOT used for storing file lists. However, this pattern is still critical for:
 - Error collection arrays in `sync.zig`
@@ -716,6 +732,7 @@ This pattern appears in:
 - Batch file operations where possible
 - Use size comparison before expensive mtime checks
 - Handle network filesystems gracefully
+- See [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md) for platform-specific optimization strategies
 
 ## Testing Considerations
 - Add 2ms delays between operations creating timestamped directories

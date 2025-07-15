@@ -203,7 +203,7 @@ KitchenSync Configuration:
 Unless verbosity is set to 0 (silent mode), KitchenSync logs a message to the console for every change it makes. Each message is prefixed with a timestamp showing second precision. The verbosity levels are:
 - **0 (silent)**: No output except errors and final summary
 - **1 (normal)**: Standard sync operations (copying, archiving, errors)
-- **2 (verbose IO)**: All operations plus detailed IO activities (file scanning, stat calls, directory creation attempts)
+- **2 (verbose IO)**: All operations plus directory-level IO activities (metadata loading, directory traversal, processing summaries)
 
 ### Path Display in Logs
 
@@ -236,28 +236,23 @@ When an error occurs during an operation, the error message appears immediately 
 
 ### Verbose IO Mode (`-v=2`)
 
-When verbosity is set to 2, KitchenSync logs every IO operation, which is useful for diagnosing performance issues or hanging operations. This mode shows:
+When verbosity is set to 2, KitchenSync logs significant IO operations to help diagnose performance bottlenecks. To minimize overhead, only major IO operations are logged:
 
-- Directory traversal operations
-- Stat calls on individual files and directories
-- Directory creation attempts
-- File comparison operations
-- Archive directory setup
+- Directory read operations
+- Directory creation
+- File operations (copy, move)
 
 Example verbose IO output:
 ```
-[2025-01-01_10:23:30] traversing directory: /home/user/documents
-[2025-01-01_10:23:30] stat: /home/user/documents/file1.txt
-[2025-01-01_10:23:30] comparing: /home/user/documents/file1.txt vs /backup/documents/file1.txt
-[2025-01-01_10:23:30] stat: /home/user/documents/file2.pdf
-[2025-01-01_10:23:31] comparing: /home/user/documents/file2.pdf vs /backup/documents/file2.pdf
-[2025-01-01_10:23:32] creating archive directory: /backup/documents/.kitchensync/2025-01-01_10-23-32.456
+[2025-01-01_10:23:30] reading directory: /home/user/documents
+[2025-01-01_10:23:30] reading directory: /backup/documents
+[2025-01-01_10:23:32] creating directory: /backup/documents/.kitchensync/2025-01-01_10-23-32.456
 [2025-01-01_10:23:32] moving to .kitchensync: /backup/documents/file2.pdf
 [2025-01-01_10:23:33] copying /home/user/documents/file2.pdf
-[2025-01-01_10:23:33] traversing directory: /home/user/documents/subdir
+[2025-01-01_10:23:33] reading directory: /home/user/documents/subdir
 ```
 
-This detailed logging helps identify which specific IO operation is slow when troubleshooting performance issues or apparent hangs. Note that with the streaming architecture, files are processed immediately as they're discovered during directory traversal.
+This detailed logging helps identify which directories are slow to process when troubleshooting performance issues. The optimized metadata loading means file information is gathered in batches per directory rather than one file at a time.
 
 ### Error Handling
 
