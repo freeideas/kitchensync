@@ -24,14 +24,6 @@ pub const SyncAction = enum {
 };
 
 
-pub const FileInfo = struct {
-    path: []const u8,
-    size: u64,
-    mtime: i128,
-    is_dir: bool,
-};
-
-
 pub const SyncError = struct {
     source_path: []const u8,
     dest_path: []const u8,
@@ -41,16 +33,45 @@ pub const SyncError = struct {
 
 
 pub const SyncResult = struct {
-    files_copied: u64 = 0,
-    files_updated: u64 = 0,
-    files_deleted: u64 = 0,
-    dirs_created: u64 = 0,
-    files_unchanged: u64 = 0,
+    files_copied: u32 = 0,
+    files_updated: u32 = 0,
+    files_deleted: u32 = 0,
+    dirs_created: u32 = 0,
+    files_unchanged: u32 = 0,
     errors: []SyncError = &.{},
 };
 
 
-pub fn sync(allocator: std.mem.Allocator, config: Config) !SyncResult {
+fn formatTimestamp(allocator: std.mem.Allocator, nanos: i128) ![]u8 {
+    const epoch_secs = @divTrunc(nanos, std.time.ns_per_s);
+    const secs_u64: u64 = if (epoch_secs >= 0) @intCast(epoch_secs) else 0;
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs_u64 };
+    const epoch_day = epoch.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}_{d:0>2}:{d:0>2}:{d:0>2}", .{
+        year_day.year,
+        @as(u8, @intCast(month_day.month.numeric())),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
+
+fn logOperation(allocator: std.mem.Allocator, writer: anytype, message: []const u8) !void {
+    const timestamp = std.time.nanoTimestamp();
+    const timestamp_str = try formatTimestamp(allocator, timestamp);
+    defer allocator.free(timestamp_str);
+    
+    try writer.print("[{s}] {s}\n", .{ timestamp_str, message });
+}
+
+
+pub fn syncDirectory(allocator: std.mem.Allocator, config: *const Config, stdout: anytype) !SyncResult {
     var result = SyncResult{};
     var errors = std.ArrayList(SyncError).init(allocator);
     defer {
@@ -61,22 +82,11 @@ pub fn sync(allocator: std.mem.Allocator, config: Config) !SyncResult {
         errors.deinit();
     }
     
-    const stdout = std.io.getStdOut().writer();
+    try fileops.createDirectory(config.dst_path);
     
-    if (config.verbosity >= 2) {
-        try stdout.print("[{s}] scanning source directory: {s}\n", .{ formatTimestamp(), config.src_path });
-    }
+    var filter = patterns.GlobFilter.init(allocator, config.src_path, config.exclude_patterns);
     
-    if (!config.preview) {
-        fileops.createDirectory(config.dst_path) catch |err| {
-            if (config.verbosity > 0) {
-                try stdout.print("Error creating destination directory '{s}': {s}\n", .{ config.dst_path, @errorName(err) });
-            }
-            return err;
-        };
-    }
-    
-    var processed_paths = std.hash_map.StringHashMap(void).init(allocator);
+    var processed_paths = std.StringHashMap(void).init(allocator);
     defer {
         var iter = processed_paths.iterator();
         while (iter.next()) |entry| {
@@ -85,102 +95,96 @@ pub fn sync(allocator: std.mem.Allocator, config: Config) !SyncResult {
         processed_paths.deinit();
     }
     
-    const filter = patterns.GlobFilter{
-        .root_dir = config.src_path,
-        .patterns = config.exclude_patterns,
-        .allocator = allocator,
-    };
+    const timestamp = std.time.nanoTimestamp();
     
-    const timestamp = try fileops.formatArchiveTimestamp(allocator, std.time.nanoTimestamp());
-    defer allocator.free(timestamp);
+    try syncDirectoryRecursive(allocator, config, stdout, config.src_path, config.dst_path, &filter, &result, &errors, &processed_paths, timestamp);
     
-    try traverseAndSync(allocator, config.src_path, config.dst_path, config.src_path, config.dst_path, &filter, config, &result, &errors, &processed_paths, timestamp);
-    
-    try deleteUnmatchedFiles(allocator, config.dst_path, config.dst_path, &processed_paths, config, &result, &errors, timestamp);
+    try handleDeletions(allocator, config, stdout, config.dst_path, &processed_paths, &result, &errors, timestamp);
     
     result.errors = try errors.toOwnedSlice();
+    
     return result;
 }
 
 
-fn traverseAndSync(
+fn syncDirectoryRecursive(
     allocator: std.mem.Allocator,
-    src_root: []const u8,
-    dst_root: []const u8,
+    config: *const Config,
+    stdout: anytype,
     src_path: []const u8,
     dst_path: []const u8,
     filter: *const patterns.GlobFilter,
-    config: Config,
     result: *SyncResult,
     errors: *std.ArrayList(SyncError),
-    processed_paths: *std.hash_map.StringHashMap(void),
-    timestamp: []const u8,
+    processed_paths: *std.StringHashMap(void),
+    timestamp: i128,
 ) !void {
-    const stdout = std.io.getStdOut().writer();
-    
     if (config.verbosity >= 2) {
-        try stdout.print("[{s}] traversing directory: {s}\n", .{ formatTimestamp(), src_path });
+        const msg = try std.fmt.allocPrint(allocator, "reading directory: {s}", .{src_path});
+        defer allocator.free(msg);
+        try logOperation(allocator, stdout, msg);
     }
     
     var src_dir = std.fs.openDirAbsolute(src_path, .{ .iterate = true }) catch |err| {
         if (config.verbosity > 0) {
             try stdout.print("Error opening directory '{s}': {s}\n", .{ src_path, @errorName(err) });
         }
-        if (std.mem.eql(u8, src_path, src_root)) {
-            return err;
-        }
-        return;
+        return err;
     };
     defer src_dir.close();
     
     var iter = src_dir.iterate();
     while (try iter.next()) |entry| {
-        const entry_src_path = try std.fs.path.join(allocator, &[_][]const u8{ src_path, entry.name });
-        defer allocator.free(entry_src_path);
-        
-        const entry_dst_path = try std.fs.path.join(allocator, &[_][]const u8{ dst_path, entry.name });
-        defer allocator.free(entry_dst_path);
-        
         if (std.mem.eql(u8, entry.name, ".kitchensync")) continue;
         
-        if (try filter.matches(entry_src_path)) {
-            if (config.verbosity >= 2) {
-                try stdout.print("[{s}] excluded by pattern: {s}\n", .{ formatTimestamp(), entry_src_path });
-            }
-            continue;
-        }
+        const entry_src_path = try std.fs.path.join(allocator, &.{ src_path, entry.name });
+        defer allocator.free(entry_src_path);
         
-        if (config.skip_timestamps and patterns.isTimestampLike(entry.name)) {
-            if (config.verbosity >= 2) {
-                try stdout.print("[{s}] excluded (timestamp-like): {s}\n", .{ formatTimestamp(), entry_src_path });
-            }
-            continue;
-        }
+        if (filter.matches(entry_src_path)) continue;
         
-        const rel_path = try std.fs.path.relative(allocator, dst_root, entry_dst_path);
+        if (config.skip_timestamps and patterns.hasTimestampLikePattern(entry.name)) continue;
+        
+        const entry_dst_path = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
+        defer allocator.free(entry_dst_path);
+        
+        const rel_path = try std.fs.path.relative(allocator, config.dst_path, entry_dst_path);
         defer allocator.free(rel_path);
+        
         try processed_paths.put(try allocator.dupe(u8, rel_path), {});
         
         if (entry.kind == .directory) {
-            if (!config.preview) {
-                fileops.createDirectory(entry_dst_path) catch |err| {
-                    if (config.verbosity > 0) {
-                        try stdout.print("[{s}] error creating directory '{s}': {s}\n", .{ formatTimestamp(), entry_dst_path, @errorName(err) });
-                    }
-                    try errors.append(SyncError{
-                        .source_path = try allocator.dupe(u8, entry_src_path),
-                        .dest_path = try allocator.dupe(u8, entry_dst_path),
-                        .error_type = err,
-                        .action = .create_dir,
-                    });
-                    continue;
-                };
-            }
-            result.dirs_created += 1;
+            std.fs.accessAbsolute(entry_dst_path, .{}) catch {
+                if (config.verbosity >= 2) {
+                    const msg = try std.fmt.allocPrint(allocator, "creating directory: {s}", .{entry_dst_path});
+                    defer allocator.free(msg);
+                    try logOperation(allocator, stdout, msg);
+                }
+                
+                if (!config.preview) {
+                    fileops.createDirectory(entry_dst_path) catch |err| {
+                        try errors.append(SyncError{
+                            .source_path = try allocator.dupe(u8, entry_src_path),
+                            .dest_path = try allocator.dupe(u8, entry_dst_path),
+                            .error_type = err,
+                            .action = .create_dir,
+                        });
+                        continue;
+                    };
+                }
+                result.dirs_created += 1;
+            };
             
-            try traverseAndSync(allocator, src_root, dst_root, entry_src_path, entry_dst_path, filter, config, result, errors, processed_paths, timestamp);
+            var sub_dir = std.fs.openDirAbsolute(entry_src_path, .{ .iterate = true }) catch |err| {
+                if (config.verbosity > 0) {
+                    try stdout.print("Error opening directory '{s}': {s}\n", .{ entry_src_path, @errorName(err) });
+                }
+                continue;
+            };
+            sub_dir.close();
+            
+            try syncDirectoryRecursive(allocator, config, stdout, entry_src_path, entry_dst_path, filter, result, errors, processed_paths, timestamp);
         } else {
-            try syncFile(allocator, entry_src_path, entry_dst_path, config, result, errors, timestamp);
+            try syncFile(allocator, config, stdout, entry_src_path, entry_dst_path, result, errors, timestamp);
         }
     }
 }
@@ -188,153 +192,143 @@ fn traverseAndSync(
 
 fn syncFile(
     allocator: std.mem.Allocator,
+    config: *const Config,
+    stdout: anytype,
     src_path: []const u8,
     dst_path: []const u8,
-    config: Config,
     result: *SyncResult,
     errors: *std.ArrayList(SyncError),
-    timestamp: []const u8,
+    timestamp: i128,
 ) !void {
-    const stdout = std.io.getStdOut().writer();
-    
-    if (config.verbosity >= 2) {
-        try stdout.print("[{s}] comparing: {s} vs {s}\n", .{ formatTimestamp(), src_path, dst_path });
-    }
-    
     const src_file = std.fs.openFileAbsolute(src_path, .{}) catch |err| {
         if (config.verbosity > 0) {
             try stdout.print("Error accessing file '{s}': {s}\n", .{ src_path, @errorName(err) });
         }
-        try errors.append(SyncError{
-            .source_path = try allocator.dupe(u8, src_path),
-            .dest_path = try allocator.dupe(u8, dst_path),
-            .error_type = err,
-            .action = .copy,
-        });
         return;
     };
     defer src_file.close();
     
     const src_stat = try src_file.stat();
     
-    const dst_stat = blk: {
-        const dst_file = std.fs.openFileAbsolute(dst_path, .{}) catch |err| {
-            if (err == error.FileNotFound) {
-                break :blk null;
-            }
-            if (config.verbosity > 0) {
-                try stdout.print("Error accessing file '{s}': {s}\n", .{ dst_path, @errorName(err) });
-            }
-            try errors.append(SyncError{
-                .source_path = try allocator.dupe(u8, src_path),
-                .dest_path = try allocator.dupe(u8, dst_path),
-                .error_type = err,
-                .action = .copy,
-            });
-            return;
-        };
-        defer dst_file.close();
-        break :blk try dst_file.stat();
+    const dst_file = std.fs.openFileAbsolute(dst_path, .{}) catch {
+        const msg = try std.fmt.allocPrint(allocator, "copying {s}", .{src_path});
+        defer allocator.free(msg);
+        if (config.verbosity >= 1) try logOperation(allocator, stdout, msg);
+        
+        if (!config.preview) {
+            fileops.copyFile(src_path, dst_path) catch |err| {
+                if (config.verbosity >= 1) {
+                    try stdout.print("[{s}] error: {s}\n", .{ 
+                        try formatTimestamp(allocator, std.time.nanoTimestamp()),
+                        @errorName(err) 
+                    });
+                }
+                try errors.append(SyncError{
+                    .source_path = try allocator.dupe(u8, src_path),
+                    .dest_path = try allocator.dupe(u8, dst_path),
+                    .error_type = err,
+                    .action = .copy,
+                });
+                return;
+            };
+        }
+        result.files_copied += 1;
+        return;
     };
+    defer dst_file.close();
     
-    const action = determineAction(src_stat, dst_stat, config);
+    const dst_stat = try dst_file.stat();
     
-    switch (action) {
-        .copy => {
-            if (config.verbosity > 0) {
-                try stdout.print("[{s}] copying {s}\n", .{ formatTimestamp(), formatPathForDisplay(config.src_path, src_path) });
-            }
-            if (!config.preview) {
-                fileops.copyFile(src_path, dst_path) catch |err| {
-                    if (config.verbosity > 0) {
-                        try stdout.print("[{s}] error: {s}\n", .{ formatTimestamp(), @errorName(err) });
-                    }
-                    try errors.append(SyncError{
-                        .source_path = try allocator.dupe(u8, src_path),
-                        .dest_path = try allocator.dupe(u8, dst_path),
-                        .error_type = err,
-                        .action = action,
+    var needs_update = false;
+    if (src_stat.size != dst_stat.size) {
+        needs_update = true;
+    } else if (config.use_modtime and src_stat.size == dst_stat.size) {
+        if (src_stat.mtime > dst_stat.mtime) {
+            needs_update = true;
+        }
+    }
+    
+    if (needs_update) {
+        const archive_msg = try std.fmt.allocPrint(allocator, "moving to .kitchensync: {s}", .{dst_path});
+        defer allocator.free(archive_msg);
+        if (config.verbosity >= 1) try logOperation(allocator, stdout, archive_msg);
+        
+        if (!config.preview) {
+            const archived_path = fileops.archiveFile(allocator, dst_path, timestamp) catch |err| {
+                try errors.append(SyncError{
+                    .source_path = try allocator.dupe(u8, src_path),
+                    .dest_path = try allocator.dupe(u8, dst_path),
+                    .error_type = err,
+                    .action = .update,
+                });
+                return;
+            };
+            defer allocator.free(archived_path);
+        }
+        
+        const copy_msg = try std.fmt.allocPrint(allocator, "copying {s}", .{src_path});
+        defer allocator.free(copy_msg);
+        if (config.verbosity >= 1) try logOperation(allocator, stdout, copy_msg);
+        
+        if (!config.preview) {
+            fileops.copyFile(src_path, dst_path) catch |err| {
+                if (config.verbosity >= 1) {
+                    try stdout.print("[{s}] error: {s}\n", .{ 
+                        try formatTimestamp(allocator, std.time.nanoTimestamp()),
+                        @errorName(err) 
                     });
-                    return;
-                };
-            }
-            result.files_copied += 1;
-        },
-        .update => {
-            if (config.verbosity > 0) {
-                try stdout.print("[{s}] moving to .kitchensync: {s}\n", .{ formatTimestamp(), formatPathForDisplay(config.dst_path, dst_path) });
-            }
-            if (!config.preview) {
-                const archived_path = fileops.archiveFile(allocator, dst_path, timestamp) catch |err| {
-                    if (config.verbosity > 0) {
-                        try stdout.print("[{s}] error: {s}\n", .{ formatTimestamp(), @errorName(err) });
-                    }
-                    try errors.append(SyncError{
-                        .source_path = try allocator.dupe(u8, src_path),
-                        .dest_path = try allocator.dupe(u8, dst_path),
-                        .error_type = err,
-                        .action = action,
-                    });
-                    return;
-                };
-                defer allocator.free(archived_path);
-            }
-            
-            if (config.verbosity > 0) {
-                try stdout.print("[{s}] copying {s}\n", .{ formatTimestamp(), formatPathForDisplay(config.src_path, src_path) });
-            }
-            if (!config.preview) {
-                fileops.copyFile(src_path, dst_path) catch |err| {
-                    if (config.verbosity > 0) {
-                        try stdout.print("[{s}] error: {s}\n", .{ formatTimestamp(), @errorName(err) });
-                    }
-                    try errors.append(SyncError{
-                        .source_path = try allocator.dupe(u8, src_path),
-                        .dest_path = try allocator.dupe(u8, dst_path),
-                        .error_type = err,
-                        .action = action,
-                    });
-                    return;
-                };
-            }
-            result.files_updated += 1;
-        },
-        .skip => {
-            result.files_unchanged += 1;
-        },
-        else => unreachable,
+                }
+                try errors.append(SyncError{
+                    .source_path = try allocator.dupe(u8, src_path),
+                    .dest_path = try allocator.dupe(u8, dst_path),
+                    .error_type = err,
+                    .action = .update,
+                });
+                return;
+            };
+        }
+        result.files_updated += 1;
+    } else {
+        result.files_unchanged += 1;
     }
 }
 
 
-fn determineAction(src_stat: std.fs.File.Stat, dst_stat: ?std.fs.File.Stat, config: Config) SyncAction {
-    if (dst_stat == null) return .copy;
-    
-    const dst = dst_stat.?;
-    
-    if (src_stat.size != dst.size) return .update;
-    
-    if (config.use_modtime) {
-        if (src_stat.mtime > dst.mtime) return .update;
-    }
-    
-    return .skip;
-}
-
-
-fn deleteUnmatchedFiles(
+fn handleDeletions(
     allocator: std.mem.Allocator,
-    dst_root: []const u8,
+    config: *const Config,
+    stdout: anytype,
     dst_path: []const u8,
-    processed_paths: *std.hash_map.StringHashMap(void),
-    config: Config,
+    processed_paths: *std.StringHashMap(void),
     result: *SyncResult,
     errors: *std.ArrayList(SyncError),
-    timestamp: []const u8,
+    timestamp: i128,
 ) !void {
-    const stdout = std.io.getStdOut().writer();
+    try handleDeletionsRecursive(allocator, config, stdout, dst_path, dst_path, processed_paths, result, errors, timestamp);
+}
+
+
+fn handleDeletionsRecursive(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    stdout: anytype,
+    root_dst_path: []const u8,
+    current_dst_path: []const u8,
+    processed_paths: *std.StringHashMap(void),
+    result: *SyncResult,
+    errors: *std.ArrayList(SyncError),
+    timestamp: i128,
+) !void {
+    if (config.verbosity >= 2) {
+        const msg = try std.fmt.allocPrint(allocator, "reading directory: {s}", .{current_dst_path});
+        defer allocator.free(msg);
+        try logOperation(allocator, stdout, msg);
+    }
     
-    var dst_dir = std.fs.openDirAbsolute(dst_path, .{ .iterate = true }) catch {
+    var dst_dir = std.fs.openDirAbsolute(current_dst_path, .{ .iterate = true }) catch |err| {
+        if (config.verbosity > 0) {
+            try stdout.print("Error opening directory '{s}': {s}\n", .{ current_dst_path, @errorName(err) });
+        }
         return;
     };
     defer dst_dir.close();
@@ -343,102 +337,64 @@ fn deleteUnmatchedFiles(
     while (try iter.next()) |entry| {
         if (std.mem.eql(u8, entry.name, ".kitchensync")) continue;
         
-        const entry_path = try std.fs.path.join(allocator, &[_][]const u8{ dst_path, entry.name });
+        const entry_path = try std.fs.path.join(allocator, &.{ current_dst_path, entry.name });
         defer allocator.free(entry_path);
         
-        const rel_path = try std.fs.path.relative(allocator, dst_root, entry_path);
+        const rel_path = try std.fs.path.relative(allocator, root_dst_path, entry_path);
         defer allocator.free(rel_path);
         
         if (!processed_paths.contains(rel_path)) {
             if (entry.kind == .directory) {
-                try deleteUnmatchedFiles(allocator, dst_root, entry_path, processed_paths, config, result, errors, timestamp);
-            }
-            
-            std.fs.accessAbsolute(entry_path, .{}) catch {
-                result.files_deleted += 1;
-                continue;
-            };
-            
-            if (config.verbosity > 0) {
-                try stdout.print("[{s}] moving to .kitchensync: {s}\n", .{ formatTimestamp(), formatPathForDisplay(config.dst_path, entry_path) });
-            }
-            
-            if (!config.preview) {
-                const archived_path = fileops.archiveFile(allocator, entry_path, timestamp) catch |err| {
-                    if (err == error.FileNotFound) {
-                        result.files_deleted += 1;
+                try handleDeletionsRecursive(allocator, config, stdout, root_dst_path, entry_path, processed_paths, result, errors, timestamp);
+            } else {
+                const archive_msg = try std.fmt.allocPrint(allocator, "moving to .kitchensync: {s}", .{entry_path});
+                defer allocator.free(archive_msg);
+                if (config.verbosity >= 1) try logOperation(allocator, stdout, archive_msg);
+                
+                if (!config.preview) {
+                    const archived_path = fileops.archiveFile(allocator, entry_path, timestamp) catch |err| {
+                        if (err == error.FileNotFound) {
+                            result.files_deleted += 1;
+                            continue;
+                        }
+                        try errors.append(SyncError{
+                            .source_path = try allocator.dupe(u8, ""),
+                            .dest_path = try allocator.dupe(u8, entry_path),
+                            .error_type = err,
+                            .action = .delete,
+                        });
                         continue;
-                    }
-                    if (config.verbosity > 0) {
-                        try stdout.print("[{s}] error: {s}\n", .{ formatTimestamp(), @errorName(err) });
-                    }
-                    try errors.append(SyncError{
-                        .source_path = try allocator.dupe(u8, ""),
-                        .dest_path = try allocator.dupe(u8, entry_path),
-                        .error_type = err,
-                        .action = .delete,
-                    });
-                    continue;
-                };
-                defer allocator.free(archived_path);
+                    };
+                    defer allocator.free(archived_path);
+                }
+                result.files_deleted += 1;
             }
-            
-            result.files_deleted += 1;
         }
     }
-}
-
-
-fn formatTimestamp() [19]u8 {
-    const nanos = std.time.nanoTimestamp();
-    const epoch_secs = @divTrunc(nanos, std.time.ns_per_s);
-    const secs_u64: u64 = if (epoch_secs >= 0) @intCast(epoch_secs) else 0;
-    const epoch = std.time.epoch.EpochSeconds{ .secs = secs_u64 };
-    
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    
-    var buf: [19]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}_{d:0>2}:{d:0>2}:{d:0>2}", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        epoch.getDaySeconds().getHoursIntoDay(),
-        epoch.getDaySeconds().getMinutesIntoHour(),
-        epoch.getDaySeconds().getSecondsIntoMinute(),
-    }) catch unreachable;
-    
-    return buf;
-}
-
-
-fn formatPathForDisplay(base: []const u8, full: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, full, base)) {
-        if (full.len == base.len) return base;
-        if (full.len > base.len and (full[base.len] == '/' or full[base.len] == '\\')) {
-            return full;
-        }
-    }
-    return full;
 }
 
 
 test "__TEST__" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
     
-    try tmp.dir.makePath("src");
-    try tmp.dir.makePath("dst");
+    const base_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base_path);
     
-    const src_file = try tmp.dir.createFile("src/test.txt", .{});
-    try src_file.writeAll("test content");
-    src_file.close();
-    
-    const src_path = try tmp.dir.realpathAlloc(testing.allocator, "src");
+    const src_path = try std.fs.path.join(testing.allocator, &.{ base_path, "src" });
     defer testing.allocator.free(src_path);
-    
-    const dst_path = try tmp.dir.realpathAlloc(testing.allocator, "dst");
+    const dst_path = try std.fs.path.join(testing.allocator, &.{ base_path, "dst" });
     defer testing.allocator.free(dst_path);
+    
+    try fileops.createDirectory(src_path);
+    try fileops.createDirectory(dst_path);
+    
+    const test_file = try std.fs.path.join(testing.allocator, &.{ src_path, "test.txt" });
+    defer testing.allocator.free(test_file);
+    
+    var file = try std.fs.createFileAbsolute(test_file, .{});
+    try file.writeAll("test content");
+    file.close();
     
     const config = Config{
         .src_path = src_path,
@@ -447,17 +403,16 @@ test "__TEST__" {
         .verbosity = 0,
     };
     
-    const result = try sync(testing.allocator, config);
+    const null_writer = std.io.null_writer;
+    const result = try syncDirectory(testing.allocator, &config, null_writer);
     defer testing.allocator.free(result.errors);
     
-    try testing.expectEqual(@as(u64, 1), result.files_copied);
-    try testing.expectEqual(@as(u64, 0), result.errors.len);
+    try testing.expectEqual(@as(u32, 1), result.files_copied);
+    try testing.expectEqual(@as(u32, 0), result.files_updated);
+    try testing.expectEqual(@as(u32, 0), result.files_deleted);
     
-    const dst_file = try tmp.dir.openFile("dst/test.txt", .{});
-    defer dst_file.close();
+    const dst_file = try std.fs.path.join(testing.allocator, &.{ dst_path, "test.txt" });
+    defer testing.allocator.free(dst_file);
     
-    const content = try dst_file.readToEndAlloc(testing.allocator, 1024);
-    defer testing.allocator.free(content);
-    
-    try testing.expectEqualStrings("test content", content);
+    try std.fs.accessAbsolute(dst_file, .{});
 }

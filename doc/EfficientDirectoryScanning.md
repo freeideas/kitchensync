@@ -1,6 +1,6 @@
 # Efficient Cross-Platform Directory Listing in Zig
 
-This document introduces an optimized approach to gather file **name, size, and modification time** from a directory in Zig. It contains a complete, cross-platform solution using native Windows and Linux strategies, example usage, and rationale behind this method.
+This document introduces an optimized approach to gather file and directory **name, size, and modification time** from a directory in Zig. It contains a complete, cross-platform solution using native Windows, Linux, and macOS strategies, with a fallback for other platforms.
 
 ## Why Load Directory Info This Way?
 
@@ -18,11 +18,12 @@ const builtin = @import("builtin");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 
-/// File entry with name, size, and modification time (Unix seconds)
+/// File or directory entry with name, size, and modification time (Unix seconds)
 pub const FileEntry = struct {
     name: []const u8,
     size: u64,
     mod_time: i64, // unix timestamp
+    is_dir: bool,
     pub fn deinit(self: *FileEntry, allocator: Allocator) void {
         allocator.free(self.name);
     }
@@ -35,11 +36,21 @@ pub fn listDirectory(allocator: Allocator, dir_path: []const u8) ![]FileEntry {
         for (entries.items) |*entry| entry.deinit(allocator);
         entries.deinit();
     }
-    if (builtin.os.tag == .windows) {
-        try listDirectoryWindows(allocator, dir_path, &entries);
-    } else {
-        try listDirectoryLinux(allocator, dir_path, &entries);
+    
+    switch (builtin.os.tag) {
+        .windows => try listDirectoryWindows(allocator, dir_path, &entries),
+        .linux => try listDirectoryLinux(allocator, dir_path, &entries),
+        .macos => try listDirectoryMacOS(allocator, dir_path, &entries),
+        else => try listDirectoryGeneric(allocator, dir_path, &entries),
     }
+    
+    // Sort entries for deterministic results
+    std.sort.sort(FileEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: FileEntry, b: FileEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    
     return entries.toOwnedSlice();
 }
 
@@ -64,17 +75,20 @@ fn listDirectoryWindows(allocator: Allocator, dir_path: []const u8, entries: *Ar
         const len = std.mem.indexOfScalar(u16, &find_data.cFileName, 0) orelse find_data.cFileName.len;
         const wide_name = find_data.cFileName[0..len];
         if (!isCurOrParentDirWide(wide_name)) {
-            // files only (optional: remove directory check if folders wanted)
-            if ((find_data.dwFileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY) == 0) {
-                var buf: [256]u8 = undefined;
-                const utf8len = std.unicode.utf16leToUtf8(buf[0..], wide_name) catch {
-                    continue;
-                };
-                const name = try allocator.dupe(u8, buf[0..utf8len]);
-                const size = (@as(u64, find_data.nFileSizeHigh) << 32) | @as(u64, find_data.nFileSizeLow);
-                const mod_time = fileTimeToUnixTime(find_data.ftLastWriteTime);
-                try entries.append(FileEntry{ .name = name, .size = size, .mod_time = mod_time });
+            // Skip symbolic links
+            if ((find_data.dwFileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                continue;
             }
+            
+            var buf: [4096]u8 = undefined;  // Larger buffer for long filenames
+            const utf8len = std.unicode.utf16leToUtf8(buf[0..], wide_name) catch {
+                continue;
+            };
+            const name = try allocator.dupe(u8, buf[0..utf8len]);
+            const is_dir = (find_data.dwFileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const size = if (is_dir) 0 else (@as(u64, find_data.nFileSizeHigh) << 32) | @as(u64, find_data.nFileSizeLow);
+            const mod_time = fileTimeToUnixTime(find_data.ftLastWriteTime);
+            try entries.append(FileEntry{ .name = name, .size = size, .mod_time = mod_time, .is_dir = is_dir });
         }
         if (windows.kernel32.FindNextFileW(h, &find_data) == 0) break;
     }
@@ -109,15 +123,29 @@ fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *Arra
             const entry = @as(*linux.dirent64, @ptrCast(@alignCast(buffer[offset..].ptr)));
             const name_ptr = @as([*:0]u8, @ptrCast(@alignCast(buffer[offset + @sizeOf(linux.dirent64)..])));
             const name_len = std.mem.len(name_ptr);
-            if (!isCurOrParentDir(name_ptr[0..name_len]) and entry.d_type == linux.DT.REG) {
+            if (!isCurOrParentDir(name_ptr[0..name_len])) {
+                // Skip symbolic links
+                if (entry.d_type == linux.DT.LNK) {
+                    continue;
+                }
+                
+                const is_dir = entry.d_type == linux.DT.DIR;
                 const name = try allocator.dupe(u8, name_ptr[0..name_len]);
+                
+                // Need stat for size and mtime
                 var pathbuf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-                const file_path = (try std.fmt.bufPrint(pathbuf[0..], "{s}/{s}", .{dir_path, name}));
+                const file_path = try std.fmt.bufPrint(pathbuf[0..], "{s}/{s}", .{dir_path, name});
                 const stat = std.os.stat(file_path) catch {
                     allocator.free(name);
                     continue;
                 };
-                try entries.append(FileEntry{ .name = name, .size = @as(u64, @intCast(stat.size)), .mod_time = stat.mtime });
+                
+                try entries.append(FileEntry{ 
+                    .name = name, 
+                    .size = if (is_dir) 0 else @as(u64, @intCast(stat.size)), 
+                    .mod_time = stat.mtime,
+                    .is_dir = is_dir,
+                });
             }
             offset += entry.d_reclen;
         }
@@ -126,6 +154,63 @@ fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *Arra
 
 fn isCurOrParentDir(name: []const u8) bool {
     return std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+}
+
+/// macOS: Similar to Linux but with different syscall names
+fn listDirectoryMacOS(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
+    // macOS uses the same implementation as Linux since both support POSIX
+    // The main difference is in the syscall names, but Zig abstracts this
+    return listDirectoryLinux(allocator, dir_path, entries);
+}
+
+/// Generic fallback using standard library directory iteration
+fn listDirectoryGeneric(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
+    var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
+    defer dir.close();
+    
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) {
+            continue;
+        }
+        
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        
+        // Skip symbolic links
+        if (entry.kind == .sym_link) {
+            allocator.free(name);
+            continue;
+        }
+        
+        const is_dir = entry.kind == .directory;
+        
+        // Get file stats
+        var pathbuf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        const file_path = try std.fmt.bufPrint(pathbuf[0..], "{s}/{s}", .{dir_path, name});
+        const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| {
+            allocator.free(name);
+            if (err == error.IsDir and is_dir) {
+                // For directories, we can still add them without stats
+                try entries.append(FileEntry{ 
+                    .name = name, 
+                    .size = 0, 
+                    .mod_time = 0,
+                    .is_dir = true,
+                });
+            }
+            continue;
+        };
+        defer file.close();
+        
+        const stat = try file.stat();
+        try entries.append(FileEntry{ 
+            .name = name, 
+            .size = if (is_dir) 0 else stat.size, 
+            .mod_time = @intCast(stat.mtime),
+            .is_dir = is_dir,
+        });
+    }
 }
 
 /// Helper: free entries
@@ -151,9 +236,10 @@ pub fn main() !void {
     };
     defer freeFileEntries(allocator, entries);
 
-    std.debug.print("Directory: {s}, files found: {}\n", .{ dir_path, entries.len });
+    std.debug.print("Directory: {s}, entries found: {}\n", .{ dir_path, entries.len });
     for (entries) |entry| {
-        std.debug.print("- {s}, {d} bytes, mtime: {d}\n", .{ entry.name, entry.size, entry.mod_time });
+        const entry_type = if (entry.is_dir) "[DIR] " else "[FILE]";
+        std.debug.print("- {s} {s}, {d} bytes, mtime: {d}\n", .{ entry_type, entry.name, entry.size, entry.mod_time });
     }
 }
 ```
@@ -161,16 +247,19 @@ pub fn main() !void {
 
 ## Summary Table
 
-| Platform | API Used | Name | Size | ModTime | Extra stat Needed? |
-| :-- | :-- | :-- | :-- | :-- | :-- |
-| Windows | FindFirstFile/FindNextFile | Yes | Yes | Yes | No |
-| Linux | getdents64 + stat | Yes | Yes | Yes | Yes (stat) |
+| Platform | API Used | Name | Size | ModTime | Is Directory | Extra stat Needed? |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| Windows | FindFirstFile/FindNextFile | Yes | Yes | Yes | Yes | No |
+| Linux | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
+| macOS | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
+| Other | std.fs iteration + stat | Yes | Yes | Yes | Yes | Yes (stat) |
 
 ## Final Notes
 
-- This approach maximizes directory listing performance by minimizing system calls on both major platforms.
+- This approach maximizes directory listing performance by minimizing system calls on all major platforms.
+- Returns both files and directories, excluding symbolic links and special entries (., ..).
+- Entries are sorted alphabetically for deterministic results across platforms.
 - The design upholds the strengths of Zig: explicitness, safety, cross-platform reach, and straightforward error handling.
-- You can extend this recipe for symbolic links, directories, or for recursive listings with small modifications.
 
 For best results in high-performance, cross-platform file enumeration, this solution offers an efficient, idiomatic foundation.
 

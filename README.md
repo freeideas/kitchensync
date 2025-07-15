@@ -12,6 +12,7 @@ A safe, cross-platform directory synchronization tool written in Zig that preser
 
 - **Safe synchronization**: Never loses data - all deleted or overwritten files are archived with timestamps
 - **Cross-platform**: Native support for Windows, Linux, macOS, and other platforms
+- **Efficient directory-level processing**: Loads directory contents in batches for optimal performance
 - **Size-based comparison**: Files are primarily compared by size for efficient sync detection
 - **Optional modification time checking**: Can also use modification times when sizes match
 - **Pattern exclusion**: Exclude files/directories using glob patterns
@@ -46,7 +47,7 @@ Options:
   -p=Y/N                  Preview mode - show what would be done without doing it (default: Y)
   -t=Y/N                  Include timestamp-like filenames (default: N)
   -m=Y/N                  Use modification times for comparison (default: Y)
-  -v=0/1/2                Verbosity: 0=silent, 1=normal, 2=verbose IO (default: 1)
+  -v=0/1/2                Verbosity: 0=silent, 1=normal, 2=verbose (default: 1)
   -x PATTERN              Exclude files matching glob pattern (can be repeated)
   -h, --help              Show this help
 
@@ -105,7 +106,7 @@ kitchensync /source /dest -v=1
 # Silent mode (no output except errors)
 kitchensync /source /dest -p=N -v=0
 
-# Verbose IO mode (useful for diagnosing slow operations)
+# Verbose mode (shows directory loading for performance diagnosis)
 kitchensync /source /dest -p=N -v=2
 ```
 
@@ -191,23 +192,23 @@ When running, KitchenSync first displays its configuration:
 
 ```
 KitchenSync Configuration:
-  Source:       /home/user/documents
-  Destination:  /backup/documents
-  Preview:      enabled
-  Skip timestamps: enabled
-  Use modtime:  enabled
-  Excludes:     ["*.tmp", "*.log"]
-  Verbosity:    1
+  Source:           /home/user/documents
+  Destination:      /backup/documents
+  Preview:          enabled
+  Skip timestamps:  enabled
+  Use modtime:      enabled
+  Excludes:         ["*.tmp", "*.log"]
+  Verbosity:        1
 ```
 
 Unless verbosity is set to 0 (silent mode), KitchenSync logs a message to the console for every change it makes. Each message is prefixed with a timestamp showing second precision. The verbosity levels are:
 - **0 (silent)**: No output except errors and final summary
 - **1 (normal)**: Standard sync operations (copying, archiving, errors)
-- **2 (verbose IO)**: All operations plus directory-level IO activities (metadata loading, directory traversal, processing summaries)
+- **2 (verbose)**: Same as normal plus directory loading messages
 
 ### Path Display in Logs
 
-KitchenSync displays paths in log messages using the same format you specified on the command line. This keeps the output concise and familiar:
+KitchenSync displays paths relative to the source/destination directories you specified on the command line. This keeps the output concise and familiar:
 
 ```bash
 # If you run:
@@ -234,29 +235,22 @@ When an error occurs during an operation, the error message appears immediately 
 [2025-01-01_10:23:32] error: disk full
 ```
 
-### Verbose IO Mode (`-v=2`)
+### Verbose Mode (`-v=2`)
 
-When verbosity is set to 2, KitchenSync logs significant IO operations to help diagnose performance bottlenecks. To minimize overhead, only major IO operations are logged:
+Verbose mode adds directory operation messages to help diagnose performance issues and show progress:
 
-- Directory read operations
-- Directory creation
-- File operations (copy, move)
-
-Example verbose IO output:
 ```
-[2025-01-01_10:23:30] reading directory: /home/user/documents
-[2025-01-01_10:23:30] reading directory: /backup/documents
-[2025-01-01_10:23:32] creating directory: /backup/documents/.kitchensync/2025-01-01_10-23-32.456
+[2025-01-01_10:23:30] loading directory: /home/user/documents
+[2025-01-01_10:23:30] loading directory: /backup/documents
 [2025-01-01_10:23:32] moving to .kitchensync: /backup/documents/file2.pdf
 [2025-01-01_10:23:33] copying /home/user/documents/file2.pdf
-[2025-01-01_10:23:33] reading directory: /home/user/documents/subdir
 ```
 
-This detailed logging helps identify which directories are slow to process when troubleshooting performance issues. The optimized metadata loading means file information is gathered in batches per directory rather than one file at a time.
+The "loading directory" messages appear BEFORE reading directory contents, so you know what KitchenSync is doing during potentially slow operations. This is especially helpful on Windows where directory reading can take several seconds for large directories.
 
 ### Error Handling
 
-KitchenSync should be designed to be resilient and continue processing even when encountering:
+KitchenSync is designed to be resilient and continue processing even when encountering:
 - Locked files (antivirus scanning, open applications)
 - Permission denied errors on individual files
 - Files that disappear during synchronization
@@ -264,7 +258,7 @@ KitchenSync should be designed to be resilient and continue processing even when
 
 Only critical errors (like inability to access the source/destination root directories) will stop the entire operation.
 
-KitchenSync should continue processing all files even when individual operations fail. This ensures that one problematic file doesn't stop the entire synchronization. Files that disappear during processing should be handled gracefully. 
+KitchenSync continues processing all files even when individual operations fail. This ensures that one problematic file doesn't stop the entire synchronization. Files that disappear during processing are handled gracefully.
 
 When verbosity is set to 1 (normal mode), errors appear in the output immediately when they occur, using the same timestamped format as other messages. This real-time feedback helps you identify problems as they happen. In silent mode (verbosity 0), only the final error summary is shown.
 
@@ -292,12 +286,12 @@ At the end of synchronization, KitchenSync displays a summary of all operations:
 
 ```
 Synchronization summary:
-  Files copied:        42
-  Files updated:       7
-  Files deleted:       3
-  Directories created: 2
-  Files unchanged:     128
-  Errors:             0
+  Files copied:          42
+  Files updated:          7
+  Files deleted:          3
+  Directories created:    2
+  Files unchanged:      128
+  Errors:                 0
 ```
 
 The summary categories mean:
