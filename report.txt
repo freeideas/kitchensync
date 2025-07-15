@@ -1,0 +1,40 @@
+MOST IMPORTANT UPDATE NEEDED FOR DESIGN.md
+
+Based on implementation experience, the single most important update needed for DESIGN.md is:
+
+**Add explicit error handling patterns for cross-platform file operations**
+
+The DESIGN.md mentions error handling conceptually but lacks concrete implementation patterns for the most common file operation errors encountered during development. The document should include a dedicated section with code examples showing:
+
+1. **Atomic rename pattern for archiving** - The current documentation mentions using Dir.rename() but doesn't show the complete pattern including parent directory handling:
+   ```zig
+   var parent_dir = try std.fs.openDirAbsolute(dir_path, .{});
+   defer parent_dir.close();
+   const rel_src = try std.fs.path.relative(allocator, dir_path, file_path);
+   const rel_dst = try std.fs.path.relative(allocator, dir_path, archive_path);
+   try parent_dir.rename(rel_src, rel_dst);
+   ```
+
+2. **Resilient directory traversal pattern** - The docs emphasize streaming but don't show how to handle entry-level errors without aborting the entire traversal:
+   ```zig
+   const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
+       if (config.verbosity > 0) {
+           try stdout.print("Error accessing file '{s}': {s}\n", 
+               .{ entry_path, @errorName(err) });
+       }
+       continue; // CRITICAL: Skip this file, continue with others
+   };
+   ```
+
+3. **HashMap memory management pattern** - While the docs mention memory management, they don't show the critical cleanup pattern for StringHashMap with allocated keys:
+   ```zig
+   defer {
+       var iter = processed_paths.iterator();
+       while (iter.next()) |entry| {
+           allocator.free(entry.key_ptr.*);
+       }
+       processed_paths.deinit();
+   }
+   ```
+
+This addition would save significant debugging time by providing tested patterns for the most error-prone operations encountered during implementation. The current high-level descriptions require trial-and-error to discover these essential patterns.
