@@ -315,13 +315,38 @@ The summary categories mean:
 
 ### Preview Mode Feedback
 
-When preview mode is enabled (the default), KitchenSync makes it very clear that no actual changes were made. After displaying the summary, it shows a prominent reminder:
+When preview mode is enabled (the default), KitchenSync clearly indicates that it's running in preview mode both at the start and end of the operation.
 
+**At the start of execution:**
 ```
-Preview mode enabled; no changes made. Use -p=N to make the changes shown above.
+KitchenSync Configuration:
+  Source:           /home/user/documents
+  Destination:      /backup/documents
+  Preview:          enabled
+  Skip timestamps:  enabled
+  Use modtime:      enabled
+  Excludes:         []
+  Verbosity:        1
+
+PREVIEW MODE: No changes will be made. Remove -p=Y or use -p=N to perform actual sync.
 ```
 
-This ensures users understand that they need to explicitly disable preview mode (`-p=N`) to perform the actual synchronization.
+**After showing all the operations that would be performed:**
+```
+Synchronization summary:
+  Files copied:        42
+  Files updated:       7
+  Files deleted:       3
+  Directories created: 2
+  Files unchanged:     128
+  Errors:              0
+
+PREVIEW MODE: No changes were made. Use -p=N to perform the sync shown above.
+```
+
+This dual notification ensures users clearly understand:
+1. Before any analysis begins, that they're in preview mode
+2. After seeing what would happen, how to actually perform the synchronization
 
 ## Troubleshooting
 
