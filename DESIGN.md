@@ -2,23 +2,36 @@
 
 This document provides implementation details and guidance for Zig engineers working on KitchenSync. For usage and feature information, see [README.md](README.md).
 
-## CRITICAL ARCHITECTURAL REQUIREMENT: Directory-Level Streaming
+## CRITICAL ARCHITECTURAL REQUIREMENT: Platform-Specific Directory Loading
+
+### Two-Platform Strategy
+KitchenSync focuses on two platform categories to maximize simplicity and reliability:
+1. **Windows** (Primary platform) - Requires Windows-specific implementation
+2. **Standard** (Everything else) - Uses generic POSIX-style implementation
 
 ### Required Architecture: Directory-Level Processing
 1. **Directory batches**: Load and process one directory's contents at a time
-2. **Platform-optimized loading**: Use FindFirstFile/FindNextFile (Windows) or getdents64 (Linux) for dramatic performance gains
+2. **Platform-specific loading**: MANDATORY on Windows - uses FindFirstFile/FindNextFile
 3. **Memory bounded by directory size**: Memory usage only scales with the largest single directory, not the entire tree
 4. **Early pruning**: Skip excluded directory trees entirely without loading their contents
 5. **Visible progress**: Users see directories being processed as units
 
-### Key Performance Insight
-The standard approach of iterating files and calling stat() on each one is catastrophically slow on Windows:
-- Standard approach: 2 kernel calls per file (openFile + stat)
-- Optimized approach: 1 batched call per directory
-- Result: 100x+ performance improvement on Windows (from minutes to seconds)
+### Windows Implementation is MANDATORY
+**🚨 CRITICAL**: The Windows-specific implementation is NOT optional. Without it:
+- The application may fail to work at all on Windows
+- Directory listing can fail silently, appearing to find no files
+- Performance degrades from seconds to minutes for large directories
+- The standard Zig directory iteration is fundamentally incompatible with Windows file systems
+
+### Key Windows Requirements
+The Windows-specific implementation is required because:
+- Standard approach: 2 kernel calls per file (openFile + stat) - often fails on Windows
+- Windows approach: 1 batched call per directory - reliable and fast
+- Windows Defender and antivirus software interfere with per-file operations
+- File locking and permissions work differently on Windows
 
 ### Directory-Level Processing Benefits
-1. **Dramatic Windows performance**: The difference between usable and unusable
+1. **Windows functionality**: Without it, the app often doesn't work on Windows at all
 2. **Efficient memory use**: Only one directory's metadata in memory at a time
 3. **Better progress reporting**: Users see "processing directory X" with entry counts
 4. **Simplified deletion detection**: Compare entire directory contents at once
@@ -70,31 +83,6 @@ This project requires **Zig 0.13.0** or later due to API changes in the standard
 - `std.fs.path.normalize` has been removed - work directly with paths without normalization
 - Array literals for `path.join` require explicit type: `&[_][]const u8{ }` syntax
 
-## Zig 0.13.0 API Reference
-
-### Working Function Calls
-```zig
-// File operations
-std.fs.openFileAbsolute(path, .{})                     // reading file stats
-std.fs.createFileAbsolute(path, .{ .mode = src_stat.mode }) // copying with permissions
-var parent_dir = std.fs.openDirAbsolute(path, .{});    // MUST use 'var' for rename operations
-parent_dir.rename(old_relative, new_relative);         // atomic archiving
-
-// Directory operations  
-std.fs.cwd().makePath(path);                          // recursive directory creation
-std.fs.openDirAbsolute(path, .{ .iterate = true });   // directory traversal
-
-// Path handling
-std.fs.path.join(allocator, &.{ path1, path2 });      // new array syntax
-std.fs.realpathAlloc(allocator, relative_path);       // absolute conversion
-std.fs.path.relative(allocator, base, full_path);     // relative calculation
-
-// Collections
-std.StringHashMap(FileEntry).init(allocator);         // simplified HashMap
-
-// Print statements (CRITICAL)
-try writer.print("message", .{});                     // always need format args
-```
 
 ## Key Imports from Documentation
 
@@ -160,12 +148,10 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 ```zig
 switch (builtin.os.tag) {
     .windows => try listDirectoryWindows(allocator, dir_path, &entries),
-    .linux => try listDirectoryLinux(allocator, dir_path, &entries),
-    .macos => try listDirectoryMacOS(allocator, dir_path, &entries),
-    else => try listDirectoryGeneric(allocator, dir_path, &entries),
+    else => try listDirectoryStandard(allocator, dir_path, &entries),
 }
 ```
-If this function accidentally calls `listDirectoryGeneric` on all platforms, Windows performance will be catastrophically slow (30+ seconds for 100k files vs 3 seconds).
+If this function accidentally calls the generic implementation on Windows, the application may fail to work at all or have catastrophically slow performance (30+ seconds for 100k files vs 3 seconds).
 
 ### Performance Comparison
 | Approach | System Calls | Time for 10,000 files | Time for 100,000 files | Usability |
@@ -175,8 +161,8 @@ If this function accidentally calls `listDirectoryGeneric` on all platforms, Win
 
 ### Implementation Requirements
 1. **Use the code from [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md)**:
-   - `FindFirstFile/FindNextFile` on Windows
-   - `getdents64` on Linux
+   - `FindFirstFile/FindNextFile` on Windows (MANDATORY for functionality)
+   - Generic cross-platform implementation for all other platforms
    - Returns complete file metadata in batched operations
 
 2. **Adapt for directory-level processing**:
@@ -207,84 +193,28 @@ This happens because `listDirectoryGeneric` makes 2 system calls per file:
 
 The fix is always the same: ensure `listDirectory` uses the platform switch statement, not a direct call to `listDirectoryGeneric`.
 
-### Critical Linux Implementation Warning
+## Implementation Notes
 
-**⚠️ INFINITE LOOP HAZARD**: The Linux `dirent64` struct field names in Zig's standard library differ from typical C implementations and have changed between Zig versions:
+### Windows Specifics
+- The Windows implementation is complex but necessary for functionality
+- Handles wide strings, file attributes, and Windows-specific quirks
+- Must convert between UTF-16 and UTF-8
+- Skips reparse points (symlinks, junctions)
+- **CRITICAL**: Without Windows-specific implementation, the application often fails silently
 
-**Zig 0.13.0+ Field Names:**
-- Use `entry.type` NOT `entry.d_type` 
-- Use `entry.reclen` NOT `entry.d_reclen`
-- Cast type field: `const d_type = @as(u8, @intCast(entry.type));`
-
-**Why This Matters:**
-- Using incorrect field names (e.g., `d_type`) will compile without errors
-- The code will enter an infinite loop because `entry.d_reclen` doesn't exist, causing the offset to never advance
-- This bug is extremely difficult to debug as there are no error messages
-
-**Debugging Tips:**
-- If directory listing hangs/times out, immediately suspect field names
-- Add debug prints to verify offset is advancing: `std.debug.print("offset: {}, reclen: {}\n", .{offset, entry.reclen});`
-- Consider falling back to generic implementation during development
+### Standard Platform Specifics
+- Uses Zig's cross-platform file iteration
+- Automatically handles platform differences for Linux, macOS, BSD, etc.
+- Simple, maintainable, and sufficient for non-Windows platforms
+- No version-specific field name issues to worry about
 
 ### Directory Processing Pattern
 
 **REQUIRED**: Use the directory-level approach with platform-specific APIs:
-
-```zig
-// Load entire directory at once using platform APIs
-const entries = try listDirectory(allocator, dir_path);
-defer freeFileEntries(allocator, entries);
-
-// Load destination directory for comparison
-const dest_entries = try listDirectory(allocator, dest_dir_path);
-defer freeFileEntries(allocator, dest_entries);
-
-// Build a map for efficient lookup
-var dest_map = std.StringHashMap(FileEntry).init(allocator);
-defer dest_map.deinit();
-for (dest_entries) |entry| {
-    try dest_map.put(entry.name, entry);
-}
-
-// Process all entries in this directory
-for (entries) |entry| {
-    // Build full path for glob matching
-    const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-    defer allocator.free(full_path);
-    
-    // Check exclusion patterns using full path
-    if (glob_filter.matches(full_path)) continue;
-    
-    // Check if it's a directory
-    if (entry.is_dir) {
-        // Build destination path and recurse
-        const child_dest_path = try std.fs.path.join(allocator, &.{ dest_dir_path, entry.name });
-        defer allocator.free(child_dest_path);
-        try processDirectory(allocator, full_path, child_dest_path);
-    } else {
-        // Compare with destination and sync if needed
-        if (dest_map.get(entry.name)) |dest_entry| {
-            if (needsUpdate(entry, dest_entry)) {
-                try syncFile(entry);
-            }
-        } else {
-            try copyFile(entry);
-        }
-    }
-}
-
-// Handle deletions (files in dest but not in source)
-for (dest_entries) |dest_entry| {
-    if (!source_has(dest_entry.name)) {
-        try archiveAndDelete(dest_entry);
-    }
-}
-```
-
-**Key Benefits:**
-- All file metadata loaded in one efficient operation
-- No per-file system calls during comparison
-- Deletions handled in the same pass
+- Load entire directory at once using `listDirectory` from doc/EfficientDirectoryScanning.md
+- Build HashMap for efficient destination lookup
+- Process all entries in a single pass
+- Handle deletions in the same pass
 - Memory usage bounded by directory size
 
 ## Data Structures
@@ -342,6 +272,7 @@ const SyncError = struct {
 ### Archive Structure
 - Archives are created as `.kitchensync/{timestamp}/{filename}`
 - `.kitchensync` directories are always excluded from scanning
+- **TESTING REQUIREMENT**: Tests must verify that any directory with the exact name `.kitchensync` is filtered out at any level in the directory tree
 
 ### Archive Timestamp Format
 - Exact format: `YYYY-MM-DD_HH-MM-SS.mmm` (exactly 23 characters)
@@ -413,75 +344,20 @@ const SyncError = struct {
 - Return exit code 1 if `errors.len > 0`
 
 #### Diagnostic Error Messages
-Early-stage failures need specific context to aid debugging, especially on Windows where `AccessDenied` errors can occur for various reasons:
+Early-stage failures need specific context to aid debugging, especially on Windows where `AccessDenied` errors can occur for various reasons.
 
-1. **Directory Creation Failures** - When creating the destination directory fails (fatal error):
-   ```zig
-   fileops.createDirectory(config.dst_path) catch |err| {
-       if (config.verbosity > 0) {
-           try stdout.print("Error creating destination directory '{s}': {s}\n", 
-               .{ config.dst_path, @errorName(err) });
-       }
-       return err;  // OK to return - this is a fatal error
-   };
-   ```
+**Key Principles:**
+- Fatal errors (can't proceed): Root directory access, destination creation
+- Non-fatal errors (skip and continue): Individual files, subdirectories during traversal
+- Always log errors at verbosity > 0 with clear context
 
-2. **Traversal Non-Fatal Failures** - Directory traversal must continue after file access errors:
-   ```zig
-   // WRONG - This would abort the entire traversal:
-   const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-       if (config.verbosity > 0) {
-           try stdout.print("Error accessing file '{s}': {s}\n", 
-               .{ entry_path, @errorName(err) });
-       }
-       return err;  // BAD: Stops processing all remaining files
-   };
-   
-   // RIGHT - Continue processing other files:
-   const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-       if (config.verbosity > 0) {
-           try stdout.print("Error accessing file '{s}': {s}\n", 
-               .{ entry_path, @errorName(err) });
-       }
-       continue;  // GOOD: Skip this file, continue with others
-   };
-   ```
-
-3. **Root vs Subdirectory Failures** - Different handling for initial directory vs subdirectories:
-   ```zig
-   // For the root source/destination directory - fatal error:
-   var root_dir = std.fs.openDirAbsolute(root_path, .{ .iterate = true }) catch |err| {
-       if (config.verbosity > 0) {
-           try stdout.print("Error opening directory '{s}': {s}\n", 
-               .{ root_path, @errorName(err) });
-       }
-       return err;  // OK - can't proceed without root directory
-   };
-   
-   // For subdirectories during traversal - skip and continue:
-   var sub_dir = std.fs.openDirAbsolute(subdir_path, .{ .iterate = true }) catch |err| {
-       if (config.verbosity > 0) {
-           try stdout.print("Error opening directory '{s}': {s}\n", 
-               .{ subdir_path, @errorName(err) });
-       }
-       continue;  // Skip this subdirectory tree, continue with siblings
-   };
-   ```
-
-These diagnostic messages are critical for Windows environments where `AccessDenied` can result from antivirus software, file locks, special file attributes, or permission issues. The sync engine must be resilient and continue processing accessible files even when some files or directories cannot be accessed.
+The sync engine must be resilient and continue processing accessible files even when some files or directories cannot be accessed.
 
 #### Error Message Format Standardization
-All error messages should follow a consistent format for user clarity and debugging:
-```zig
-// Standard format: "Error {operation} '{path}': {error_name}"
-try stdout.print("Error accessing file '{s}': {s}\n", .{ entry_path, @errorName(err) });
-try stdout.print("Error creating destination directory '{s}': {s}\n", .{ config.dst_path, @errorName(err) });
-try stdout.print("Error opening directory '{s}': {s}\n", .{ root_path, @errorName(err) });
-```
+Standard format: `"Error {operation} '{path}': {error_name}"`
 - Always use `@errorName(err)` for consistent error reporting
 - Include the specific operation being attempted
 - Quote file paths for clarity, especially when they contain spaces
-- Use consistent verb tenses (present participle: "creating", "accessing", "opening")
 
 ### Logging Requirements
 - Unless verbosity is 0, log every operation with timestamp
@@ -493,23 +369,7 @@ try stdout.print("Error opening directory '{s}': {s}\n", .{ root_path, @errorNam
 - Join relative path components to original paths for user-friendly output
 
 #### Path Display Strategy
-For user-friendly path display, use the `relativePath` function from [doc/Relativizer.md](doc/Relativizer.md):
-- Converts absolute paths to relative paths from source/destination roots
-- Handles cross-platform path separators
-- Returns null if path is outside root (shouldn't happen in normal operation)
-
-Example usage:
-```zig
-// For logging with relative paths
-if (config.verbosity >= 1) {
-    const display_path = try relativePath(allocator, config.src_path, file_path) orelse file_path;
-    defer if (display_path.ptr != file_path.ptr) allocator.free(display_path);
-    
-    try stdout.print("[{s}] copying {s}\n", .{ timestamp, display_path });
-}
-```
-
-This provides cleaner, tested implementation for showing paths relative to the command-line arguments.
+For user-friendly path display, use the `relativePath` function from [doc/Relativizer.md](doc/Relativizer.md) to convert absolute paths to relative paths from source/destination roots.
 
 ## Module Implementation Details
 
@@ -547,25 +407,7 @@ This provides cleaner, tested implementation for showing paths relative to the c
 - Users need to see why files or directories were skipped
 
 ### Traversal Resilience Pattern (CRITICAL)
-During directory traversal in sync engine:
-
-```zig
-// WRONG - Aborts entire traversal:
-const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-    return err; // BAD: Stops all synchronization
-};
-
-// RIGHT - Continues traversal:
-const file = std.fs.openFileAbsolute(entry_path, .{}) catch |err| {
-    if (config.verbosity > 0) {
-        try stdout.writer().print("Error accessing file '{s}': {s}\n", 
-            .{ entry_path, @errorName(err) });
-    }
-    continue; // GOOD: Skip this file, continue with others
-};
-```
-
-This pattern ensures antivirus software, file locks, or permission issues don't stop the entire synchronization.
+During directory traversal, never abort on individual file errors. Log the error and continue processing other files. This ensures antivirus software, file locks, or permission issues don't stop the entire synchronization.
 
 - Note: With directory-level processing, excluded files within processed directories are visible in the loaded entries but skipped during processing. Entire excluded directories are still skipped without loading their contents.
 
@@ -574,15 +416,7 @@ This pattern ensures antivirus software, file locks, or permission issues don't 
 - Safe copying with proper error handling and thread-based timeout
 - Directory creation with parent directory handling
 - Use platform-safe paths (no colons in Windows timestamps)
-- **IMPORTANT**: Use `std.fs.cwd().makePath()` for recursive directory creation:
-  ```zig
-  pub fn createDirectory(path: []const u8) !void {
-      std.fs.cwd().makePath(path) catch |err| {
-          if (err == error.PathAlreadyExists) return;
-          return err;
-      };
-  }
-  ```
+- Use `std.fs.cwd().makePath()` for recursive directory creation
 
 #### File Copy Timeout Implementation
 KitchenSync uses a worker thread approach to handle file operations that may hang indefinitely on Windows. Each file copy operation spawns a new thread, allowing the main thread to abandon the operation if it exceeds the timeout.
@@ -690,70 +524,8 @@ fn copyFileDirect(src_path: []const u8, dst_path: []const u8) !void {
 The glob pattern system supports efficient filtering during directory-level processing. Filters are stateless and evaluate paths independently.
 
 ### Filter Architecture
-**CRITICAL**: Each filter must know the root directory to correctly evaluate relative paths:
+**CRITICAL**: Each filter must know the root directory to correctly evaluate relative paths. The GlobFilter struct contains the root directory and patterns, using `relativePath` from doc/Relativizer.md to convert absolute paths to relative before matching.
 
-```zig
-const GlobFilter = struct {
-    root_dir: []const u8,
-    patterns: []const []const u8,
-    
-    pub fn matches(self: *const GlobFilter, allocator: std.mem.Allocator, absolute_path: []const u8) !bool {
-        // Convert absolute path to relative from root
-        // Uses relativePath from doc/Relativizer.md
-        const relative_path = try relativePath(allocator, self.root_dir, absolute_path) orelse {
-            // Path not under root - shouldn't happen in normal operation
-            return false;
-        };
-        defer allocator.free(relative_path);
-        
-        // Check each exclusion pattern
-        for (self.patterns) |pattern| {
-            if (matchGlob(relative_path, pattern)) return true;
-        }
-        return false;
-    }
-};
-```
-
-### Directory-Level Processing with Filters
-
-```zig
-fn syncDirectory(allocator: Allocator, src_root: []const u8, dst_root: []const u8, filter: *const GlobFilter) !void {
-    // Load both directories at once
-    const src_entries = try listDirectory(allocator, src_root);
-    defer freeFileEntries(allocator, src_entries);
-    
-    const dst_entries = try listDirectory(allocator, dst_root);
-    defer freeFileEntries(allocator, dst_entries);
-    
-    // Process entries
-    for (src_entries) |entry| {
-        const full_path = try std.fs.path.join(allocator, &.{ src_root, entry.name });
-        defer allocator.free(full_path);
-        
-        // Apply filter - skip if path matches exclusion pattern
-        if (try filter.matches(allocator, full_path)) continue;
-        
-        // Check if entry is a directory
-        if (entry.is_dir) {
-            // Recursively process subdirectory
-            const dst_path = try std.fs.path.join(allocator, &.{ dst_root, entry.name });
-            defer allocator.free(dst_path);
-            try syncDirectory(allocator, full_path, dst_path, filter);
-        } else {
-            // Sync file based on metadata comparison
-            try syncFileIfNeeded(entry, dst_entries);
-        }
-    }
-    
-    // Handle deletions in same pass
-    for (dst_entries) |dst_entry| {
-        if (!hasMatchingSource(dst_entry, src_entries)) {
-            try archiveAndDelete(dst_entry);
-        }
-    }
-}
-```
 
 ### Pattern Matching Implementation (`src/patterns.zig`)
 - Implement glob patterns: `*`, `?`, `[abc]`, `[a-z]`, `{pat1,pat2}`, `**`
@@ -766,6 +538,7 @@ fn syncDirectory(allocator: Allocator, src_root: []const u8, dst_root: []const u
 - `dirname/**` - excludes everything inside the directory
 - For complete exclusion, use both: `["dirname", "dirname/**"]`
 - `.kitchensync` directories are automatically excluded before pattern matching
+- **IMPORTANT**: The `.kitchensync` exclusion is hardcoded and must work regardless of user-specified patterns
 
 ### Benefits of Directory-Level Processing
 1. **Dramatic performance**: 100x+ faster on Windows compared to file-by-file approach
@@ -792,6 +565,7 @@ test "__TEST__" {
     // 6. Directory handling bug detection (CRITICAL)
     // 7. Error verbosity configuration (CRITICAL)
     // 8. Verbosity output verification (MISSING)
+    // 9. Verify .kitchensync directories are always excluded (CRITICAL)
 }
 ```
 
@@ -824,27 +598,10 @@ Without these tests, bugs in the verbose logging implementation go undetected.
 **💡 Implementation Tip**: The verbose IO mode should show directory-level operations, not individual file stat calls. This provides useful feedback without overwhelming output.
 
 ### Critical Bug Detection Tests
-Add these specific test cases to catch the most common implementation bugs:
-
-```zig
-test "streaming_sync_behavior" {
-    // Test should verify streaming behavior:
-    // 1. Files are processed immediately during traversal
-    // 2. Excluded directories are never entered
-    // 3. Errors don't stop processing of other files
-    // 4. Verbosity levels control output appropriately
-    
-    // Implementation should use mock file operations to verify
-    // that sync operations happen during traversal, not after
-}
-
-test "deletion_detection" {
-    // Test the deletion detection mechanism:
-    // 1. Track all processed destination paths during sync
-    // 2. Second pass through destination finds unprocessed files
-    // 3. Those files are archived and deleted
-}
-```
+Specific test cases needed to catch common implementation bugs:
+- **Streaming sync behavior**: Verify files are processed during traversal, not after
+- **Deletion detection**: Test two-pass mechanism for finding unprocessed destination files
+- **Kitchensync directory exclusion**: Verify `.kitchensync` directories are never traversed at any level
 
 ## Platform-Specific Implementation
 
@@ -865,23 +622,7 @@ const archive_path = try std.fs.path.join(allocator, &.{
 // Sync operations use absolute paths for reliability
 ```
 
-### Archive Timestamp Format
-```zig
-pub fn formatArchiveTimestamp(allocator: std.mem.Allocator, nanos: i128) ![]u8 {
-    // Format: YYYY-MM-DD_HH-MM-SS.mmm
-    // Use '-' not ':' for Windows compatibility
-    const epoch_secs = @divTrunc(nanos, std.time.ns_per_s);
-    const secs_u64: u64 = if (epoch_secs >= 0) @intCast(epoch_secs) else 0;
-    const epoch = std.time.epoch.EpochSeconds{ .secs = secs_u64 };
-    // ... format with getDaySeconds(), getMonthDay(), etc.
-}
-```
 
-### Cross-Platform Considerations
-- Use `std.fs.path.sep` for platform separator
-- Handle Windows drive letters and UNC paths
-- Preserve file permissions appropriately per platform
-- Handle case sensitivity differences
 
 ## Memory Management
 - Always pair allocations with `defer` cleanup
@@ -889,60 +630,10 @@ pub fn formatArchiveTimestamp(allocator: std.mem.Allocator, nanos: i128) ![]u8 {
 - Free path strings from `std.fs.path.join`
 - Document ownership clearly in function signatures
 
-### HashMap and Dynamic Array Cleanup Pattern (CRITICAL)
+### Memory Management Patterns
 **⚠  IMPLEMENTATION TIP: This is the #1 source of memory leaks in this project.**
 
-**Important clarification**: With directory-level processing, this pattern is critical for:
-- Error collection arrays in `sync.zig`
-- FileEntry arrays returned by `listDirectory`
-- Temporary StringHashMap for destination file lookup
-- Config exclude_patterns array in `main.zig`
-
-**Example - Error Array Cleanup:**
-```zig
-// Building error array during sync
-var errors = std.ArrayList(SyncError).init(allocator);
-defer {
-    // Free all allocated strings in error structs
-    for (errors.items) |err| {
-        allocator.free(err.source_path);
-        allocator.free(err.dest_path);
-    }
-    errors.deinit();
-}
-
-// When adding errors:
-try errors.append(SyncError{
-    .source_path = try allocator.dupe(u8, src_path),
-    .dest_path = try allocator.dupe(u8, dst_path),
-    .error_type = err,
-    .action = action,
-});
-```
-
-**Example - FileEntry Array Cleanup:**
-```zig
-// Load directory entries
-const entries = try listDirectory(allocator, dir_path);
-defer freeFileEntries(allocator, entries);
-
-// Use entries for processing...
-// The defer ensures proper cleanup of all allocated names
-```
-
-**Example - Destination Lookup Map:**
-```zig
-// Build map for efficient destination lookup
-var dest_map = std.StringHashMap(FileEntry).init(allocator);
-defer dest_map.deinit();
-
-// Note: Don't duplicate keys - use references to existing FileEntry.name
-for (dest_entries) |entry| {
-    try dest_map.put(entry.name, entry);
-}
-```
-
-**Key principles:**
+When using collections that contain allocated strings:
 1. **Ownership transfer**: Once strings are added to collections, the collection owns them
 2. **Cleanup order**: Free inner allocations before outer containers
 3. **Test with GPA**: Use `std.heap.GeneralPurposeAllocator` in tests to catch leaks
@@ -964,27 +655,39 @@ This pattern appears in:
   ```
 
 ### Command-Line Argument Path Conversion Pattern
-**CRITICAL**: The most common segmentation fault occurs when converting parsed paths to absolute paths. The config struct's path pointers get reassigned, creating a double-free situation:
+**CRITICAL**: The most common segmentation fault occurs when converting parsed paths to absolute paths. The config struct's path pointers get reassigned, creating a double-free situation that will cost hours of debugging.
+
+When converting to absolute paths, you MUST follow these steps:
+1. Save original pointers before reassignment
+2. Free originals in a defer block  
+3. Assign new absolute paths to config
+4. Let ParsedArgs.deinit() handle the absolute paths
 
 ```zig
-// CORRECT: Save original pointers before reassignment
+// CORRECT: The parsed Config owns the original paths
 var config = parsed.config;
-const orig_src_path = config.src_path;
+const orig_src_path = config.src_path;  // Step 1: Save before reassignment
 const orig_dst_path = config.dst_path;
 defer {
-    allocator.free(orig_src_path);
+    allocator.free(orig_src_path);  // Step 2: Free originals
     allocator.free(orig_dst_path);
 }
 
-// Convert to absolute and reassign
+// Step 3: Convert to absolute and reassign
 const src_absolute = try std.fs.cwd().realpathAlloc(allocator, config.src_path);
 defer allocator.free(src_absolute);
 config.src_path = src_absolute;
 
-// IMPORTANT: ParsedArgs defer must NOT free src_path/dst_path anymore
+// Step 4: ParsedArgs.deinit() will now free the absolute paths
 ```
 
-This prevents double-free crashes during cleanup.
+This pattern is non-obvious because:
+- The Config struct is embedded in ParsedArgs, not a pointer
+- Path strings are reassigned, not replaced
+- The ownership transfer happens across function boundaries
+- Standard defer patterns don't apply due to the reassignment
+
+Without this explicit pattern, the double-free crashes occur during cleanup, not at the point of error, making them extremely difficult to debug.
 
 ## Performance Considerations
 - Batch file operations where possible

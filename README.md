@@ -1,6 +1,6 @@
 # KitchenSync
 
-A safe, cross-platform directory synchronization tool written in Zig that preserves file history. Works seamlessly on Linux, Windows, macOS, and other platforms supported by Zig.
+A safe, cross-platform directory synchronization tool written in Zig that preserves file history. Optimized for Windows with standard support for Linux, macOS, and other platforms supported by Zig.
 
 ## Development Guidelines
 
@@ -11,7 +11,7 @@ A safe, cross-platform directory synchronization tool written in Zig that preser
 ## Features
 
 - **Safe synchronization**: Never loses data - all deleted or overwritten files are archived with timestamps
-- **Cross-platform**: Native support for Windows, Linux, macOS, and other platforms
+- **Cross-platform**: Windows-optimized with standard support for Linux, macOS, and other platforms
 - **Hang-resistant operation**: Unlike most sync tools, KitchenSync won't freeze indefinitely on stuck file operations - it automatically recovers and continues
 - **Efficient directory-level processing**: Loads directory contents in batches for optimal performance
 - **Size-based comparison**: Files are primarily compared by size for efficient sync detection
@@ -399,16 +399,21 @@ This dual notification ensures users clearly understand:
 
 ## Platform Notes
 
-### Windows Considerations
+### Windows (Primary Platform)
 
+**KitchenSync is optimized for Windows** with platform-specific implementations that are required for proper functionality:
+
+- **Native Windows APIs**: Uses `FindFirstFile/FindNextFile` for optimal performance and reliability
 - **Path Separators**: Both `\` and `/` are accepted and normalized automatically
 - **Drive Letters**: Supports standard paths (`C:\...`) and UNC paths (`\\server\share`)
 - **Reserved Names**: Avoids Windows reserved names (CON, PRN, AUX, etc.)
 - **Archive Timestamps**: Uses `-` instead of `:` in timestamps (filesystem restriction)
 - **Case Sensitivity**: Paths are case-insensitive but case-preserving
+- **Antivirus Compatibility**: Designed to work reliably with Windows Defender and other antivirus software
 
-### Linux/Unix Considerations
+### Standard Platforms (Linux, macOS, BSD)
 
+- **Cross-platform Implementation**: Uses standard Zig file operations for broad compatibility
 - **Hidden Files**: Files starting with `.` are treated as hidden
 - **Permissions**: File permissions are preserved during copying
 - **Case Sensitivity**: File systems are typically case-sensitive
@@ -447,9 +452,12 @@ The development build creates a binary optimized for your current system in `zig
 
 KitchenSync can be built for any platform from any platform. The `dist` directory structure uses the exact target triple names that are passed to Zig's `-Dtarget` flag.
 
-#### Primary Distribution Targets
+#### Two-Platform Distribution Strategy
 
-The following three platforms are the primary distribution targets:
+KitchenSync focuses on two platform categories for maximum simplicity and reliability:
+
+1. **Windows** (Primary) - Requires platform-specific optimizations
+2. **Standard** (Everything else) - Uses generic cross-platform implementation
 
 ```bash
 # IMPORTANT: Use --prefix zig-out to ensure output goes to zig-out directory

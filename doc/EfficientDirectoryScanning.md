@@ -1,14 +1,15 @@
 # Efficient Cross-Platform Directory Listing in Zig
 
-This document introduces an optimized approach to gather file and directory **name, size, and modification time** from a directory in Zig. It contains a complete, cross-platform solution using native Windows, Linux, and macOS strategies, with a fallback for other platforms.
+This document introduces an optimized approach to gather file and directory **name, size, and modification time** from a directory in Zig. It contains a complete, two-platform solution using native Windows implementation and a standard cross-platform implementation for all other platforms.
 
-**⚠️ CRITICAL**: When integrating this code, you MUST use the platform switch in `listDirectory()`. A common mistake is to accidentally call only `listDirectoryGeneric()`, which causes catastrophic performance on Windows (30+ seconds for 100k files instead of 3 seconds).
+**⚠️ CRITICAL**: When integrating this code, you MUST use the platform switch in `listDirectory()`. A common mistake is to accidentally call only `listDirectoryStandard()`, which causes the application to fail or have catastrophic performance on Windows (30+ seconds for 100k files instead of 3 seconds).
 
 ## Why Load Directory Info This Way?
 
-- **Performance:** On Windows, APIs like `FindFirstFile/FindNextFile` provide complete file metadata in a single call, drastically reducing I/O overhead.
-- **Reduced System Calls:** Unlike standard approaches (e.g., `stat()` per file), these APIs batch-fetch attributes, minimizing kernel transitions.
-- **Cross-Platform Efficiency:** On Linux, the `getdents64` syscall reads many directory entries at once, improving speed for large folders.
+- **Windows Functionality:** On Windows, APIs like `FindFirstFile/FindNextFile` are often required for the application to work at all. The standard approach frequently fails silently.
+- **Performance:** These APIs provide complete file metadata in a single call, drastically reducing I/O overhead.
+- **Reduced System Calls:** Unlike standard approaches (e.g., `stat()` per file), the Windows APIs batch-fetch attributes, minimizing kernel transitions.
+- **Simplified Maintenance:** Two-platform approach reduces complexity while maintaining full functionality.
 - **Zig Developer Experience:** This implementation embraces Zig idioms—explicit memory management, robust error handling, and clear abstractions—allowing easy integration and extension.
 
 
@@ -41,9 +42,7 @@ pub fn listDirectory(allocator: Allocator, dir_path: []const u8) ![]FileEntry {
     
     switch (builtin.os.tag) {
         .windows => try listDirectoryWindows(allocator, dir_path, &entries),
-        .linux => try listDirectoryLinux(allocator, dir_path, &entries),
-        .macos => try listDirectoryMacOS(allocator, dir_path, &entries),
-        else => try listDirectoryGeneric(allocator, dir_path, &entries),
+        else => try listDirectoryStandard(allocator, dir_path, &entries),
     }
     
     // Sort entries for deterministic results
@@ -107,78 +106,8 @@ fn fileTimeToUnixTime(ft: std.os.windows.FILETIME) i64 {
     return @as(i64, @intCast(ft64 / 10_000_000)) - win_epoch_offset;
 }
 
-/// Linux: Use getdents64 to batch-read entries (stat needed for size+modtime).
-fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
-    const linux = std.os.linux;
-    const dir_fd = std.posix.open(dir_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
-        error.FileNotFound => return error.DirectoryNotFound,
-        else => return err,
-    };
-    defer std.posix.close(dir_fd);
-
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        const bytes = linux.getdents64(dir_fd, &buffer, buffer.len);
-        if (bytes == 0) break;
-        var offset: usize = 0;
-        while (offset < bytes) {
-            const entry = @as(*linux.dirent64, @ptrCast(@alignCast(buffer[offset..].ptr)));
-            const name_ptr = @as([*:0]u8, @ptrCast(@alignCast(buffer[offset + @sizeOf(linux.dirent64)..])));
-            const name_len = std.mem.len(name_ptr);
-            
-            // CRITICAL: Advance offset using correct field name
-            const reclen = entry.reclen; // NOT d_reclen!
-            if (reclen == 0) {
-                // Defensive programming - prevent infinite loop
-                std.debug.print("WARNING: zero reclen detected, aborting directory read\n", .{});
-                break;
-            }
-            offset += reclen;
-            
-            if (!isCurOrParentDir(name_ptr[0..name_len])) {
-                // CRITICAL: Use correct field name and cast
-                const d_type = @as(u8, @intCast(entry.type)); // NOT entry.d_type!
-                
-                // Skip symbolic links
-                if (d_type == linux.DT.LNK) {
-                    continue;
-                }
-                
-                const is_dir = d_type == linux.DT.DIR;
-                const name = try allocator.dupe(u8, name_ptr[0..name_len]);
-                
-                // Need stat for size and mtime
-                var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
-                const file_path = try std.fmt.bufPrint(pathbuf[0..], "{s}/{s}", .{dir_path, name});
-                const stat = std.fs.cwd().statFile(file_path) catch {
-                    allocator.free(name);
-                    continue;
-                };
-                
-                try entries.append(FileEntry{ 
-                    .name = name, 
-                    .size = if (is_dir) 0 else @as(u64, @intCast(stat.size)), 
-                    .mod_time = @intCast(@divFloor(stat.mtime, std.time.ns_per_s)),
-                    .is_dir = is_dir,
-                });
-            }
-        }
-    }
-}
-
-fn isCurOrParentDir(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
-}
-
-/// macOS: Similar to Linux but with different syscall names
-fn listDirectoryMacOS(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
-    // macOS uses the same implementation as Linux since both support POSIX
-    // The main difference is in the syscall names, but Zig abstracts this
-    return listDirectoryLinux(allocator, dir_path, entries);
-}
-
-/// Generic fallback using standard library directory iteration
-fn listDirectoryGeneric(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
+/// Standard: Cross-platform implementation using Zig standard library
+fn listDirectoryStandard(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
     var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
     defer dir.close();
     
@@ -261,23 +190,25 @@ pub fn main() !void {
 
 ## Summary Table
 
-| Platform | API Used | Name | Size | ModTime | Is Directory | Extra stat Needed? |
+| Platform Category | API Used | Name | Size | ModTime | Is Directory | Extra stat Needed? |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | Windows | FindFirstFile/FindNextFile | Yes | Yes | Yes | Yes | No |
-| Linux | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
-| macOS | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
-| Other | std.fs iteration + stat | Yes | Yes | Yes | Yes | Yes (stat) |
+| Standard (Linux, macOS, BSD, etc.) | std.fs iteration + stat | Yes | Yes | Yes | Yes | Yes (stat) |
 
-## Platform-Specific Implementation Notes
+## Two-Platform Implementation Notes
 
-### Linux dirent64 Field Names
-The Linux implementation is particularly sensitive to Zig standard library changes. Always verify:
-1. Field names match your Zig version (`entry.type` vs `entry.d_type`, `entry.reclen` vs `entry.d_reclen`)
-2. Add defensive checks for zero `reclen` to prevent infinite loops
-3. Test with debug prints if experiencing hangs: `std.debug.print("Processing: {s}, offset: {}\n", .{name_ptr[0..name_len], offset});`
+### Windows Implementation
+- Complex but necessary for functionality
+- Handles wide strings, file attributes, and Windows-specific quirks
+- Must convert between UTF-16 and UTF-8
+- Skips reparse points (symlinks, junctions)
+- **CRITICAL**: Without this implementation, the application often fails silently on Windows
 
-### Fallback Strategy
-During development, consider using the generic implementation first, then optimizing with platform-specific code once the core logic is working. The performance difference is significant on Windows but less dramatic on Linux/macOS.
+### Standard Implementation
+- Uses Zig's cross-platform file iteration
+- Simple, maintainable, and works reliably across all non-Windows platforms
+- Automatically handles platform differences
+- No version-specific issues to worry about
 
 ### Troubleshooting Windows Performance Issues
 
@@ -287,7 +218,7 @@ If your application hangs for 30+ seconds when scanning large directories on Win
    ```zig
    switch (builtin.os.tag) {
        .windows => try listDirectoryWindows(allocator, dir_path, &entries),
-       // ... other platforms
+       else => try listDirectoryStandard(allocator, dir_path, &entries),
    }
    ```
 
@@ -304,19 +235,20 @@ If your application hangs for 30+ seconds when scanning large directories on Win
    // WRONG - This bypasses platform optimization!
    pub fn listDirectory(allocator: Allocator, dir_path: []const u8) ![]FileEntry {
        var entries = ArrayList(FileEntry).init(allocator);
-       try listDirectoryGeneric(allocator, dir_path, &entries);  // BAD!
+       try listDirectoryStandard(allocator, dir_path, &entries);  // BAD!
        return entries.toOwnedSlice();
    }
    ```
 
-The generic implementation makes 2+ system calls per file, while the Windows-specific implementation batches everything into one enumeration. For 100,000 files, this is the difference between 200,000+ kernel calls vs ~100 calls.
+The standard implementation makes 2+ system calls per file, while the Windows-specific implementation batches everything into one enumeration. For 100,000 files, this is the difference between 200,000+ kernel calls vs ~100 calls.
 
 ## Final Notes
 
-- This approach maximizes directory listing performance by minimizing system calls on all major platforms.
+- This two-platform approach maximizes directory listing performance while minimizing complexity.
+- Windows implementation is required for functionality, not just performance.
 - Returns both files and directories, excluding symbolic links and special entries (., ..).
 - Entries are sorted alphabetically for deterministic results across platforms.
 - The design upholds the strengths of Zig: explicitness, safety, cross-platform reach, and straightforward error handling.
 
-For best results in high-performance, cross-platform file enumeration, this solution offers an efficient, idiomatic foundation.
+For best results in cross-platform file enumeration, this simplified two-platform solution offers an efficient, maintainable foundation.
 

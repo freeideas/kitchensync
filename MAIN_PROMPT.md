@@ -12,6 +12,7 @@ Delete all files and subdirectories (including hidden) except:
    - Write module
    - Test immediately
    - Fix failures before continuing
+   - IMPORTANT: do not continue with a module that fails its tests; if you must delete the module and rewrite, that is acceptable
 
 ## Phase 2: Integration
 1. Run end-to-end tests

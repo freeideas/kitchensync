@@ -1,12 +1,22 @@
-# Ignore everything by default
-*
+# Zig build artifacts
+.zig-cache/
+zig-out/
 
-# Allow .gitignore itself
-!.gitignore
+# Test artifacts
+tmp/
+*.tmp
 
-# Allow all .md files in root directory only
-!/*.md
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Allow everything in doc directory
-!doc/
-!doc/**
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
