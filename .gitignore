@@ -11,3 +11,7 @@
 # Allow everything in doc directory
 !doc/
 !doc/**
+
+# Allow dist directory and all binaries in it
+!dist/
+!dist/**
