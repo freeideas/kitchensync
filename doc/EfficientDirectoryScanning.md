@@ -2,6 +2,8 @@
 
 This document introduces an optimized approach to gather file and directory **name, size, and modification time** from a directory in Zig. It contains a complete, cross-platform solution using native Windows, Linux, and macOS strategies, with a fallback for other platforms.
 
+**⚠️ CRITICAL**: When integrating this code, you MUST use the platform switch in `listDirectory()`. A common mistake is to accidentally call only `listDirectoryGeneric()`, which causes catastrophic performance on Windows (30+ seconds for 100k files instead of 3 seconds).
+
 ## Why Load Directory Info This Way?
 
 - **Performance:** On Windows, APIs like `FindFirstFile/FindNextFile` provide complete file metadata in a single call, drastically reducing I/O overhead.
@@ -108,11 +110,11 @@ fn fileTimeToUnixTime(ft: std.os.windows.FILETIME) i64 {
 /// Linux: Use getdents64 to batch-read entries (stat needed for size+modtime).
 fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *ArrayList(FileEntry)) !void {
     const linux = std.os.linux;
-    const dir_fd = std.os.open(dir_path, std.os.O.RDONLY, 0) catch |err| switch (err) {
+    const dir_fd = std.posix.open(dir_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
         error.FileNotFound => return error.DirectoryNotFound,
         else => return err,
     };
-    defer std.os.close(dir_fd);
+    defer std.posix.close(dir_fd);
 
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -123,19 +125,32 @@ fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *Arra
             const entry = @as(*linux.dirent64, @ptrCast(@alignCast(buffer[offset..].ptr)));
             const name_ptr = @as([*:0]u8, @ptrCast(@alignCast(buffer[offset + @sizeOf(linux.dirent64)..])));
             const name_len = std.mem.len(name_ptr);
+            
+            // CRITICAL: Advance offset using correct field name
+            const reclen = entry.reclen; // NOT d_reclen!
+            if (reclen == 0) {
+                // Defensive programming - prevent infinite loop
+                std.debug.print("WARNING: zero reclen detected, aborting directory read\n", .{});
+                break;
+            }
+            offset += reclen;
+            
             if (!isCurOrParentDir(name_ptr[0..name_len])) {
+                // CRITICAL: Use correct field name and cast
+                const d_type = @as(u8, @intCast(entry.type)); // NOT entry.d_type!
+                
                 // Skip symbolic links
-                if (entry.d_type == linux.DT.LNK) {
+                if (d_type == linux.DT.LNK) {
                     continue;
                 }
                 
-                const is_dir = entry.d_type == linux.DT.DIR;
+                const is_dir = d_type == linux.DT.DIR;
                 const name = try allocator.dupe(u8, name_ptr[0..name_len]);
                 
                 // Need stat for size and mtime
-                var pathbuf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+                var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
                 const file_path = try std.fmt.bufPrint(pathbuf[0..], "{s}/{s}", .{dir_path, name});
-                const stat = std.os.stat(file_path) catch {
+                const stat = std.fs.cwd().statFile(file_path) catch {
                     allocator.free(name);
                     continue;
                 };
@@ -143,11 +158,10 @@ fn listDirectoryLinux(allocator: Allocator, dir_path: []const u8, entries: *Arra
                 try entries.append(FileEntry{ 
                     .name = name, 
                     .size = if (is_dir) 0 else @as(u64, @intCast(stat.size)), 
-                    .mod_time = stat.mtime,
+                    .mod_time = @intCast(@divFloor(stat.mtime, std.time.ns_per_s)),
                     .is_dir = is_dir,
                 });
             }
-            offset += entry.d_reclen;
         }
     }
 }
@@ -253,6 +267,49 @@ pub fn main() !void {
 | Linux | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
 | macOS | getdents64 + stat | Yes | Yes | Yes | Yes | Yes (stat) |
 | Other | std.fs iteration + stat | Yes | Yes | Yes | Yes | Yes (stat) |
+
+## Platform-Specific Implementation Notes
+
+### Linux dirent64 Field Names
+The Linux implementation is particularly sensitive to Zig standard library changes. Always verify:
+1. Field names match your Zig version (`entry.type` vs `entry.d_type`, `entry.reclen` vs `entry.d_reclen`)
+2. Add defensive checks for zero `reclen` to prevent infinite loops
+3. Test with debug prints if experiencing hangs: `std.debug.print("Processing: {s}, offset: {}\n", .{name_ptr[0..name_len], offset});`
+
+### Fallback Strategy
+During development, consider using the generic implementation first, then optimizing with platform-specific code once the core logic is working. The performance difference is significant on Windows but less dramatic on Linux/macOS.
+
+### Troubleshooting Windows Performance Issues
+
+If your application hangs for 30+ seconds when scanning large directories on Windows:
+
+1. **Check the `listDirectory` function** - It MUST contain the platform switch:
+   ```zig
+   switch (builtin.os.tag) {
+       .windows => try listDirectoryWindows(allocator, dir_path, &entries),
+       // ... other platforms
+   }
+   ```
+
+2. **Verify the Windows-specific function is called** - Add a debug print:
+   ```zig
+   fn listDirectoryWindows(...) !void {
+       std.debug.print("Using Windows optimized implementation\n", .{});
+       // ... rest of implementation
+   }
+   ```
+
+3. **Common mistake** - If you see this pattern, it's WRONG:
+   ```zig
+   // WRONG - This bypasses platform optimization!
+   pub fn listDirectory(allocator: Allocator, dir_path: []const u8) ![]FileEntry {
+       var entries = ArrayList(FileEntry).init(allocator);
+       try listDirectoryGeneric(allocator, dir_path, &entries);  // BAD!
+       return entries.toOwnedSlice();
+   }
+   ```
+
+The generic implementation makes 2+ system calls per file, while the Windows-specific implementation batches everything into one enumeration. For 100,000 files, this is the difference between 200,000+ kernel calls vs ~100 calls.
 
 ## Final Notes
 

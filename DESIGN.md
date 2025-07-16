@@ -90,7 +90,7 @@ std.fs.realpathAlloc(allocator, relative_path);       // absolute conversion
 std.fs.path.relative(allocator, base, full_path);     // relative calculation
 
 // Collections
-std.StringHashMap(*FileInfo).init(allocator);         // simplified HashMap
+std.StringHashMap(FileEntry).init(allocator);         // simplified HashMap
 
 // Print statements (CRITICAL)
 try writer.print("message", .{});                     // always need format args
@@ -104,8 +104,8 @@ From [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md):
 - `freeFileEntries` - Cleanup function for FileEntry arrays
 
 From [doc/Relativizer.md](doc/Relativizer.md):
-- `relativePath` - Convert absolute to relative paths for glob matching and logging
-- `freeRelativePath` - Cleanup function for allocated relative paths
+- `relativePath` - Convert absolute to relative paths for glob matching and logging (returns allocated string)
+- Note: Use `allocator.free()` to clean up - `freeRelativePath` won't work due to const/mutable mismatch
 
 ## Core Components
 
@@ -137,10 +137,11 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 **Primary responsibility**: Perform atomic file system operations
 
 - Archive files to `.kitchensync/{timestamp}/` before deletion/overwrite
-- Copy files with permission preservation
+- Copy files with permission preservation and thread-based timeout
 - Create directories (including parent paths)
 - Format timestamps for archive paths: `YYYY-MM-DD_HH-MM-SS.mmm`
 - Handle platform-specific path requirements
+- Implement abort timeout for hanging file operations (especially on Windows)
 
 ### 4. Pattern Matcher (`src/patterns.zig`)
 **Primary responsibility**: Evaluate glob patterns and filters
@@ -155,11 +156,22 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 ### Required Implementation
 **⚠️ MANDATORY**: KitchenSync MUST use the platform-specific directory loading approach from [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md). The standard Zig directory iteration is unusably slow on Windows.
 
+**🚨 CRITICAL BUG WARNING**: The `listDirectory` function in `sync.zig` MUST use compile-time platform detection to call the appropriate implementation:
+```zig
+switch (builtin.os.tag) {
+    .windows => try listDirectoryWindows(allocator, dir_path, &entries),
+    .linux => try listDirectoryLinux(allocator, dir_path, &entries),
+    .macos => try listDirectoryMacOS(allocator, dir_path, &entries),
+    else => try listDirectoryGeneric(allocator, dir_path, &entries),
+}
+```
+If this function accidentally calls `listDirectoryGeneric` on all platforms, Windows performance will be catastrophically slow (30+ seconds for 100k files vs 3 seconds).
+
 ### Performance Comparison
-| Approach | System Calls | Time for 10,000 files | Usability |
-|----------|--------------|----------------------|------------|
-| Standard Zig iteration | 20,000+ | 5+ minutes | Unusable on Windows |
-| Platform-specific APIs | ~10 | 3 seconds | Fast and responsive |
+| Approach | System Calls | Time for 10,000 files | Time for 100,000 files | Usability |
+|----------|--------------|----------------------|------------------------|------------|
+| Standard Zig iteration | 20,000+ | 5+ minutes | 30+ minutes | Unusable on Windows |
+| Platform-specific APIs | ~10 | 3 seconds | 30 seconds | Fast and responsive |
 
 ### Implementation Requirements
 1. **Use the code from [doc/EfficientDirectoryScanning.md](doc/EfficientDirectoryScanning.md)**:
@@ -180,6 +192,39 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 - Each `openFileAbsolute()` triggers Windows Defender scanning
 - Kernel transitions on Windows are extremely expensive
 - The platform-specific approach avoids these bottlenecks entirely
+
+### How to Detect the Performance Bug
+If you experience these symptoms, the platform-specific implementation is NOT being used:
+1. **Windows hangs after "loading directory: ."** - The program appears frozen for 30+ seconds
+2. **No further output during the hang** - Even with -v=2, no progress is shown
+3. **Eventually exits without completing** - May appear to crash or exit silently
+
+This happens because `listDirectoryGeneric` makes 2 system calls per file:
+- `openFileAbsolute()` to get a file handle
+- `stat()` to get file metadata
+- Each call can trigger antivirus scanning on Windows
+- For 100,000 files, this means 200,000+ kernel transitions
+
+The fix is always the same: ensure `listDirectory` uses the platform switch statement, not a direct call to `listDirectoryGeneric`.
+
+### Critical Linux Implementation Warning
+
+**⚠️ INFINITE LOOP HAZARD**: The Linux `dirent64` struct field names in Zig's standard library differ from typical C implementations and have changed between Zig versions:
+
+**Zig 0.13.0+ Field Names:**
+- Use `entry.type` NOT `entry.d_type` 
+- Use `entry.reclen` NOT `entry.d_reclen`
+- Cast type field: `const d_type = @as(u8, @intCast(entry.type));`
+
+**Why This Matters:**
+- Using incorrect field names (e.g., `d_type`) will compile without errors
+- The code will enter an infinite loop because `entry.d_reclen` doesn't exist, causing the offset to never advance
+- This bug is extremely difficult to debug as there are no error messages
+
+**Debugging Tips:**
+- If directory listing hangs/times out, immediately suspect field names
+- Add debug prints to verify offset is advancing: `std.debug.print("offset: {}, reclen: {}\n", .{offset, entry.reclen});`
+- Consider falling back to generic implementation during development
 
 ### Directory Processing Pattern
 
@@ -254,6 +299,7 @@ const Config = struct {
     skip_timestamps: bool = true,  // true = exclude timestamp files
     use_modtime: bool = true,
     verbosity: u8 = 1,  // 0=silent, 1=normal, 2=verbose IO
+    abort_timeout: u32 = 60,  // Abort file operations after seconds without progress
 };
 ```
 
@@ -328,12 +374,12 @@ const SyncError = struct {
 - `-t=Y` means COPY timestamp files
 - `-m` (modtime) defaults to `Y` (use modification times)
 - `-v=0/1/2` where 0=silent, 1=normal (default: 1), 2=verbose IO
+- `-a=SECONDS` abort timeout, defaults to 60 seconds (0=disabled)
 - Options can appear before or after positional arguments
 - **CRITICAL**: Convert relative paths to absolute immediately after parsing:
   ```zig
-  const src_absolute = try std.fs.realpathAlloc(allocator, config.src_path);
-  allocator.free(config.src_path);
-  config.src_path = src_absolute;
+  // IMPORTANT: See "Command-Line Argument Path Conversion Pattern" section for 
+  // proper memory management to avoid double-free errors
   
   // For non-existent destinations, use path.resolve
   const dst_absolute = std.fs.cwd().realpathAlloc(allocator, config.dst_path) catch |err| blk: {
@@ -457,7 +503,7 @@ Example usage:
 // For logging with relative paths
 if (config.verbosity >= 1) {
     const display_path = try relativePath(allocator, config.src_path, file_path) orelse file_path;
-    defer if (display_path.ptr != file_path.ptr) freeRelativePath(allocator, display_path);
+    defer if (display_path.ptr != file_path.ptr) allocator.free(display_path);
     
     try stdout.print("[{s}] copying {s}\n", .{ timestamp, display_path });
 }
@@ -469,7 +515,7 @@ This provides cleaner, tested implementation for showing paths relative to the c
 
 ### `src/main.zig` (~200 lines)
 - Parse positional args for SOURCE and DESTINATION
-- Parse abbreviated options: `-p=Y/N`, `-t=Y/N`, `-m=Y/N`, `-v=0/1/2`
+- Parse abbreviated options: `-p=Y/N`, `-t=Y/N`, `-m=Y/N`, `-v=0/1/2`, `-a=SECONDS`
 - Parse `-x PATTERN` where pattern is consumed as next argument
 - Validate that both positional arguments are provided
 - Display configuration before starting
@@ -525,7 +571,7 @@ This pattern ensures antivirus software, file locks, or permission issues don't 
 
 ### `src/fileops.zig` (~150 lines)
 - Archive function creates .kitchensync/YYYY-MM-DD_HH-MM-SS.mmm/ structure
-- Safe copying with proper error handling
+- Safe copying with proper error handling and thread-based timeout
 - Directory creation with parent directory handling
 - Use platform-safe paths (no colons in Windows timestamps)
 - **IMPORTANT**: Use `std.fs.cwd().makePath()` for recursive directory creation:
@@ -537,6 +583,106 @@ This pattern ensures antivirus software, file locks, or permission issues don't 
       };
   }
   ```
+
+#### File Copy Timeout Implementation
+KitchenSync uses a worker thread approach to handle file operations that may hang indefinitely on Windows. Each file copy operation spawns a new thread, allowing the main thread to abandon the operation if it exceeds the timeout.
+
+```zig
+const FileCopyResult = struct {
+    completed: bool = false,
+    failed: bool = false,
+    mutex: std.Thread.Mutex = .{},
+};
+
+pub fn copyFile(src_path: []const u8, dst_path: []const u8, timeout_seconds: u32) !void {
+    if (timeout_seconds == 0) {
+        // No timeout - direct copy
+        return copyFileDirect(src_path, dst_path);
+    }
+    
+    var result = FileCopyResult{};
+    
+    // Spawn worker thread for the actual copy operation
+    const thread = try std.Thread.spawn(.{}, copyFileWorker, .{src_path, dst_path, &result});
+    
+    // Main thread waits with timeout
+    const timeout_ns = @as(u64, timeout_seconds) * std.time.ns_per_s;
+    var timer = try std.time.Timer.start();
+    
+    while (timer.read() < timeout_ns) {
+        result.mutex.lock();
+        const done = result.completed or result.failed;
+        result.mutex.unlock();
+        
+        if (done) {
+            try thread.join();
+            if (result.failed) return error.CopyFailed;
+            return;
+        }
+        
+        std.time.sleep(10 * std.time.ns_per_ms); // Check every 10ms
+    }
+    
+    // Timeout occurred - abandon the thread
+    thread.detach();
+    return error.Timeout;
+}
+
+fn copyFileWorker(src_path: []const u8, dst_path: []const u8, result: *FileCopyResult) void {
+    copyFileDirect(src_path, dst_path) catch {
+        result.mutex.lock();
+        result.failed = true;
+        result.mutex.unlock();
+        return;
+    };
+    
+    result.mutex.lock();
+    result.completed = true;
+    result.mutex.unlock();
+}
+
+fn copyFileDirect(src_path: []const u8, dst_path: []const u8) !void {
+    // Standard file copy implementation
+    const src_file = try std.fs.openFileAbsolute(src_path, .{});
+    defer src_file.close();
+    
+    const src_stat = try src_file.stat();
+    
+    const dst_dir = std.fs.path.dirname(dst_path) orelse ".";
+    try createDirectory(dst_dir);
+    
+    const dst_file = try std.fs.createFileAbsolute(dst_path, .{ .mode = src_stat.mode });
+    defer dst_file.close();
+    
+    try src_file.seekTo(0);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const bytes_read = try src_file.read(&buf);
+        if (bytes_read == 0) break;
+        try dst_file.writeAll(buf[0..bytes_read]);
+    }
+}
+```
+
+**Key Design Decisions:**
+
+1. **Thread per copy**: Each file copy operation runs in its own thread
+2. **Main thread controls timeout**: The sync engine's main thread monitors the timeout
+3. **Thread abandonment**: On timeout, the thread is detached and abandoned
+4. **Natural cleanup**: When the abandoned thread's kernel call eventually returns, the thread exits normally
+
+**Why thread abandonment is acceptable:**
+- **Rare occurrence**: Timeouts only happen when system-level issues cause indefinite hangs
+- **Limited impact**: One thread per timeout (typically <1MB stack + minimal heap)
+- **No alternative**: Zig doesn't support thread cancellation for safety reasons
+- **System reclamation**: All resources are freed when the process exits
+- **Prevents corruption**: Abandoned threads can't interfere with subsequent operations
+
+**Implementation Notes:**
+- The mutex protects the shared result structure
+- The main thread polls every 10ms to check completion
+- `thread.detach()` makes the thread independent - it will clean itself up when done
+- If timeout is 0 (disabled), we skip threading entirely for efficiency
 
 ## Glob Pattern Handling and Filtering Strategy
 
@@ -558,7 +704,7 @@ const GlobFilter = struct {
             // Path not under root - shouldn't happen in normal operation
             return false;
         };
-        defer freeRelativePath(allocator, relative_path);
+        defer allocator.free(relative_path);
         
         // Check each exclusion pattern
         for (self.patterns) |pattern| {
@@ -589,7 +735,7 @@ fn syncDirectory(allocator: Allocator, src_root: []const u8, dst_root: []const u
         if (try filter.matches(allocator, full_path)) continue;
         
         // Check if entry is a directory
-        if (isDirectory(full_path)) {
+        if (entry.is_dir) {
             // Recursively process subdirectory
             const dst_path = try std.fs.path.join(allocator, &.{ dst_root, entry.name });
             defer allocator.free(dst_path);
@@ -721,7 +867,7 @@ const archive_path = try std.fs.path.join(allocator, &.{
 
 ### Archive Timestamp Format
 ```zig
-pub fn formatArchiveTimestamp(allocator: *Allocator, nanos: i128) ![]u8 {
+pub fn formatArchiveTimestamp(allocator: std.mem.Allocator, nanos: i128) ![]u8 {
     // Format: YYYY-MM-DD_HH-MM-SS.mmm
     // Use '-' not ':' for Windows compatibility
     const epoch_secs = @divTrunc(nanos, std.time.ns_per_s);
@@ -866,8 +1012,3 @@ std.time.sleep(2 * std.time.ns_per_ms);
 - File modification time comparisons may not detect changes within the same millisecond
 - Tests creating multiple timestamped artifacts need explicit delays
 - This applies to FAT32, NTFS, ext4, and most common filesystems
-
-## Building Distribution Binaries
-- **IMPORTANT**: When cross-compiling with `zig build -Dtarget=...`, you must add `--prefix zig-out` to ensure the output goes to the expected location
-- Without `--prefix`, the binary may not appear in `zig-out/bin/`
-- Use the `build-dist.sh` script for easier builds: `./build-dist.sh linux`

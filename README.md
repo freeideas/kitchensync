@@ -12,6 +12,7 @@ A safe, cross-platform directory synchronization tool written in Zig that preser
 
 - **Safe synchronization**: Never loses data - all deleted or overwritten files are archived with timestamps
 - **Cross-platform**: Native support for Windows, Linux, macOS, and other platforms
+- **Hang-resistant operation**: Unlike most sync tools, KitchenSync won't freeze indefinitely on stuck file operations - it automatically recovers and continues
 - **Efficient directory-level processing**: Loads directory contents in batches for optimal performance
 - **Size-based comparison**: Files are primarily compared by size for efficient sync detection
 - **Optional modification time checking**: Can also use modification times when sizes match
@@ -48,6 +49,7 @@ Options:
   -t=Y/N                  Include timestamp-like filenames (default: N)
   -m=Y/N                  Use modification times for comparison (default: Y)
   -v=0/1/2                Verbosity: 0=silent, 1=normal, 2=verbose (default: 1)
+  -a=SECONDS              Abort file operations after SECONDS without progress (default: 60)
   -x PATTERN              Exclude files matching glob pattern (can be repeated)
   -h, --help              Show this help
 
@@ -73,6 +75,31 @@ Examples of filenames that would be skipped (unless `-t=Y`):
 - `snapshot_202401151823_data.db` (contains 2024-01-15 18:23)
 - `1985-07-04_00_archive.tar` (contains 1985-07-04 00:xx)
 - `report_2024-01-15T14.pdf` (contains 2024-01-15 14:xx)
+
+### Abort Timeout
+
+The `-a=SECONDS` option provides protection against hung file operations that can freeze traditional sync tools indefinitely. KitchenSync uses an innovative thread-based approach where each file operation runs with a configurable timeout.
+
+This feature is essential because file operations can hang forever due to:
+- Antivirus software indefinitely blocking file access
+- Network drives with lost connections
+- Faulty hardware or USB devices
+- Windows kernel-level issues
+- File system corruption
+
+The default timeout is 60 seconds. When a file operation exceeds this limit, KitchenSync:
+1. Abandons the stuck operation (leaving it to complete or fail in the background)
+2. Logs the timeout as an error
+3. Continues processing the remaining files
+
+This ensures your sync job completes even when encountering problematic files that would cause other tools to hang forever.
+
+Examples:
+- `-a=30` - Abort after 30 seconds (recommended for local drives)
+- `-a=300` - Abort after 5 minutes (for slow network drives)
+- `-a=0` - Disable timeout (wait indefinitely - use with caution)
+
+**Note**: This is a key differentiator from tools like rsync, robocopy, or xcopy, which can hang indefinitely on a single file, requiring manual intervention or forced termination of the entire sync operation.
 
 ## Examples
 
@@ -108,6 +135,12 @@ kitchensync /source /dest -p=N -v=0
 
 # Verbose mode (shows directory loading for performance diagnosis)
 kitchensync /source /dest -p=N -v=2
+
+# Set abort timeout to 5 minutes for slow network drives
+kitchensync /mnt/network/source /local/backup -a=300 -p=N
+
+# Disable abort timeout for very large files
+kitchensync /media/large-files /backup -a=0 -p=N
 ```
 
 ### Windows Examples
@@ -130,6 +163,12 @@ kitchensync "C:\My Documents" "D:\Backup\My Documents" -p=N
 
 # Mixed path separators are normalized automatically (with actual sync)
 kitchensync C:/Users/Jane/Pictures D:\Backup\Pictures -p=N
+
+# Use shorter timeout for Windows antivirus issues
+kitchensync C:\Work E:\Backup -a=30 -p=N
+
+# Longer timeout for network drives on Windows
+kitchensync \\Server\Share D:\LocalBackup -a=600 -p=N
 ```
 
 ### Cross-Platform Patterns
@@ -197,6 +236,7 @@ KitchenSync Configuration:
   Preview:          enabled
   Skip timestamps:  enabled
   Use modtime:      enabled
+  Abort timeout:    60 seconds
   Excludes:         ["*.tmp", "*.log"]
   Verbosity:        1
 ```
@@ -314,6 +354,7 @@ KitchenSync Configuration:
   Preview:          enabled
   Skip timestamps:  enabled
   Use modtime:      enabled
+  Abort timeout:    60 seconds
   Excludes:         []
   Verbosity:        1
 

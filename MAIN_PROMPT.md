@@ -1,7 +1,7 @@
 # Implementation Instructions
 
 ## Phase 0: Clean Start
-Delete all files except:
+Delete all files and subdirectories (including hidden) except:
 - Root .md files
 - doc/ directory (if exists)
 - Git files (.git, .gitignore)
