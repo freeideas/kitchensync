@@ -1,4 +1,7 @@
-# Store .md files and documentation only; this is deliberate
+# Store .md files, documentation, and binary distribution only; this is deliberate
+
+
+
 # Ignore everything by default
 *
 
