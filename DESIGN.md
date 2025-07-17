@@ -131,6 +131,7 @@ From [doc/copyFile.zig](doc/copyFile.zig):
 
 - Archive files to `.kitchensync/{timestamp}/` before deletion/overwrite
 - Copy files with permission preservation and thread-based timeout using the implementation from [doc/copyFile.zig](doc/copyFile.zig)
+- **IMPORTANT**: The target file is always moved (archived) before copying. If the archive operation fails, the copy is not attempted
 - Create directories (including parent paths)
 - Format timestamps for archive paths: `YYYY-MM-DD_HH-MM-SS.mmm`
 - Handle platform-specific path requirements
@@ -289,6 +290,7 @@ const SyncError = struct {
 - Use `Dir.rename(old_name, new_relative_path)` for atomic file moves
 - Open parent directory first, then operate with relative paths
 - Create archive directory hierarchy before attempting rename
+- **Archive-then-Copy Pattern**: Files are moved (not copied) to archive, then source is copied to destination
 - Handle non-existent files gracefully during delete operations
 - Check file existence with `accessAbsolute` before archiving
 - **Archive Race Condition Handling**:
@@ -299,6 +301,10 @@ const SyncError = struct {
   };
   // Proceed with archiving...
   ```
+- **Copy Operation Guarantee**: The copy operation will never encounter an existing destination file because:
+  - Archive uses `rename()` which moves the file atomically
+  - If archive fails, the entire update operation is aborted
+  - This eliminates FILE_EXISTS errors during copy
 
 ## Implementation Guidelines
 
@@ -419,12 +425,18 @@ During directory traversal, never abort on individual file errors. Log the error
 ### `src/fileops.zig` (~150 lines)
 - Archive function creates .kitchensync/YYYY-MM-DD_HH-MM-SS.mmm/ structure
 - Safe copying with proper error handling and thread-based timeout
+- **File Update Sequence**: Archive (move) target file first, then copy source file. If archive fails, copy is not attempted
 - Directory creation with parent directory handling
 - Use platform-safe paths (no colons in Windows timestamps)
 - Use `std.fs.cwd().makePath()` for recursive directory creation
 
 #### File Copy Timeout Implementation
 **IMPORTANT**: KitchenSync must use very similar implementation from [doc/copyFile.zig](doc/copyFile.zig) for file copy operations. This implementation has been proven to work reliably on Windows and includes:
+
+**CRITICAL**: The copy operation assumes the destination file has already been moved (archived). The copy will never encounter an existing destination file because:
+1. For updates: The old file is archived (moved) before copying the new version
+2. For new files: No destination file exists
+3. If archiving fails: The copy operation is skipped entirely
 
 1. **Thread-based timeout mechanism**: Handles file operations that may hang indefinitely on Windows
 2. **Windows-specific implementation**: Uses `CopyFileExW` API on Windows for enhanced performance and reliability

@@ -4,7 +4,7 @@
 Delete all files and subdirectories (including hidden) except:
 - Root .md files
 - doc/ directory (if exists) and its contents
-- Git files (.git, .gitignore)
+- Git files (.git, .gitignore, etc.)
 
 ## Phase 1: Build Incrementally
 1. Read all .md files to understand requirements

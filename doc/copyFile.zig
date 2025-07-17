@@ -77,7 +77,7 @@ pub fn copyFile(src_path: []const u8, dst_path: []const u8, timeout_seconds: u32
         result.mutex.unlock();
         
         if (done) {
-            try thread.join();
+            thread.join();
             if (result.failed) return error.CopyFailed;
             return;
         }
@@ -106,7 +106,7 @@ fn copyFileWorker(src_path: []const u8, dst_path: []const u8, result: *FileCopyR
 fn copyFileDirect(src_path: []const u8, dst_path: []const u8) !void {
     // Create destination directory if it doesn't exist
     const dst_dir = std.fs.path.dirname(dst_path) orelse ".";
-    try std.fs.makeDirAbsolute(dst_dir) catch |err| switch (err) {
+    std.fs.makeDirAbsolute(dst_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -159,78 +159,6 @@ fn copyFileWindows(src_path: []const u8, dst_path: []const u8) !void {
     }
 }
 
-// Optional: Windows file copy with progress callback
-fn copyFileWindowsWithProgress(src_path: []const u8, dst_path: []const u8) !void {
-    if (builtin.os.tag != .windows) {
-        @compileError("copyFileWindowsWithProgress can only be called on Windows");
-    }
-    
-    const allocator = std.heap.page_allocator;
-    
-    // Convert UTF-8 paths to UTF-16 for Windows API
-    const src_path_w = try std.unicode.utf8ToUtf16LeWithNull(allocator, src_path);
-    defer allocator.free(src_path_w);
-    
-    const dst_path_w = try std.unicode.utf8ToUtf16LeWithNull(allocator, dst_path);
-    defer allocator.free(dst_path_w);
-    
-    // Progress callback function
-    const progressCallback = struct {
-        fn callback(
-            TotalFileSize: windows.LARGE_INTEGER,
-            TotalBytesTransferred: windows.LARGE_INTEGER,
-            StreamSize: windows.LARGE_INTEGER,
-            StreamBytesTransferred: windows.LARGE_INTEGER,
-            dwStreamNumber: windows.DWORD,
-            dwCallbackReason: windows.DWORD,
-            hSourceFile: std.os.windows.HANDLE,
-            hDestinationFile: std.os.windows.HANDLE,
-            lpData: ?windows.LPVOID,
-        ) callconv(windows.WINAPI) windows.DWORD {
-            _ = StreamSize;
-            _ = StreamBytesTransferred;
-            _ = dwStreamNumber;
-            _ = dwCallbackReason;
-            _ = hSourceFile;
-            _ = hDestinationFile;
-            _ = lpData;
-            
-            // Calculate progress percentage
-            if (TotalFileSize > 0) {
-                const progress = (@as(f64, @floatFromInt(TotalBytesTransferred)) / @as(f64, @floatFromInt(TotalFileSize))) * 100.0;
-                std.debug.print("Copy progress: {d:.1}%\r", .{progress});
-            }
-            
-            return windows.PROGRESS_CONTINUE;
-        }
-    }.callback;
-    
-    // Call CopyFileExW with progress callback
-    const result = windows.CopyFileExW(
-        src_path_w.ptr,
-        dst_path_w.ptr,
-        progressCallback,
-        null, // No user data
-        null, // No cancel flag
-        0,    // No special flags
-    );
-    
-    if (result == 0) {
-        const err = std.os.windows.kernel32.GetLastError();
-        switch (err) {
-            .FILE_NOT_FOUND => return error.FileNotFound,
-            .PATH_NOT_FOUND => return error.PathNotFound,
-            .ACCESS_DENIED => return error.AccessDenied,
-            .DISK_FULL => return error.DiskFull,
-            .FILE_EXISTS => return error.FileExists,
-            .SHARING_VIOLATION => return error.SharingViolation,
-            else => return error.UnexpectedError,
-        }
-    }
-    
-    std.debug.print("\nCopy completed successfully!\n", .{});
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -254,14 +182,6 @@ pub fn main() !void {
         std.fmt.parseInt(u32, args[3], 10) catch 30 
     else 
         30;
-    
-    std.debug.print("Copying from: {s}\n", .{args[1]});
-    std.debug.print("Copying to: {s}\n", .{args[2]});
-    std.debug.print("Timeout: {d} seconds\n", .{timeout});
-    
-    if (builtin.os.tag == .windows) {
-        std.debug.print("Using native Windows CopyFileExW API for enhanced performance\n", .{});
-    }
     
     copyFile(args[1], args[2], timeout) catch |err| {
         std.debug.print("Error copying file: {}\n", .{err});
