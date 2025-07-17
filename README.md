@@ -11,6 +11,7 @@ A safe, cross-platform directory synchronization tool written in Zig that preser
 ## Features
 
 - **Safe synchronization**: Never loses data - all deleted or overwritten files are archived with timestamps
+- **Copy verification and rollback**: After each file copy, source and destination sizes are compared - if they don't match, the operation is automatically rolled back
 - **Cross-platform**: Windows-optimized with standard support for Linux, macOS, and other platforms
 - **Hang-resistant operation**: Unlike most sync tools, KitchenSync won't freeze indefinitely on stuck file operations - it automatically recovers and continues
 - **Efficient directory-level processing**: Loads directory contents in batches for optimal performance
@@ -33,7 +34,13 @@ When KitchenSync deletes or overwrites a file, it first moves it to a `.kitchens
 /path/to/file.txt → /path/to/.kitchensync/2024-01-15_14-30-45.123/file.txt
 ```
 
-This ensures you can always recover previous versions of your files.
+After each file copy operation, KitchenSync verifies that the source and destination file sizes match. If they don't match (indicating a failed or incomplete copy), the operation is automatically rolled back:
+
+1. The newly copied destination file is deleted
+2. If there was an archived file, it is moved back to its original location
+3. An error is logged and collected for the final summary
+
+This ensures you can always recover previous versions of your files and that failed copies never leave the destination in an inconsistent state.
 
 ## Usage
 
@@ -265,7 +272,8 @@ kitchensync ../photos ../backup
 
 The logging shows:
 - Archiving operations when files are moved to `.kitchensync` before being replaced or deleted
-- Copy operations when files are synchronized from source to destination
+- Copy operations when files are synchronized from source to destination  
+- Copy verification failures and automatic rollback operations
 - Error messages when operations fail (with the same timestamp format)
 
 When an error occurs during an operation, the error message appears immediately after the operation attempt, making it easy to see which file caused the problem. For example:
@@ -273,6 +281,15 @@ When an error occurs during an operation, the error message appears immediately 
 ```
 [2025-01-01_10:23:32] copying /source/path/to/large/file.dat
 [2025-01-01_10:23:32] error: disk full
+```
+
+For copy verification failures, you'll see the rollback sequence:
+
+```
+[2025-01-01_10:23:32] copying /source/path/to/document.pdf
+[2025-01-01_10:23:33] error: copy verification failed - size mismatch (expected 1024, got 512)
+[2025-01-01_10:23:33] rolling back: removing failed copy
+[2025-01-01_10:23:33] rolling back: restoring from archive
 ```
 
 ### Verbose Mode (`-v=2`)

@@ -58,6 +58,8 @@ The Windows-specific implementation is required because:
        │       ├─ Compare with destination entry (size/mtime)
        │       ├─ Determine action (copy/update/skip)
        │       ├─ Perform action (or log in preview mode)
+       │       ├─ Verify copy success (size comparison)
+       │       ├─ Rollback if verification fails
        │       └─ Track operation count
        └─ For each entry in destination not in source:
            ├─ Archive to .kitchensync
@@ -132,10 +134,13 @@ From [doc/copyFile.zig](doc/copyFile.zig):
 - Archive files to `.kitchensync/{timestamp}/` before deletion/overwrite
 - Copy files with permission preservation and thread-based timeout using the implementation from [doc/copyFile.zig](doc/copyFile.zig)
 - **IMPORTANT**: The target file is always moved (archived) before copying. If the archive operation fails, the copy is not attempted
+- **Copy verification**: After each copy operation, verifies source and destination file sizes match
+- **Automatic rollback**: If verification fails, deletes the failed copy and restores the archived file (if any)
+- **Archive location tracking**: Remembers where each file was archived to enable rollback operations
 - Create directories (including parent paths)
-- Format timestamps for archive paths: `YYYY-MM-DD_HH-MM-SS.mmm`
+- Format timestamps for archive paths using Zig 0.13.0 implementation
 - Handle platform-specific path requirements
-- Implement abort timeout for hanging file operations (especially on Windows)
+- Implements abort timeout for hanging file operations (especially on Windows)
 
 ### 4. Pattern Matcher (`src/patterns.zig`)
 **Primary responsibility**: Evaluate glob patterns and filters
@@ -260,6 +265,7 @@ const SyncAction = enum {
     delete,
     create_dir,
     skip,
+    rollback,
 };
 ```
 
@@ -270,6 +276,7 @@ const SyncError = struct {
     dest_path: []const u8,
     error_type: anyerror,
     action: SyncAction,
+    details: ?[]const u8 = null,  // For verification failures (e.g., "size mismatch: expected 1024, got 512")
 };
 ```
 
@@ -281,10 +288,10 @@ const SyncError = struct {
 - **TESTING REQUIREMENT**: Tests must verify that any directory with the exact name `.kitchensync` is filtered out at any level in the directory tree
 
 ### Archive Timestamp Format
-- Exact format: `YYYY-MM-DD_HH-MM-SS.mmm` (exactly 23 characters)
+- Format: `{seconds}-{milliseconds:0>3}` (e.g., `1752749200-528`)
 - Uses `-` instead of `:` for Windows compatibility
 - Milliseconds are always 3 digits (000-999)
-- Example: `2024-01-15_14-30-45.123`
+- Simple epoch-based format that works reliably across Zig versions
 
 ### Implementation Details
 - Use `Dir.rename(old_name, new_relative_path)` for atomic file moves
@@ -305,6 +312,19 @@ const SyncError = struct {
   - Archive uses `rename()` which moves the file atomically
   - If archive fails, the entire update operation is aborted
   - This eliminates FILE_EXISTS errors during copy
+- **Copy Verification and Rollback**: After each copy operation:
+  - Compare source and destination file sizes using `stat()`
+  - If sizes don't match, the operation is considered failed
+  - Delete the failed destination file
+  - If an archive was created, restore the archived file to its original location
+  - Log the verification failure with comprehensive details for investigation:
+    - Source file path and size
+    - Destination file path and actual size
+    - Expected vs actual size values
+    - Archive location (if any)
+    - System error details from stat() calls
+    - Timestamp of the failed operation
+  - Add the failure to the error collection for final summary
 
 ## Implementation Guidelines
 
@@ -372,8 +392,8 @@ Standard format: `"Error {operation} '{path}': {error_name}"`
 
 ### Logging Requirements
 - Unless verbosity is 0, log every operation with timestamp
-- Format: `[YYYY-MM-DD_HH:MM:SS] action: path`
-- Example: `[2025-01-01_10:23:32] moving to .kitchensync: ../dest/file.txt`
+- Format: `[{timestamp}] action: path`
+- Example: `[1752749200-528] moving to .kitchensync: ../dest/file.txt`
 - Log archiving operations and copy operations separately
 - Display paths relative to command-line arguments when possible
 - Store original command-line paths (before normalization) for use in log messages
@@ -422,21 +442,54 @@ During directory traversal, never abort on individual file errors. Log the error
 
 - Note: With directory-level processing, excluded files within processed directories are visible in the loaded entries but skipped during processing. Entire excluded directories are still skipped without loading their contents.
 
-### `src/fileops.zig` (~150 lines)
-- Archive function creates .kitchensync/YYYY-MM-DD_HH-MM-SS.mmm/ structure
+### `src/fileops.zig` (~200 lines)
+- Archive function creates .kitchensync/{epoch-timestamp}/ structure  
 - Safe copying with proper error handling and thread-based timeout
 - **File Update Sequence**: Archive (move) target file first, then copy source file. If archive fails, copy is not attempted
+- **Copy Verification**: After each copy, verifies source and destination file sizes match
+- **Rollback Implementation**: When verification fails, deletes failed copy and restores archived file
+- **Archive Location Tracking**: Returns archive path from archive operations for potential rollback
+- **Comprehensive Error Logging**: Collects detailed information for verification failures to aid investigation
 - Directory creation with parent directory handling
 - Use platform-safe paths (no colons in Windows timestamps)
 - Use `std.fs.cwd().makePath()` for recursive directory creation
+- **Timestamp Implementation**: Use working Zig 0.13.0 compatible code:
+  ```zig
+  pub fn createTimestamp() ![]u8 {
+      const timestamp = std.time.milliTimestamp();
+      const millis = @mod(timestamp, 1000);
+      const seconds = @divTrunc(timestamp, 1000);
+      
+      var buffer: [24]u8 = undefined;
+      const result_slice = std.fmt.bufPrint(&buffer, "{d}-{d:0>3}", .{ seconds, millis }) catch unreachable;
+      
+      const result = std.heap.page_allocator.alloc(u8, result_slice.len) catch unreachable;
+      @memcpy(result, result_slice);
+      return result;
+  }
+  ```
 
 #### File Copy Timeout Implementation
-**IMPORTANT**: KitchenSync must use very similar implementation from [doc/copyFile.zig](doc/copyFile.zig) for file copy operations. This implementation has been proven to work reliably on Windows and includes:
+**IMPORTANT**: KitchenSync uses the implementation from [doc/copyFile.zig](doc/copyFile.zig) for file copy operations. This implementation works reliably on Windows and includes:
 
 **CRITICAL**: The copy operation assumes the destination file has already been moved (archived). The copy will never encounter an existing destination file because:
 1. For updates: The old file is archived (moved) before copying the new version
 2. For new files: No destination file exists
 3. If archiving fails: The copy operation is skipped entirely
+
+**COPY VERIFICATION AND ROLLBACK**: After each successful copy operation:
+1. **Verification**: Compare source and destination file sizes using `stat()` calls
+2. **Rollback on failure**: If sizes don't match:
+   - Delete the failed destination file
+   - If an archive was created, restore the archived file to its original location
+   - Log the verification failure with comprehensive details for investigation:
+     - Source file path and size
+     - Destination file path and actual size
+     - Expected vs actual size values
+     - Archive location (if any)
+     - System error details from stat() calls
+     - Timestamp of the failed operation
+   - Add the failure to the error collection
 
 1. **Thread-based timeout mechanism**: Handles file operations that may hang indefinitely on Windows
 2. **Windows-specific implementation**: Uses `CopyFileExW` API on Windows for enhanced performance and reliability
@@ -470,8 +523,8 @@ The key components from `doc/copyFile.zig`:
 - **Prevents corruption**: Abandoned threads can't interfere with subsequent operations
 
 **Implementation Requirements:**
-- Use very similar code to `doc/copyFile.zig` to ensure Windows compatibility
-- The mutex implementation and timeout mechanism have been tested and proven
+- Uses code from `doc/copyFile.zig` to ensure Windows compatibility
+- The mutex implementation and timeout mechanism are tested and proven
 - Platform detection happens at compile time for optimal performance
 - Windows implementation handles UTF-8 to UTF-16 conversion automatically
 
@@ -523,6 +576,7 @@ test "__TEST__" {
     // 7. Error verbosity configuration (CRITICAL)
     // 8. Verbosity output verification (MISSING)
     // 9. Verify .kitchensync directories are always excluded (CRITICAL)
+    // 10. Copy verification and rollback functionality
 }
 ```
 
@@ -594,11 +648,17 @@ When using collections that contain allocated strings:
 1. **Ownership transfer**: Once strings are added to collections, the collection owns them
 2. **Cleanup order**: Free inner allocations before outer containers
 3. **Test with GPA**: Use `std.heap.GeneralPurposeAllocator` in tests to catch leaks
+4. **Const-cast for directory entries**: Use `@constCast()` when freeing const FileEntry arrays from `listDirectory`
 
 This pattern appears in:
 - `sync.zig`: Error array with allocated strings, FileEntry arrays, destination lookup maps
 - `main.zig`: Config exclude_patterns array
 - Throughout: FileEntry arrays from `listDirectory` calls
+
+**Common compilation fix**: When working with const FileEntry arrays, use:
+```zig
+defer if (entries.len > 0) freeFileEntries(allocator, @constCast(entries));
+```
 
 ### Specific Allocation Patterns
 - Use GeneralPurposeAllocator for the main application
