@@ -3,7 +3,7 @@
 ## Phase 0: Clean Start
 Delete all files and subdirectories (including hidden) except:
 - Root .md files
-- doc/ directory (if exists)
+- doc/ directory (if exists) and its contents
 - Git files (.git, .gitignore)
 
 ## Phase 1: Build Incrementally

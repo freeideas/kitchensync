@@ -95,6 +95,11 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 - `relativePath` - Convert absolute to relative paths for glob matching and logging (returns allocated string)
 - Note: Use `allocator.free()` to clean up - `freeRelativePath` won't work due to const/mutable mismatch
 
+From [doc/copyFile.zig](doc/copyFile.zig):
+- `copyFile` - Thread-based file copy with timeout support and Windows-specific implementation
+- Uses `CopyFileExW` on Windows for reliability and performance
+- Falls back to standard Zig file copy on other platforms
+
 ## Core Components
 
 ### 1. Main Application (`src/main.zig`)
@@ -125,7 +130,7 @@ From [doc/Relativizer.md](doc/Relativizer.md):
 **Primary responsibility**: Perform atomic file system operations
 
 - Archive files to `.kitchensync/{timestamp}/` before deletion/overwrite
-- Copy files with permission preservation and thread-based timeout
+- Copy files with permission preservation and thread-based timeout using the implementation from [doc/copyFile.zig](doc/copyFile.zig)
 - Create directories (including parent paths)
 - Format timestamps for archive paths: `YYYY-MM-DD_HH-MM-SS.mmm`
 - Handle platform-specific path requirements
@@ -419,91 +424,31 @@ During directory traversal, never abort on individual file errors. Log the error
 - Use `std.fs.cwd().makePath()` for recursive directory creation
 
 #### File Copy Timeout Implementation
-KitchenSync uses a worker thread approach to handle file operations that may hang indefinitely on Windows. Each file copy operation spawns a new thread, allowing the main thread to abandon the operation if it exceeds the timeout.
+**IMPORTANT**: KitchenSync must use very similar implementation from [doc/copyFile.zig](doc/copyFile.zig) for file copy operations. This implementation has been proven to work reliably on Windows and includes:
 
-```zig
-const FileCopyResult = struct {
-    completed: bool = false,
-    failed: bool = false,
-    mutex: std.Thread.Mutex = .{},
-};
+1. **Thread-based timeout mechanism**: Handles file operations that may hang indefinitely on Windows
+2. **Windows-specific implementation**: Uses `CopyFileExW` API on Windows for enhanced performance and reliability
+3. **Cross-platform fallback**: Uses standard Zig file copy on non-Windows systems
 
-pub fn copyFile(src_path: []const u8, dst_path: []const u8, timeout_seconds: u32) !void {
-    if (timeout_seconds == 0) {
-        // No timeout - direct copy
-        return copyFileDirect(src_path, dst_path);
-    }
-    
-    var result = FileCopyResult{};
-    
-    // Spawn worker thread for the actual copy operation
-    const thread = try std.Thread.spawn(.{}, copyFileWorker, .{src_path, dst_path, &result});
-    
-    // Main thread waits with timeout
-    const timeout_ns = @as(u64, timeout_seconds) * std.time.ns_per_s;
-    var timer = try std.time.Timer.start();
-    
-    while (timer.read() < timeout_ns) {
-        result.mutex.lock();
-        const done = result.completed or result.failed;
-        result.mutex.unlock();
-        
-        if (done) {
-            try thread.join();
-            if (result.failed) return error.CopyFailed;
-            return;
-        }
-        
-        std.time.sleep(10 * std.time.ns_per_ms); // Check every 10ms
-    }
-    
-    // Timeout occurred - abandon the thread
-    thread.detach();
-    return error.Timeout;
-}
+The key components from `doc/copyFile.zig`:
+- `copyFile()` - Main entry point with timeout support
+- `copyFileWorker()` - Worker thread function
+- `copyFileDirect()` - Platform-aware copy implementation
+- `copyFileWindows()` - Windows-specific implementation using `CopyFileExW`
 
-fn copyFileWorker(src_path: []const u8, dst_path: []const u8, result: *FileCopyResult) void {
-    copyFileDirect(src_path, dst_path) catch {
-        result.mutex.lock();
-        result.failed = true;
-        result.mutex.unlock();
-        return;
-    };
-    
-    result.mutex.lock();
-    result.completed = true;
-    result.mutex.unlock();
-}
+**Critical Windows Benefits**:
+- Native Windows API avoids antivirus interference
+- Better handling of file locks and permissions
+- More reliable than standard cross-platform approaches
+- Supports large file copies without hanging
 
-fn copyFileDirect(src_path: []const u8, dst_path: []const u8) !void {
-    // Standard file copy implementation
-    const src_file = try std.fs.openFileAbsolute(src_path, .{});
-    defer src_file.close();
-    
-    const src_stat = try src_file.stat();
-    
-    const dst_dir = std.fs.path.dirname(dst_path) orelse ".";
-    try createDirectory(dst_dir);
-    
-    const dst_file = try std.fs.createFileAbsolute(dst_path, .{ .mode = src_stat.mode });
-    defer dst_file.close();
-    
-    try src_file.seekTo(0);
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const bytes_read = try src_file.read(&buf);
-        if (bytes_read == 0) break;
-        try dst_file.writeAll(buf[0..bytes_read]);
-    }
-}
-```
-
-**Key Design Decisions:**
+**Key Design Decisions** (from `doc/copyFile.zig`):
 
 1. **Thread per copy**: Each file copy operation runs in its own thread
 2. **Main thread controls timeout**: The sync engine's main thread monitors the timeout
 3. **Thread abandonment**: On timeout, the thread is detached and abandoned
 4. **Natural cleanup**: When the abandoned thread's kernel call eventually returns, the thread exits normally
+5. **Windows-specific path**: Uses `CopyFileExW` on Windows for reliability
 
 **Why thread abandonment is acceptable:**
 - **Rare occurrence**: Timeouts only happen when system-level issues cause indefinite hangs
@@ -512,11 +457,11 @@ fn copyFileDirect(src_path: []const u8, dst_path: []const u8) !void {
 - **System reclamation**: All resources are freed when the process exits
 - **Prevents corruption**: Abandoned threads can't interfere with subsequent operations
 
-**Implementation Notes:**
-- The mutex protects the shared result structure
-- The main thread polls every 10ms to check completion
-- `thread.detach()` makes the thread independent - it will clean itself up when done
-- If timeout is 0 (disabled), we skip threading entirely for efficiency
+**Implementation Requirements:**
+- Use very similar code to `doc/copyFile.zig` to ensure Windows compatibility
+- The mutex implementation and timeout mechanism have been tested and proven
+- Platform detection happens at compile time for optimal performance
+- Windows implementation handles UTF-8 to UTF-16 conversion automatically
 
 ## Glob Pattern Handling and Filtering Strategy
 
