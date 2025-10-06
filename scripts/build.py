@@ -33,6 +33,18 @@ def main():
     build_src_dir.mkdir()
     release_dir.mkdir(exist_ok=True)
 
+    # Delete existing release files to make build success/failure obvious
+    jar_path = release_dir / "kitchensync.jar"
+    exe_name = "kitchensync.exe" if sys.platform == "win32" else "kitchensync"
+    exe_path = release_dir / exe_name
+
+    if jar_path.exists():
+        print(f"Removing existing {jar_path}...")
+        jar_path.unlink()
+    if exe_path.exists():
+        print(f"Removing existing {exe_path}...")
+        exe_path.unlink()
+
     # Find all Java source files
     print("Finding Java source files...")
     src_dir = project_root / "src" / "main" / "java"
@@ -103,11 +115,11 @@ def main():
     # Try to find native-image
     native_image_bin = None
     if sys.platform == "win32":
-        # Check common locations
+        # Check common locations - use full path to bin directory
         possible_paths = [
+            Path(r"C:\acex\mountz\jdk\bin\native-image.cmd"),
             "native-image.cmd",
             "native-image",
-            Path(r"C:\acex\mountz\jdk\lib\svm\bin\native-image.exe"),
         ]
     else:
         possible_paths = ["native-image"]
@@ -115,7 +127,7 @@ def main():
     for path in possible_paths:
         try:
             print(f"Checking: {path}")
-            result = subprocess.run([str(path), "--version"], capture_output=True, timeout=5)
+            result = subprocess.run([str(path), "--version"], capture_output=True, timeout=30, shell=True)
             if result.returncode == 0:
                 native_image_bin = str(path)
                 print(f"Found native-image: {native_image_bin}")
@@ -137,9 +149,11 @@ def main():
         "-jar", str(jar_path),
         "-o", str(exe_path.with_suffix("")),  # Remove .exe, native-image adds it on Windows
         "--no-fallback",
-        "-H:+ReportExceptionStackTraces"
+        "-H:+ReportExceptionStackTraces",
+        "-march=x86-64",  # Use baseline x86-64 instruction set for maximum compatibility
+        "-O1"  # Lower optimization level for better compatibility
     ]
-    
+
     # Add static linking options for Linux only (not supported on Windows)
     if sys.platform != "win32":
         native_image_cmd.extend([
@@ -148,7 +162,7 @@ def main():
         ])
 
     try:
-        result = subprocess.run(native_image_cmd, capture_output=True, text=True)
+        result = subprocess.run(native_image_cmd, capture_output=True, text=True, shell=True)
         if result.returncode != 0:
             print("\nWARNING: Native image creation failed")
             if result.stderr:
