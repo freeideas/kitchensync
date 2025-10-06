@@ -150,8 +150,10 @@ def main():
         "-o", str(exe_path.with_suffix("")),  # Remove .exe, native-image adds it on Windows
         "--no-fallback",
         "-H:+ReportExceptionStackTraces",
-        "-march=x86-64",  # Use baseline x86-64 instruction set for maximum compatibility
-        "-O1"  # Lower optimization level for better compatibility
+        "-march=compatibility",  # Maximum compatibility for old x64 CPUs (Celeron, etc.)
+        "-O1",  # Lower optimization level for better compatibility
+        "--gc=serial",  # Simple GC for older hardware
+        "-H:-GenLoopSafepoints"  # Better compatibility with older CPUs
     ]
 
     # Add static linking options for Linux only (not supported on Windows)
