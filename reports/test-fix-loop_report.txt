@@ -1,0 +1,28 @@
+Test-Fix-Loop Report
+===================
+
+Date: 2025-10-02
+
+## Issues Found and Fixed
+
+### Issue 1: Platform-specific path separator in ArchiveManager unit test
+**Location:** ArchiveManager.java:134-140 (getArchivePath_TEST_)
+**Problem:** Test was checking for Unix-style path separators (`/`) but on Windows, paths use backslashes (`\`).
+**Fix:** Normalized paths by replacing backslashes with forward slashes before checking path patterns.
+**Lines changed:** 134-143
+
+### Issue 2: Multiple archive timestamps for single sync operation
+**Location:** ArchiveManager.java archiveFile() and archiveDirectory()
+**Problem:** Each call to archiveFile() and archiveDirectory() created a new timestamp, resulting in separate timestamped directories for files and directories archived during the same sync operation. The end-user test expected all archived items to be in a single timestamped directory.
+**Fix:** Implemented session-level timestamp management using beginArchiveSession()/endArchiveSession() methods. Added these calls in FileSyncer.syncDirectories() to ensure all archives in a sync operation share the same timestamp.
+**Files modified:**
+- ArchiveManager.java: Added sessionTimestamp, beginArchiveSession(), endArchiveSession(), getTimestamp()
+- FileSyncer.java: Wrapped syncDirectoryContents() with try-finally to manage archive session
+
+## Test Results
+- All 6 unit test classes pass
+- All 9 end-user tests pass
+- Build succeeds (both JAR and native executable)
+
+## Documentation Accuracy
+No significant inaccuracies found in README.md or SPECIFICATION.md. The documentation accurately describes the expected behavior.

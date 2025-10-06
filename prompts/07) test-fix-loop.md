@@ -1,0 +1,3 @@
+Read @README.md and @SPECIFICATION.md then...
+Run ./scripts/test.py ; if the test does not pass, edit code (including test.py code if needed) and re-test. Run ./scripts/build.py as needed.
+As you work, append lines to ./reports/test-fix-loop_report.txt whenever you have significant difficulties, or if you find any inaccuracies in the documentation.
