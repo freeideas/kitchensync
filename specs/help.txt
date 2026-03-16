@@ -1,0 +1,19 @@
+Usage: kitchensync [OPTIONS] [DIRECTORY]
+
+Real-time directory synchronization across multiple filesystem targets.
+
+Arguments:
+  [DIRECTORY]  Sync root directory [default: current directory]
+
+Options:
+      --once  Sync once and exit (no filesystem watcher)
+  -h, --help  Print this help
+
+Setup:
+  1. Create .kitchensync/ in the directory you want to sync
+  2. Add peer URLs to .kitchensync/peers.conf (one per line)
+  3. Run kitchensync
+
+If .kitchensync/ does not exist, kitchensync creates it.
+If peers.conf is missing or empty, there are no peers to sync with —
+kitchensync starts normally but skips outbound and inbound sync.

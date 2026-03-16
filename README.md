@@ -1,155 +1,49 @@
 # KitchenSync
 
-Safe directory synchronization tool that never loses data. Optimized for Windows with cross-platform support.
+Real-time directory synchronization across multiple filesystem targets.
 
 ## What It Does
 
-KitchenSync copies files from a source directory to a destination directory, ensuring they stay in sync. Before replacing or deleting any file, it archives the old version to a `.kitchensync` directory with a timestamp, so you never lose data.
+KitchenSync keeps a directory in sync across peers. On startup it walks all devices (local and peers concurrently), compares their states, and transfers files to resolve differences. Depending on the mode, it either continues running or exits.
 
-## Quick Start
+## Modes
 
-```bash
-# Preview what would be synchronized (safe - makes no changes)
-java -jar kitchensync.jar /source/path /dest/path
+**Watch mode** (default): walks all devices, compares and transfers via per-peer queues (10 queues per peer, connections opened on demand), then watches the local filesystem for ongoing changes. The watcher enqueues changed paths for each peer as changes are detected. Runs until stopped.
 
-# Actually perform the sync
-java -jar kitchensync.jar /source/path /dest/path -p=N
+**Once mode** (`--once`): walks all devices, drains all peer queues, then exits. No filesystem watcher. Pushes local changes to all peers and pulls peer changes locally, but does not propagate changes between peers — a subsequent run completes the propagation. Useful for scripting, cron jobs, and testing.
 
-# Exclude certain files
-java -jar kitchensync.jar /source /dest -x "*.tmp" -x ".git" -p=N
-```
+**Help** (`--help`): prints the contents of `help.txt` and exits.
 
-## Key Features
+Peers that are switched off or unreachable are skipped with a log entry.
 
-- **Never loses data** - archives all replaced/deleted files with timestamps
-- **Copy verification** - automatically rolls back failed copies
-- **Hang-resistant** - won't freeze on stuck files like other sync tools
-- **Preview mode** - see what would change before making changes (default)
-- **Pattern exclusion** - skip files matching glob patterns
-- **Cross-platform** - works on Windows, Linux, macOS
+## No Destructive Writes
 
-## Usage
+KitchenSync never deletes nor overwrites files. When a sync operation would replace or remove a file, the existing file is first moved into `.kitchensync/BACK/<timestamp>/<filename>`.
 
-```bash
-java -jar kitchensync.jar [options] SOURCE DESTINATION
+## Timestamps
 
-Options:
-  -p=Y/N      Preview mode (default: Y) - set to N to actually sync
-  -m=Y/N      Compare modification times (default: Y)
-  -g=Y/N      Greater size only - copy only if source is larger (default: N)
-  -c=Y/N      Force copy all files (default: N)
-  -v=0/1/2    Verbosity: 0=silent, 1=normal, 2=verbose (default: 1)
-  -a=SECONDS  Abort timeout for stuck operations (default: 30)
-  -x PATTERN  Exclude files matching pattern (can be repeated)
-  -t=Y/N      Include timestamp-like filenames (default: N)
-  -h, --help  Show help
-```
+All timestamps throughout KitchenSync use a single format: `YYYYMMDDTHHmmss.ffffffZ` — UTC with microsecond precision (e.g. `20260314T091523.847291Z`). This applies to tombstones, BACK directory names, XFER directory names, reconcile_time, log entries, and the `/shutdown` API.
 
-## Examples
+## The `.kitchensync/` Directory
 
-```bash
-# Windows: Sync documents folder
-java -jar kitchensync.jar C:\Users\John\Documents D:\Backup\Documents -p=N
+Each synced directory contains a `.kitchensync/` directory that stores all local metadata. This directory is excluded from synchronization.
 
-# Linux/macOS: Backup projects
-java -jar kitchensync.jar ~/projects /backup/projects -p=N
+| Path                         | Purpose                                                             |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `peers.conf`                 | Peer URLs, one per line                                             |
+| `manifest`                   | List of all known file paths on this device, one per line           |
+| `reconcile_time`             | Timestamp of last successful walk                                   |
+| `SNAP/`                      | Tombstones only — one file per deleted path (see `sync.md`)         |
+| `XFER/<uuid>/<timestamp>/`   | Staging area for in-progress transfers (see `sync.md`)              |
+| `BACK/<timestamp>/`          | Displaced files, organized by timestamp                             |
+| `kitchensync.sqlite`         | SQLite database: config and logging (see `quartz-lifecycle.md`)     |
 
-# Exclude build artifacts
-java -jar kitchensync.jar ./src ./backup \
-  -x ".git" -x "node_modules" -x "*.o" -p=N
+## Implementation
 
-# Resume interrupted transfer (only copy larger files)
-java -jar kitchensync.jar /downloads /backup -g=Y -p=N
+Written in Rust. Built binaries go into `./released/` using platform-specific names:
 
-# Silent mode for scripts
-java -jar kitchensync.jar /src /dest -p=N -v=0
-```
-
-## How Files Are Compared
-
-Files are compared primarily by size:
-- Different sizes = file needs sync
-- Same size + different modification time (if `-m=Y`) = file needs sync
-- Same size + different modification time (if `-m=N`) = file not copied, but modtime updated
-- Force copy mode (`-c=Y`) = always copy everything
-
-After syncing, destination modification times always match source (except in preview mode). This ensures running sync twice in a row with no changes makes no copies the second time.
-
-## File Safety
-
-Before replacing or deleting any file, KitchenSync moves it to an archive:
-
-```
-/dest/file.txt → /dest/.kitchensync/2024-01-15_14-30-45.123/file.txt
-```
-
-After copying, KitchenSync verifies the file size matches. If not, it automatically:
-1. Deletes the bad copy
-2. Restores the archived file
-3. Reports an error
-
-## Glob Patterns
-
-Exclude files using these patterns:
-
-```
-*               Match any characters (except /)
-?               Match one character
-[abc]           Match any character in set
-[a-z]           Match any character in range
-{pat1,pat2}     Match either pattern
-**              Match directories recursively
-
-Examples:
-  *.tmp         All .tmp files
-  .*            Hidden files
-  **/*.log      Log files in any subdirectory
-  build/**      Everything under build/
-```
-
-## Output
-
-KitchenSync shows configuration at startup, then displays each operation:
-
-```
-[2024-01-15_14:30:45] moving to .kitchensync: oldfile.txt
-[2024-01-15_14:30:45] copying newfile.txt
-```
-
-At the end, it displays a summary:
-
-```
-Synchronization summary:
-  Files copied:     42
-  Files filtered:   15
-  Symlinks skipped: 3
-  Errors:           0
-```
-
-## Building
-
-```bash
-# Using the build script
-./scripts/build.py
-
-# Or manually
-mkdir -p build release
-javac -d build src/main/java/**/*.java
-jar -cfe release/kitchensync.jar KitchenSync -C build .
-```
-
-Requires Java 11 or later. No other dependencies.
-
-## Platform Notes
-
-**Windows**: Uses native APIs for best performance. Handles paths with `\` or `/`, drive letters, UNC paths.
-
-**Linux/macOS**: Uses standard Java file operations. Preserves file permissions.
-
-## Troubleshooting
-
-**Permission errors**: Antivirus may be scanning files. KitchenSync will skip and continue.
-
-**Files not excluded**: Use quotes: `-x "*.tmp"` not `-x *.tmp`
-
-**Hung operations**: Adjust timeout with `-a=SECONDS` (default 30)
+| Platform | Binary              |
+| -------- | ------------------- |
+| Linux    | `kitchensync.linux` |
+| Windows  | `kitchensync.exe`   |
+| macOS    | `kitchensync.mac`   |
