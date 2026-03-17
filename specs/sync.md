@@ -4,59 +4,96 @@ How KitchenSync synchronizes files across devices.
 
 ## The `.kitchensync/` Directory
 
-Any directory with a `.kitchensync/` directory is an independent sync root. Each sync root has its own peer list, its own manifest, and operates independently — it knows nothing about parent or child directories that may also be sync roots.
-
-This means subtrees can sync independently. A parent sync root walks into subdirectories that are also sync roots and syncs their files normally — it just skips all `.kitchensync/` directories.
+Any directory with a `.kitchensync/` directory can be an independent sync root. Each sync root has its own peer list, its own database, and operates independently.
 
 Contents:
 
-- `peers.conf` — list of peer URLs to sync with
-- `manifest` — list of all known file paths on this device, one per line
-- `reconcile_time` — timestamp of last successful walk
-- `SNAP/` — tombstone files only (see "Tombstones" below)
-- `XFER/<uuid>/<timestamp>/` — staging area for in-progress transfers (see "Transfer Staging" below)
-- `BACK/` — files displaced by sync operations, organized by timestamp
-- `kitchensync.sqlite` — SQLite database: config and logging only (see `quartz-lifecycle.md`)
+| Path                | Purpose                                          |
+| ------------------- | ------------------------------------------------ |
+| `kitchensync.db`    | Local snapshot database (see `database.md`)      |
+| `peers.conf`        | Peer configuration (see `peers.md`)              |
+| `PEER/`             | Peer databases with queues (persist across runs) |
+| `BACK/<timestamp>/` | Displaced files, organized by timestamp          |
 
-## Tombstones (SNAP/)
+Note: XFER staging directories are created in `.kitchensync/XFER/` directories throughout the tree (adjacent to target files), not just at the sync root. See "Transfer Staging" below.
 
-When a file is deleted, a tombstone is created at `SNAP/<filename>` containing:
+## Local Database
 
-```json
-{"del_time": "20260314T091523.847291Z"}
-```
+The local database (`.kitchensync/kitchensync.db`) contains the snapshot table -- the known state of the local filesystem. This enables fast startup:
 
-Tombstones are the only files in SNAP. There are no entries for live files — live file metadata (size, mtime) comes from the filesystem itself.
+1. On startup, compare the database to the filesystem
+2. Any differences are immediately detected -- no need to walk peers first
+3. Changed paths are enqueued to all peers within seconds
 
-A tombstone records when a deletion was detected:
-- **Watcher sees the deletion in real time** — `del_time` is the current time. Precise.
-- **Walk detects the deletion** (file in manifest but not on disk) — `del_time` is set to `reconcile_time` from the previous run. This is conservative: the file could have been deleted any time after the last reconcile. If a peer modified it after our reconcile_time, the peer's modification wins. This biases toward preserving data.
+See `database.md` for schema details.
 
-Tombstones older than 6 months are deleted during walks.
+## Peer Databases
 
-## Manifest
+Each configured peer has a database at `.kitchensync/PEER/{peer-name}.db` containing:
+- **snapshot** table -- the peer's filesystem state, with tombstones for deleted files
+- **queue** table -- paths awaiting sync with this peer
+- **config** table -- peer-specific config (`last_walk_time`)
 
-The `manifest` file lists every file path known to exist on this device, one per line. It is updated at the end of each walk to reflect the current state of the filesystem.
+Queue entries persist across runs and disconnections, enabling fast sync when a peer reconnects. At startup, peer databases for peers not listed in `peers.conf` are deleted -- this cleans up after peer removal. The snapshot table persists across connections, enabling deletion detection (see Peer Walker).
 
-The manifest's purpose is to detect deletions. When a walk finds a path in the manifest but not on disk, that file was deleted since the last run — a tombstone is created.
+See `database.md` for schema details.
 
-## Reconcile Time
+## Tombstones
 
-The `reconcile_time` file contains a single timestamp — when the last walk successfully completed. It provides the conservative `del_time` for deletions detected during walks.
+When a file is deleted, its snapshot row is updated: `del_time` is set to the deletion timestamp. The row remains as a tombstone.
+
+Tombstone timing:
+- **Watcher detects deletion in real time** -- `del_time` is the current time. Precise.
+- **Walker detects deletion** (in database but not on disk) -- `del_time` is set to the `last_walk_time` from the config table. This is conservative: the file could have been deleted any time after the last walk. If a peer modified it after our last walk, the peer's modification wins.
+
+The `last_walk_time` is stored in the config table and updated at the end of each successful local walk.
+
+### Resurrection
+
+If a deleted file reappears (exists on disk but has `del_time` set in the database), compare `mod_time` to `del_time`:
+- `mod_time > del_time` -- the file wins. Clear `del_time`, update the row, enqueue to peers.
+- `mod_time <= del_time` -- the deletion wins. The file appeared from somewhere stale (e.g., restored from old backup). Delete it again, move to BACK/.
+
+Tombstones older than `tombstone-retention-days` (default: 180, ~6 months) are deleted during walks. Why 6 months default? Long enough for occasionally-connected peers (USB drives, laptops) to sync before the deletion record expires; short enough to not accumulate forever.
 
 ## Transfer Staging (XFER/)
 
-All file transfers are staged through `.kitchensync/XFER/` on the destination device:
+File transfers are staged in an XFER directory on the destination device. The XFER directory is created inside a `.kitchensync/` directory in the **target file's parent directory**:
 
 ```
-.kitchensync/XFER/<uuid>/<timestamp>/<filename>
+<target-parent>/.kitchensync/XFER/<timestamp>/<uuid>/<basename>
 ```
 
-The full transfer process (decide, transfer, recheck, swap) is described in `reconciliation.md`. The key property: the final swap is a rename on the same filesystem — near-atomic. A file is either fully present or not; there are no partially written files visible in the sync root.
+For example, transferring `docs/notes/readme.txt` stages to:
+```
+docs/notes/.kitchensync/XFER/20260314T091523.847291Z/a1b2c3d4/readme.txt
+```
 
-Multiple threads may transfer the same file concurrently. Each gets its own UUID directory, so writes don't collide. Redundant work, never corruption.
+The XFER directory contains only the file's basename, not a path -- the directory structure is already encoded by the XFER directory's location.
 
-XFER directories older than 2 days are deleted during walks.
+Why near the target? If the sync root spans multiple mounted filesystems, placing XFER in the same directory as the target ensures the final rename is same-filesystem -- instant rather than copy+delete. The sync root's `.kitchensync/` might be on a different device than the target file.
+
+Why inside `.kitchensync/`? Keeps staging directories hidden from users. No visible pollution in their file tree.
+
+Why timestamp in path? Makes it trivial to identify and clean up stale transfers -- just compare the directory name to the current time.
+
+The transfer process:
+1. **Transfer** -- copy file to XFER staging in target parent's `.kitchensync/XFER/`
+2. **Recheck** -- stat the destination; if state changed, re-evaluate
+3. **Swap** -- displace existing file to BACK/, rename from XFER to final location
+4. **Cleanup** -- delete the empty XFER directories (uuid, then timestamp if empty)
+
+The swap is a rename on the same filesystem -- instant and atomic. Files are either fully present or not; no partial writes visible in the sync root.
+
+Multiple threads may transfer the same file concurrently. Each gets its own UUID directory, so writes don't collide.
+
+Stale XFER directories (from crashes) older than `xfer-cleanup-days` (default: 2) are deleted during walks. Why 2 days default? Long enough that a slow transfer won't be interrupted; short enough to clean up crash debris promptly. The walker scans for `.kitchensync/XFER/` directories throughout the tree, not just at the sync root.
+
+When walking a peer, the walker also deletes stale `.kitchensync/XFER/` directories older than `xfer-cleanup-days` on the peer, handling crash debris from our push operations.
+
+File permissions are not synchronized. New files use the destination system's default permissions (umask-based).
+
+If the destination file is read-only, KitchenSync clears the read-only attribute before displacement. On failure, the transfer is skipped and logged as an error.
 
 ## The `BACK/` Directory
 
@@ -66,97 +103,160 @@ When a sync operation would overwrite or remove a file, the existing file is mov
 .kitchensync/BACK/<timestamp>/<filename>
 ```
 
-No file is ever destroyed — displaced files are always recoverable from `BACK/`.
+No file is ever destroyed -- displaced files are always recoverable.
 
-## Walk
-
-A walk updates a device's metadata to match its filesystem. Same operation on every device; the only difference is I/O (local filesystem vs SFTP).
-
-1. Read `manifest` → set of previously known paths.
-2. Walk the filesystem → set of (path, size, mtime) for all files on disk.
-3. Paths in manifest but not on disk → create tombstone with `del_time` = `reconcile_time`.
-4. Paths on disk with existing tombstone → file resurrected, remove tombstone.
-5. Write updated `manifest` (paths currently on disk).
-6. Update `reconcile_time`.
-7. Clean up: delete XFER directories older than 2 days, delete tombstones older than 6 months.
-
-The walk also builds an **in-memory index** of the device's state: live files (path, size, mtime) from the directory listing, plus tombstones (path, del_time) from SNAP. This index is used by the compare step — no additional I/O needed.
-
-### SFTP efficiency
-
-For a remote peer with 50,000 files, the walk requires:
-- Directory listing of the filesystem: ~4 MB (gives all file metadata for free)
-- Directory listing of SNAP: negligible (only tombstones, typically few)
-- Read `manifest`: ~2.5 MB (one file, 50,000 paths)
-- Read tombstone files: negligible (few small files)
-- Write updated `manifest`: ~2.5 MB (one file)
-- Write `reconcile_time`: negligible (one small file)
-
-**Total: ~9 MB.** No per-file reads or writes for live files.
-
-## Compare
-
-After all walks complete, the compare step diffs the in-memory indexes. For each peer, take the union of all paths across local and peer indexes and apply the decision rules from `reconciliation.md`:
-
-- In local index only (live or tombstone) → enqueue on this peer's queue
-- In peer index only (live or tombstone) → enqueue on this peer's queue
-- In both but different (mtime, size, or deletion state) → enqueue on this peer's queue
-- In both and matching → skip
-
-This is entirely in-memory — zero I/O. The indexes were built during the walks.
+BACK directories older than `back-retention-days` (default: 90) are deleted during walks. Why 90 days default? Long enough to recover from accidental sync conflicts or user mistakes; short enough to reclaim disk space from obsolete backups.
 
 ## Peer Queues
 
-Each peer has 10 queues. A queue entry is just a path — a lightweight hint meaning "this path probably needs reconciliation between local and this peer." The actual decision is made by the queue worker at processing time, using fresh data.
+Each peer has a queue stored in its SQLite database (`.kitchensync/PEER/{name}.db`). A queue entry is just a relative path -- a lightweight hint meaning "this path probably needs sync between local and this peer."
 
-When a path needs to be enqueued for a peer, it goes to that peer's shortest queue.
+Queue entries persist across runs and disconnections. When a peer reconnects after being offline, all accumulated changes are ready to sync immediately.
 
-### Queue workers
+### Queue Characteristics
 
-Each queue has a worker. The worker:
+- **Deduplicated by path** -- same path enqueued twice results in one entry (with refreshed timestamp)
+- **Capped at 10,000 entries** -- when full, oldest entries are dropped to make room
+- **Recent-first priority** -- newer changes get the "fast path"; older changes that overflow are caught by the peer walk
 
-1. Dequeues a path.
-2. Reads the current state of the path on both sides (stat the file, check for tombstone).
-3. Applies the decision rules from `reconciliation.md`. If no action is needed (another worker already handled it, or state changed), skip.
-4. If a transfer is needed, executes the 4-phase process (decide, transfer, recheck, swap).
+The queue is an optimization, not the source of truth. The peer walk catches everything, including paths that overflowed the queue.
 
-A queue worker opens a connection to the peer when it dequeues its first item. The connection stays open while the queue is non-empty. When the queue drains, the connection is closed. Idle queues consume no resources.
+## Connection Manager
 
-### Connection efficiency
+Each peer has a dedicated connection manager thread that handles the connection lifecycle:
 
-Ten queues per peer means up to 10 concurrent SFTP connections. For fast networks, all 10 may be active. For slow peers or small syncs, most queues stay empty and only one or two connections are used.
+```
+loop forever:
+    if queue is non-empty:
+        connect (try URLs in order, retry every `retry-interval` seconds on failure)
+        spawn `workers-per-peer` worker threads → drain queue
+        wait for queue to empty (or connection drop)
+        disconnect
+    else if time since last_walk_time > rewalk_after_minutes:
+        connect (try URLs in order)
+        walk peer filesystem → update snapshot table
+        record last_walk_time
+        drain any queue entries discovered by walk
+        disconnect
+    else:
+        sleep briefly, check again
+```
+
+On first iteration, `last_walk_time` is unset, so `time since last_walk_time > rewalk_after_minutes` is true -- triggering an immediate walk. This catches any changes that occurred while disconnected. Periodic re-walks (controlled by `rewalk-after-minutes`, default 12 hours) catch external changes on peers that don't run KitchenSync.
+
+Why `workers-per-peer` workers (default: 10)? This allows concurrent transfers per peer, saturating fast network links. All workers share the SSH connection (via separate SFTP channels).
+
+### No Idle Connections
+
+Connections only open when there's work to do (queue non-empty or time to re-walk). When the queue drains, the connection closes. This is friendly to:
+- Peers that sleep (NAS, laptops)
+- Networks with connection limits
+- Long-running watch mode sessions
+
+### Worker Threads
+
+When a connection is established, `workers-per-peer` (default: 10) worker threads are spawned. Each worker:
+
+1. Dequeues a path from the SQLite queue
+2. Looks up the path in local database and peer database
+3. Applies decision rules from `reconciliation.md`
+4. If action needed, executes push or pull through XFER staging
+5. Updates both databases after successful transfer
+6. Repeats until queue is empty
+
+Workers exit when the queue is empty. The connection manager waits for all workers to finish, then closes the connection.
+
+If a transfer fails (network error, permission denied, etc.), the worker logs the error and continues to the next queue item. The failed path is not re-enqueued -- it will be re-discovered on the next periodic rewalk.
 
 ## Startup Sequence
 
-### Once mode
+### Watch Mode (default)
 
-1. **Quartz lifecycle** — init database, instance check, start HTTP server (see `quartz-lifecycle.md`).
-2. **Walk all devices concurrently** — one thread per device (local + all reachable peers). Each walk updates the device's manifest, reconcile_time, and tombstones, and builds an in-memory index.
-3. **Compare** — for each peer, diff the in-memory indexes and enqueue differing paths on that peer's queues.
-4. **Drain queues** — wait for all peer queues to empty. Queue workers execute the 4-phase transfer for each path.
-5. **Shutdown** — log `info` to database. Exit 0.
+1. **Init** -- open local database, instance check
+2. **Start watcher** -- immediately, before walks begin. Why first? To catch any filesystem changes that happen during the walks; otherwise those changes could be missed.
+3. **Start local walker** -- compares database to filesystem, enqueues differences to all peers' SQLite queues
+4. **Start connection managers** -- one thread per configured peer, each runs independently
+5. **Steady state** -- watcher detects changes, enqueues to all peers; connection managers handle sync
+6. **Shutdown** -- receive `POST /shutdown`, stop watcher, wait for connection managers to drain queues, exit
 
-Once mode pushes all local changes to peers and pulls all changes from peers to local, but does not propagate changes between peers. For example, a file pulled from the NAS will not be pushed to the USB drive in the same run. A subsequent run (or watch mode) will complete the propagation. In watch mode, the watcher sees files arriving locally from any peer and automatically enqueues them for all other peers.
+### Once Mode (`--once`)
 
-### Watch mode
+1. **Init** -- open local database, instance check
+2. **Start local walker** -- compares database to filesystem, enqueues to all peers
+3. **Start connection managers** -- one thread per configured peer
+4. **Wait for completion** -- all connection managers must: connect, walk peer, drain queue, disconnect
+5. **Shutdown** -- exit 0
 
-Steps 1–4 are the same as once mode. Then:
+In once mode, changes detected by peer walkers are enqueued to all peers (not just the detecting peer). This propagates changes between peers in a single run. Connection managers exit after one cycle instead of looping.
 
-5. **Steady state** — the filesystem watcher (started in step 1, see below) detects local changes. For each change, enqueue the path on each peer's shortest queue.
-6. **Shutdown** — receive `POST /shutdown`. Stop the watcher. Drain remaining queues. Log `info` to database. Exit 0.
+## Local Walker
 
-### Watch mode: the watcher
+The local walker compares the database to the filesystem:
 
-In watch mode, the filesystem watcher starts **immediately** after the quartz lifecycle completes — before the walks begin. Events accumulate in an unbounded FIFO queue. A watcher thread consumes from this queue: for each event, update the local manifest and tombstones as needed, then enqueue the path on each peer's shortest queue.
+**Phase 1: Walk the filesystem**
+- For each file/directory on disk, check the database
+- If not in database (new): insert row, enqueue to all peers
+- If in database but changed (mod_time or size): update row, enqueue to all peers
+- If in database with `del_time` set (resurrection): compare `mod_time` to `del_time`
+  - If `mod_time > del_time`: file wins. Clear `del_time`, update row, enqueue to all peers.
+  - If `mod_time <= del_time`: deletion wins. Delete the file, move to BACK/. (File appeared from stale source.)
 
-The walks (step 2) and queue draining (step 4) run concurrently with the watcher. Since all writes go through XFER staging, concurrent operations on the same path produce redundant work at worst, never corruption.
+**Phase 2: Walk the database**
+- For each row without `del_time`, check the filesystem
+- If not on disk (deleted): set `del_time` to `last_walk_time`, enqueue to all peers
 
-The watcher only monitors the local filesystem. There is no equivalent for peers — peers are only walked during startup. This is the one asymmetry between local and peer.
+**Phase 3: Update last_walk_time**
+- Store current timestamp in config table as `last_walk_time`
+
+This detects all local changes since the last run and fans them out to all peers immediately -- no peer walks needed first.
+
+## Peer Walker
+
+The peer walker runs inside the connection manager, immediately after establishing a connection. It mirrors the local walker's logic, updating the peer snapshot incrementally rather than clearing it.
+
+**Phase A: Walk the remote filesystem**
+- Walk the peer's filesystem over SFTP
+- For each file on peer, check the peer snapshot table:
+  - If not in snapshot (new): insert row, enqueue to this peer's queue
+  - If in snapshot but changed (mod_time or size): update row, enqueue to this peer's queue
+  - If in snapshot with `del_time` set (resurrection): compare `mod_time` to `del_time`
+    - If `mod_time > del_time`: file wins. Clear `del_time`, update row, enqueue.
+    - If `mod_time <= del_time`: deletion wins. Skip (deletion will propagate to peer).
+- In `--once` mode: also enqueue to all other peers' queues
+
+**Phase B: Walk the peer snapshot**
+- For each row in peer snapshot without `del_time`, check the peer filesystem
+- If not on peer (deleted): set `del_time` to `last_walk_time`, enqueue to this peer's queue
+- In `--once` mode: also enqueue to all other peers' queues
+
+**Phase C: Update last_walk_time**
+- Store current timestamp in peer database's config table as `last_walk_time`
+
+This catches:
+- Files that exist on the peer but not locally (or are different)
+- Files that exist locally but not on the peer
+- Files deleted on the peer since last walk (tombstones with accurate `del_time`)
 
 ## Threading Model
 
-- **Watcher thread** (watch mode only) — starts immediately. Consumes filesystem events, updates local manifest/tombstones, enqueues paths on peer queues.
-- **Walk threads** — one per device (local + each reachable peer), running concurrently during startup. Each thread walks its device and builds an in-memory index.
-- **Queue workers** — 10 per peer. Each worker dequeues a path, reads fresh state, applies decision rules, and executes the 4-phase transfer if needed. Opens a connection on first item, closes when queue drains.
+- **Watcher thread** (watch mode only) -- starts immediately, updates local database, enqueues paths to all peers' SQLite queues
+- **Local walker thread** -- compares database to filesystem at startup, enqueues differences to all peers
+- **Connection manager threads** -- one per configured peer, handles connect/walk/drain/disconnect cycle
+- **Worker threads** -- `workers-per-peer` (default: 10) per peer, spawned by connection manager when connected, drain the queue
 
-Unreachable peers get no threads; they are skipped with a log entry and catch up on a future run. If a peer becomes unreachable mid-session, its queue workers log `error` and exit.
+The watcher and local walker start immediately at startup. Connection managers start concurrently and independently retry connections every `retry-interval` seconds until successful. When a connection succeeds, the peer walk runs, then workers drain the queue, then the connection closes.
+
+## Configuration Watching
+
+KitchenSync watches `.kitchensync/peers.conf` for changes. When the file is modified:
+
+1. Wait 500ms after the last modification (debounce)
+2. Log the configuration reload
+3. Gracefully shut down (same sequence as `POST /shutdown`)
+4. Re-execute with the original command-line arguments
+
+This applies to both watch mode and `--once` mode. The effect is identical to manually stopping KitchenSync, editing peers.conf, and restarting. Use case: you start `--once` and realize it's syncing to an unwanted slow device -- edit peers.conf to remove it and KitchenSync restarts without that peer.
+
+Why debounce? Text editors often write files in multiple steps (write temp, rename, or multiple rapid saves). Waiting 500ms after the last change avoids restarting on partial writes.
+
+Why restart instead of hot-reload? Simpler implementation, no edge cases around mid-sync config changes, and the existing design (persistent queues, XFER cleanup) already handles restarts gracefully.

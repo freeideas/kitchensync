@@ -11,9 +11,34 @@ Options:
 
 Setup:
   1. Create .kitchensync/ in the directory you want to sync
-  2. Add peer URLs to .kitchensync/peers.conf (one per line)
+  2. Add peers to .kitchensync/peers.conf:
+
+     peer-name
+       sftp://user@host/path
+       sftp://user@alternate-host/path
+
+     Each peer has a name followed by indented URLs (tried in order).
+
   3. Run kitchensync
 
 If .kitchensync/ does not exist, kitchensync creates it.
-If peers.conf is missing or empty, there are no peers to sync with —
-kitchensync starts normally but skips outbound and inbound sync.
+If peers.conf is missing or has no peers, kitchensync exits with an error.
+
+Configuration (optional lines in peers.conf before peer definitions):
+
+  Setting                     Default  Description
+  -------------------------   -------  --------------------------------
+  queue-max-size              10000    Max queued paths per peer
+  connection-timeout          30       Seconds for SSH connect
+  retry-interval              60       Seconds between reconnect attempts
+  workers-per-peer            10       Concurrent transfers per peer
+  xfer-cleanup-days           2        Delete stale staging dirs after
+  back-retention-days         90       Delete old backups after
+  tombstone-retention-days    180      Forget deletions after
+  log-retention-days          32       Purge log entries after
+
+Per-peer setting (indented line before URLs):
+
+  Setting                     Default  Description
+  -------------------------   -------  --------------------------------
+  rewalk-after-minutes        720      Minutes to wait between re-walks

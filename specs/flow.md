@@ -4,135 +4,190 @@ An example run of KitchenSync from start to exit, followed by tricky situations.
 
 ## Example: Once Mode
 
-Setup: node A syncs `/home/ace/docs` with two peers — a NAS over SSH and a USB drive.
+Setup: node A syncs `/home/bilbo/docs` with two peers -- a NAS and a USB drive.
 
 ```
 peers.conf:
-  sftp://ace@nas.local/volume1/docs
-  file:///media/ace/usb-backup/docs
+nas
+  sftp://bilbo@192.168.1.50/volume1/docs
+  sftp://bilbo@nas.tail12345.ts.net/volume1/docs
+
+usb-backup
+  file:///media/bilbo/usb-backup/docs
 ```
 
 Since last run, the user edited `report.txt` and deleted `old/draft.md` locally. Meanwhile, someone added `notes/meeting.txt` on the NAS, and `photos/cat.jpg` was copied to the USB drive.
 
 ### 1. Startup
 
-- Open `.kitchensync/kitchensync.sqlite`, init schema, set WAL mode.
-- Read `config` table for `"serving-port"` → port 48201. POST `http://127.0.0.1:48201/app-path` → connection refused (previous instance crashed). Proceed.
-- Bind `127.0.0.1:0` → OS assigns port 51033. Upsert `"serving-port" = "51033"` in `config` table.
-- Connect to NAS (SSH agent auth succeeds on first try). Connect to USB drive (local path, just check it exists).
-- Create 10 queues per peer (all empty, no connections yet).
-- Print `Listening on port 51033` to stdout. Log `info` to database.
+- Open `.kitchensync/kitchensync.db`, init schema, set WAL mode.
+- Instance check: read `config` table for `"serving-port"` -> POST `/app-path` -> connection refused. Proceed.
+- Bind `127.0.0.1:0` -> OS assigns port 51033. Upsert `"serving-port" = "51033"`.
+- Log `info` startup message to database.
+- Peer databases in `.kitchensync/PEER/` are preserved (queues persist).
 
-### 2. Walk all devices (concurrently)
+### 2. Local Walker
 
-Three threads run in parallel — one per device. Each thread reads the device's manifest, walks the filesystem, updates metadata, and builds an in-memory index.
+Runs immediately (no watcher in once mode).
 
-- **Local thread:** read manifest, walk `/home/ace/docs`.
-  - `report.txt`: on disk with new size/mtime. In-memory index records current state.
-  - `old/draft.md`: in manifest but not on disk → create tombstone `SNAP/old/draft.md` with `del_time` = `reconcile_time`. Remove from manifest.
-  - Write updated manifest. Update `reconcile_time`. Clean up one stale XFER directory from the previous crash.
-  - **In-memory index:** 49,999 live files + 1 tombstone.
-- **NAS thread:** read NAS's manifest over SFTP (~2.5 MB), walk NAS's filesystem (~4 MB directory listing).
-  - `notes/meeting.txt`: on disk but not in manifest → add to manifest. In-memory index records it.
-  - All other files: on disk, in manifest. Index records current state.
-  - Write updated manifest (~2.5 MB). Update `reconcile_time`.
-  - **In-memory index:** 50,001 live files + 0 tombstones.
-- **USB thread:** read USB's manifest, walk USB's filesystem (local I/O, no SFTP).
-  - `photos/cat.jpg`: on disk but not in manifest → add to manifest.
-  - **In-memory index:** 50,001 live files + 0 tombstones.
+- Phase 1: Walk `/home/bilbo/docs` filesystem
+  - `report.txt`: on disk with new size/mtime. Database shows old values. Update database row, enqueue to NAS and USB SQLite queues.
+  - Other files: match database. Skip.
+- Phase 2: Walk database for deletions
+  - `old/draft.md`: in database with no `del_time`, not on disk. Set `del_time`, enqueue to NAS and USB.
+- Local walker completes. Paths enqueued to peer SQLite databases.
 
-### 3. Compare (in-memory)
+### 3. Connection Managers (concurrently)
 
-Diff local index against each peer's index. Enqueue differing paths.
+Two connection manager threads start, one for NAS and one for USB.
 
-- **Local vs NAS:**
-  - `report.txt`: both live, local `mod_time` newer → enqueue on NAS queue.
-  - `old/draft.md`: local deleted, NAS live → enqueue on NAS queue.
-  - `notes/meeting.txt`: NAS live, local unknown → enqueue on NAS queue.
-  - All other paths match → skip.
-- **Local vs USB:**
-  - `report.txt`: both live, local `mod_time` newer → enqueue on USB queue.
-  - `old/draft.md`: local deleted, USB unknown → skip (no action per decision rules).
-  - `photos/cat.jpg`: USB live, local unknown → enqueue on USB queue.
-  - All other paths match → skip.
+**NAS connection manager:**
+- Try first URL `192.168.1.50` -> succeeds.
+- Walk NAS filesystem over SFTP, update snapshot table:
+  - `notes/meeting.txt`: on NAS, not in local database. Enqueue to NAS (and USB, since once mode).
+  - Other files: record in snapshot, skip if matches local.
+- Spawn `workers-per-peer` (default: 10) workers to drain NAS queue.
 
-### 4. Queue workers process entries
+**USB connection manager:**
+- Try `file://` path -> exists.
+- Walk USB filesystem, update snapshot table:
+  - `photos/cat.jpg`: on USB, not in local database. Enqueue to USB (and NAS, since once mode).
+  - Other files: record in snapshot, skip if matches local.
 
-- **NAS queue workers:**
-  - `report.txt`: local newer → push to NAS via XFER staging, displace NAS's copy to NAS's `BACK/`.
-  - `old/draft.md`: local `del_time` newer than NAS's `mod_time` → displace NAS's copy to NAS's `BACK/`, create tombstone on NAS.
-  - `notes/meeting.txt`: NAS live, local unknown → pull from NAS via local XFER staging.
-- **USB queue workers:**
-  - `report.txt`: local newer → push to USB via XFER staging.
-  - `photos/cat.jpg`: USB live, local unknown → pull from USB via local XFER staging.
+### 4. Workers Drain Queues
 
-Note: `notes/meeting.txt` was pulled locally from the NAS, and `photos/cat.jpg` from the USB drive. Neither is propagated to the other peer in this run — once mode does not propagate changes between peers. A subsequent run will detect these files locally and push them to the peers that don't have them. In watch mode, the watcher would catch them immediately.
+**NAS workers (`workers-per-peer` threads):**
+- `report.txt`: local database shows newer mtime than NAS snapshot. Push to NAS via XFER staging, displace NAS copy to NAS's `BACK/`.
+- `old/draft.md`: local `del_time` set, NAS still has file. Push deletion: displace NAS copy to NAS's `BACK/`.
+- `notes/meeting.txt`: NAS has file, local unknown. Pull from NAS via local XFER staging, update local database.
+
+**USB workers (`workers-per-peer` threads):**
+- `report.txt`: local newer than USB. Push to USB via XFER staging.
+- `photos/cat.jpg`: USB has file, local unknown. Pull from USB, update local database.
+- `notes/meeting.txt`: enqueued from NAS walker. Local now has it (pulled from NAS). Push to USB.
+- `old/draft.md`: enqueued from local walker. Local `del_time` set, USB unknown. No action needed.
 
 ### 5. Shutdown
 
-- All queues drained. Log `info` to database. Exit 0.
+- All connection managers complete their cycle (connect, walk, drain, disconnect).
+- Log `info` to database. Exit 0.
+- Peer databases (including empty queues) remain in `.kitchensync/PEER/`.
 
 ## Example: Watch Mode
 
 Setup: same as once mode above.
 
-### 1–4. Same as once mode
+### 1. Startup
 
-- Startup, walk, compare, queue processing — identical, except the filesystem watcher starts immediately after startup (before walks begin).
+Same as once mode, plus start the filesystem watcher immediately.
 
-### 5. Steady state
+### 2. Local Walker + Connection Managers
 
-- Watcher detects `todo.txt` created by the user.
-- Update local manifest, enqueue `todo.txt` on NAS's shortest queue and USB's shortest queue.
-- Queue workers pick it up: local has live file, peers have no entry → push to both via XFER staging.
-- Watcher continues until `POST /shutdown` is received.
+- Watcher starts, monitoring for filesystem changes.
+- Local walker runs, enqueues differences to peer SQLite queues.
+- Connection managers start (one per peer), begin connect/walk/drain cycles.
 
-### 6. Shutdown
+Watcher events for paths being walked may produce redundant enqueues -- harmless (deduped by path).
+
+### 3. Steady State
+
+- User creates `todo.txt`.
+- Watcher detects it, updates local database, enqueues to NAS and USB SQLite queues.
+- Connection managers see non-empty queues, connect, drain them.
+- When queues are empty, connection managers wait for either: new queue entries, or time to re-walk (per `rewalk-after-minutes`).
+- Periodic re-walks catch any external changes on peers that don't run KitchenSync.
+
+### 4. Shutdown
 
 - Receive `POST /shutdown` with valid timestamp. Respond `{"shutting_down": true}`.
-- Stop the filesystem watcher. Drain remaining queues.
+- Stop the watcher. Signal connection managers to finish current cycle and exit.
+- Wait for all connection managers to complete.
 - Log `info` to database. Exit 0.
 
 ## Tricky Situations
 
-### Peer unreachable during sync
+### Peer unreachable at startup
 
-The NAS is powered off. SSH connection refused → log `error`, skip the NAS entirely (no walk thread, no queues). Only the USB drive gets walked and queued. The NAS will receive the changes on a future run.
+The NAS is powered off. NAS connection manager tries all URLs, all fail -> log warning, sleep `retry-interval` seconds (default: 60), retry. Meanwhile, changes accumulate in NAS's SQLite queue. When NAS powers on, next connection attempt succeeds, peer walk runs, queue drains. Fast catch-up.
 
-### Peer becomes unreachable mid-session
+### Peer becomes unreachable mid-transfer
 
-The NAS was reachable during the walk but drops while a queue worker is transferring a file. The worker logs `error` and exits. Other NAS queue workers detect the same failure and exit. Any incomplete XFER directories will be cleaned up on a future run. The NAS catches up later.
+NAS was reachable during walk but drops during queue processing. Workers log `error` and exit. Connection manager detects the dropped connection, retries every `retry-interval` seconds (queue is still non-empty). When NAS is reachable again, reconnects and drains remaining queue. Incomplete XFER directories cleaned up on next walk.
 
 ### Both sides changed the same file
 
-Node A edited `config.yaml` at 09:00. While A was offline, someone edited `config.yaml` on the NAS at 10:00. During the walk, both in-memory indexes record their respective mtimes. The compare step sees different mtimes and enqueues the path. The queue worker stats both sides: NAS (10:00) is newer than local (09:00). A's version is displaced to local `BACK/`, NAS's version is pulled.
+Node A edited `config.yaml` at 09:00. Someone edited it on NAS at 10:00. Walker detects difference, enqueues path. Queue worker compares local database (09:00) to `nas.db` (10:00). NAS is newer. Local copy displaced to `BACK/`, NAS version pulled.
 
 ### File deleted on one side, modified on the other
 
-Node A deletes `notes.txt` while offline. The walk creates a tombstone with `del_time` = `reconcile_time` (say, 08:00). The NAS walk finds `notes.txt` with `mod_time` 10:00. The compare enqueues it. The queue worker reads both states: NAS `mod_time` (10:00) is newer than A's `del_time` (08:00) → NAS's version wins. The file is pulled back to A, the tombstone is removed.
+Node A deletes `notes.txt` while offline. Local walker sets `del_time` to current time (say, 08:00). NAS walker finds `notes.txt` with mtime 10:00. Queue worker compares: NAS mtime (10:00) > local `del_time` (08:00). NAS wins. File pulled back, `del_time` cleared.
 
-If the NAS's version were older (`mod_time` 07:00), A's deletion (08:00) would win → displace the NAS's copy to NAS's `BACK/`.
+If NAS version were older (mtime 07:00), deletion wins -> NAS copy displaced to NAS's `BACK/`.
 
 ### Crash during sync
 
-KitchenSync crashes while queue workers are transferring files. On next run, the instance check gets connection refused → proceeds to take ownership. Walks clean up stale XFER directories (older than 2 days) on all devices. The walks rebuild in-memory indexes from current disk state, the compare re-enqueues any unfinished work.
+KitchenSync crashes while transferring files. On next run:
+- Instance check gets connection refused -> take ownership
+- `PEER/` directory preserved -- queues survive the crash
+- Local walker re-enqueues any local changes (may duplicate, deduped by path)
+- Connection managers reconnect and continue processing
+- XFER directories older than `xfer-cleanup-days` (default: 2) cleaned up
+- BACK directories older than `back-retention-days` (default: 90) cleaned up
+- Tombstones older than `tombstone-retention-days` (default: 180) cleaned up
 
 ### Nested sync roots
 
-`/tree` is a sync root. `/tree/subtree/` is also a sync root (has its own `.kitchensync/`). The parent walks into `subtree/` and syncs its files normally but skips `subtree/.kitchensync/`. The child syncs independently with its own peers.
+`/tree` is a sync root. `/tree/subtree/` is also a sync root. The parent walks into `subtree/` and syncs its files normally but skips `subtree/.kitchensync/`. Each operates independently with its own database.
 
 ### Empty state (first run)
 
-Manifests are empty, no tombstones, no reconcile_time. The walks build in-memory indexes from directory listings. The compare finds every path differs (unknown on one side, live on the other). All files are exchanged — where the same path exists on both sides, the newer `mod_time` wins.
+Local database is empty. Local walker builds it from filesystem. Connection managers connect to peers, walk them, enqueue differences. Everything gets reconciled. Where same path exists on multiple devices, newer mtime wins.
 
 ### USB drive plugged in after a month
 
-USB's manifest and tombstones are a month old but internally consistent. Local and NAS have diverged. The USB walk updates nothing (USB's disk matches its manifest). The compare diffs local's index against USB's index and finds many differences — files added, modified, and deleted over the past month. All differences are enqueued and processed. The USB is brought up to date with local in one run.
+USB's files are a month old. While USB was offline, changes accumulated in USB's SQLite queue. When USB is plugged in:
+- USB connection manager detects `file://` path now exists
+- Connects, walks USB filesystem, updates snapshot
+- Drains queue (recent changes sync first, queue was capped at 10,000)
+- Peer walk catches any older changes that overflowed the queue
+- USB brought up to date
 
 ### Same file exists on two peers
 
-Both the NAS and the USB drive have `readme.txt`, both absent locally. The compare enqueues `readme.txt` on both the NAS queue and the USB queue. Both queue workers try to pull it locally through separate XFER UUIDs. Each writes to its own XFER directory, then moves into place. The second move displaces the first (to `BACK/`). The version with the newer `mod_time` ends up in place. Redundant work, but no corruption.
+Both NAS and USB have `readme.txt`, local doesn't. Both peer walkers enqueue it. Both queue workers try to pull through separate XFER UUIDs. Second move displaces the first to `BACK/`. Newer mtime wins. Redundant work, no corruption.
 
 ### Symlinks in the sync root
 
-The walk encounters a symlink, sees it's a symlink, and skips it entirely — it does not appear in the manifest or in-memory index and is not synced. This avoids syncing files outside the sync root, infinite loops, and Windows privilege issues.
+Walker encounters symlink -> skips it. Symlinks do not appear in databases and are not synced.
+
+### Fast fan-out on startup
+
+Local database already has 50,000 files from previous run. User edited 5 files since then. Local walker:
+1. Walks filesystem, comparing to database
+2. Detects 5 changed files within seconds
+3. Enqueues all 5 to all peers immediately
+
+No need to wait for peer walks. Outgoing updates begin within seconds of start.
+
+### Directory renamed (deep subtree)
+
+User renames `projects/old-name/` to `projects/new-name/`. The directory contains 500 files in nested subdirectories.
+
+KitchenSync does not track renames -- it sees paths. This looks like 500 deletions and 500 creations:
+
+**Local walker Phase 1 (walk filesystem):**
+- Encounters all 500 files under `projects/new-name/`
+- None exist in database (new paths) -> insert rows, enqueue to all peers
+
+**Local walker Phase 2 (walk database):**
+- Finds all 500 rows under `projects/old-name/`
+- None exist on disk -> set `del_time` on each, enqueue to all peers
+
+Both phases are required to see the full picture. Phase 1 alone would miss the deletions; Phase 2 alone would miss the creations.
+
+**Result:**
+- All 500 "new" files are transferred to peers (full content, not a rename optimization)
+- All 500 "old" files are deleted from peers (moved to peers' `BACK/`)
+- Bandwidth used: 500 files transferred, even though content is identical
+
+This is a known limitation of path-based sync. Content-addressed systems (like git or rsync with `--fuzzy`) can detect renames, but add significant complexity. KitchenSync prioritizes simplicity -- renames are rare compared to edits, and the result is correct even if not optimal.

@@ -8,7 +8,9 @@ Any directory may contain a `.syncignore` file listing patterns of files and dir
 
 `.syncignore` files are themselves synced, so ignore rules stay consistent across all peers.
 
-All directory walks — local and peer — apply the **local** `.syncignore` rules. Peer `.syncignore` files are not read during sync; they only take effect when that peer runs its own KitchenSync instance.
+All directory walks -- local and peer -- apply the **local** `.syncignore` rules. Peer `.syncignore` files are not read during sync; they only take effect when that peer runs its own KitchenSync instance.
+
+Why use local rules for peer walks? Consistency and predictability. The local machine decides what it cares about. Reading peer ignore rules would require extra SFTP round-trips and could cause confusing asymmetries (peer ignores a file that local wants).
 
 ## Pattern Format
 
@@ -33,8 +35,9 @@ Why: following symlinks could sync files outside the sync root or create infinit
 
 The following are always excluded regardless of ignore files:
 
-- `.kitchensync/` directories
-- `.git/` directories
-- Symbolic links (files and directories)
+- `.kitchensync/` directories -- sync metadata must not sync (would cause loops and conflicts)
+- `.git/` directories -- usually large, machine-specific, and already have their own sync mechanism (git push/pull). Can be overridden with `!.git/` in `.syncignore` if needed.
+- Symbolic links (files and directories) -- see Symlinks section above
+- Special files (devices, FIFOs, sockets) -- not regular files, cannot be transferred meaningfully
 
-A `.syncignore` file may negate the `.git/` exclusion (e.g. `!.git/`) to force syncing it. The `.kitchensync/` and symlink exclusions cannot be overridden.
+A `.syncignore` file may negate the `.git/` exclusion (e.g. `!.git/`) to force syncing it. The `.kitchensync/`, symlink, and special file exclusions cannot be overridden.
