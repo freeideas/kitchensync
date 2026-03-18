@@ -1,88 +1,100 @@
 # KitchenSync
 
-Real-time directory synchronization across multiple filesystem targets.
+Synchronize file trees across multiple peers.
 
 ## Why KitchenSync?
 
-**Zero infrastructure on peers.** KitchenSync only needs SSH access to remote peers -- the same SSH you already use. No daemons to install, no ports to open, no services to manage. If you can `ssh user@host`, KitchenSync can sync with it.
+**Zero infrastructure on peers.** Only needs SSH access — no daemons, no ports, no services. If you can `ssh user@host`, KitchenSync can sync with it.
 
-**Run it however you want.** Keep it running all day with the filesystem watcher, or run it occasionally manually or from cron. Run it on one machine, or run it on several. KitchenSync adapts to your workflow, not the other way around.
+**Any peer, anywhere.** The local filesystem isn't special — it's just another peer. Sync two remote servers without touching the local machine, or include a local directory alongside remotes.
 
-**Occasionally-connected peers just work.** USB drives, laptops, NAS boxes that sleep, servers behind flaky connections -- plug them in or wake them up and KitchenSync brings them current. No manual intervention, no conflict dialogs, no "sync pending" limbo.
+**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections — plug them in and KitchenSync brings them current. The snapshot knows what the world should look like; discrepancies are detected and resolved automatically.
 
-**Changes fan out in seconds.** The local database knows what changed since the last run. On startup, outgoing updates begin immediately -- no waiting to walk remote filesystems first.
+**N-way sync in one pass.** All peers are listed in parallel at each directory level. Decisions are made once, copies fan out to all peers that need them.
 
-**Highly parallel.** Up to 10 concurrent transfers per peer, with all peers syncing simultaneously. Utilizes fast links without manual tuning.
+**Multiple paths to every peer.** Each peer can have several URLs — local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the NAS over your LAN; at the office it goes through the VPN. One config, no switching.
 
-**Multiple paths to each peer.** Configure a peer with several connection methods (local file system, local IP, Tailscale, public DNS) and KitchenSync uses the first one that works. Automatically use home network when you're home, VPN when you're not.
+**Never destructive.** Old copies of overwritten or deleted files go to `.kitchensync/BACK/`. Multiple versions are kept for 90 days (configurable).
 
-**Never destructive.** KitchenSync keeps the old copy of every overwritten or deleted file. Displaced files go to `.kitchensync/BACK/` where you can recover them. Multiple changes are kept, but not forever. Deletions propagate with timestamp-based conflict resolution -- the most recent action wins, and ties go to keeping data.
-
-**No central server.** Every peer is equal. Sync between any subset of your devices. Add or remove peers anytime. No account, no cloud, no subscription.
+**No central server.** Every peer is equal (unless you use `--canon`). No account, no cloud, no subscription.
 
 ## How It Compares
 
 |                          | KitchenSync             | rsync  | Syncthing           | Unison      |
 | ------------------------ | ----------------------- | ------ | ------------------- | ----------- |
-| Software needed on peers | SSH only                | rsync  | Syncthing daemon    | Unison      |
+| Software needed on peers | No more than SSH        | rsync  | Syncthing daemon    | Unison      |
 | Bidirectional            | Yes                     | No     | Yes                 | Yes         |
 | Multi-peer mesh          | Yes                     | No     | Yes                 | Pairwise    |
 | Deletion propagation     | Yes                     | Manual | Yes                 | Yes         |
-| Watch mode               | Yes                     | No     | Always-on           | No          |
-| Run occasionally         | Yes                     | Yes    | Not designed for it | Yes         |
 | Conflict resolution      | Automatic (newest wins) | N/A    | Manual or LWW       | Interactive |
 
-## Modes
+## Quick Start
 
-**Watch mode** (default): Detects local changes immediately via filesystem watcher, syncs with all reachable peers continuously. Runs until stopped.
+1. Create a config directory and file:
 
-**Once mode** (`--once`): Syncs everything once and exits. Perfect for cron jobs, scripts, or "sync now" workflows.
+   ```
+   mkdir mydir/.kitchensync
+   ```
+
+2. Create `mydir/.kitchensync/kitchensync-conf.json`:
+
+   ```json5
+   {
+     peers: {
+       nas: {
+         urls: [
+           "sftp://bilbo@192.168.1.50/volume1/docs",   // home LAN
+           "sftp://bilbo@nas.tail12345.ts.net/volume1/docs"  // VPN fallback
+         ]
+       },
+       local: { urls: ["file://./"] }
+     }
+   }
+   ```
+
+3. Run:
+
+   ```
+   kitchensync mydir/
+   ```
+
+## Command Line
+
+```
+kitchensync <config> [--canon <peer-name>]
+```
+
+`<config>` can be:
+- Path to a `.json` config file
+- Path to a `.kitchensync/` directory
+- Path to the parent of a `.kitchensync/` directory
+
+`--canon <peer-name>` makes the named peer authoritative — every peer will be made the same as this named peer.
 
 ## The `.kitchensync/` Directory
 
-Each synced directory contains a `.kitchensync/` directory storing all metadata (excluded from sync):
+Convention: place the config file and database in a `.kitchensync/` directory. Contents:
 
-| Path             | Purpose                                          |
-| ---------------- | ------------------------------------------------ |
-| `kitchensync.db` | SQLite database: file state, config, logs        |
-| `peers.conf`     | Peer configuration                               |
-| `PEER/`          | Peer databases with queues (persist across runs) |
-| `BACK/`          | Displaced files, recoverable                     |
+| Path                    | Purpose                                      |
+| ----------------------- | -------------------------------------------- |
+| `kitchensync-conf.json` | Peer configuration (JSON5)                   |
+| `kitchensync.db`        | SQLite database: snapshot, config, logs      |
+| `BACK/`                 | Displaced files, recoverable for 90 days     |
 
-Transfer staging uses `.kitchensync/XFER/` directories throughout the tree, ensuring same-filesystem rename for instant swaps while keeping staging hidden from users.
+Transfer staging uses `.kitchensync/XFER/` directories near target files for atomic swaps.
 
 ## Cleanup
 
-Old data is automatically cleaned up during walks. Retention periods are configurable in `peers.conf` (see `kitchensync --help`):
-
-| What                      | Default Retention | Notes                                |
-| ------------------------- | ----------------- | ------------------------------------ |
-| Log entries               | 32 days           | Purged on every log insert           |
-| `.kitchensync/XFER/` dirs | 2 days            | Incomplete transfers from crashes    |
-| `BACK/` dirs              | 90 days           | Displaced files remain recoverable   |
-| Tombstones                | 6 months          | Deletion records in the database     |
-| `PEER/` databases         | 0 (startup)       | Databases for unlisted peers deleted |
-
-## Peer Configuration
-
-Peers are configured in `.kitchensync/peers.conf`. Each peer has a name followed by one or more URLs (tried in order):
-
-```
-nas
-  sftp://bilbo@192.168.1.50/volume1/docs
-  sftp://bilbo@nas.tail12345.ts.net/volume1/docs
-
-laptop
-  sftp://bilbo@laptop.local/home/bilbo/docs
-  sftp://bilbo@laptop.tail12345.ts.net/home/bilbo/docs
-
-usb-backup
-  file:///media/bilbo/usb-backup/docs
-```
+| What                      | Default Retention |
+| ------------------------- | ----------------- |
+| Log entries               | 32 days           |
+| `.kitchensync/XFER/` dirs | 2 days            |
+| `BACK/` dirs              | 90 days           |
+| Tombstones                | 180 days          |
 
 ## Timestamps
 
-All timestamps use `YYYYMMDDTHHmmss.ffffffZ` format -- UTC with microsecond precision.
+All timestamps use `YYYYMMDDTHHmmss.ffffffZ` — UTC with microsecond precision.
 
 ## Building
 
