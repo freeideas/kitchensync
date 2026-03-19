@@ -16,7 +16,6 @@ Using `file://` URLs and temporary directories:
 - **Snapshot** — updated during traversal, discrepancies detected on next run
 - **XFER staging** — atomic swaps, recheck, cleanup of stale dirs
 - **BACK directories** — displaced files recoverable, retention cleanup
-- **Ignore rules** — `.syncignore` parsing, pattern matching, hierarchy
 - **Config resolution** — all three forms (file, .kitchensync/ dir, parent dir)
 - **Offline peers** — skipped gracefully, caught up on next run
 - **Single instance** — second run detects first and exits

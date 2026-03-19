@@ -20,6 +20,10 @@ Localhost only.
 
 **POST /shutdown** — body: `{"timestamp": "YYYYMMDDTHHmmss.ffffffZ"}`, must be within 5 seconds in either direction of server time. Responds `{"shutting_down": true}`.
 
+## Post-Completion Linger
+
+After all work is complete, the app continues serving HTTP endpoints for 5 seconds, then the process exits with code 0. The process must terminate on its own — it must not hang or wait for a `/shutdown` request. A test that launches the binary with a valid config and two reachable `file://` peers must see the process exit within 15 seconds of launch.
+
 ## Logging
 
 All output goes to the `applog` table. On every insert, purge entries older than `log-retention-days`.
@@ -31,7 +35,12 @@ All output goes to the `applog` table. On every insert, purge entries older than
 | `debug` | Operational output            |
 | `trace` | Fine-grained diagnostics      |
 
+### Log Level
+
+The `config` table stores `"log-level"` (one of `error`, `info`, `debug`, `trace`). Default: `info`. Messages below the configured level are discarded — not written to `applog`. On startup, if no `"log-level"` row exists, insert one with value `info`.
+
 KitchenSync exceptions (CLI tool, not a service):
 - Does not print the port on startup (step 3).
 - Configuration errors are printed to stdout and cause immediate exit.
+- `info` and `error` log messages are also printed to stdout (in addition to being written to `applog`).
 - `/app-path` returns the canonical path to the resolved config file (not the binary). The instance check compares config file paths — multiple KitchenSync binaries may run simultaneously as long as they use different config files.

@@ -22,18 +22,18 @@ kitchensync <config> [--canon <peer-name>] [-h|--help]
 ## Run
 
 1. Purge expired tombstones, log entries, stale XFER and BACK directories
-2. Start worker threads (`workers`, default 10)
-3. Run multi-tree traversal (see multi-tree-sync.md)
+2. Run multi-tree traversal (see multi-tree-sync.md)
    - Directories created/deleted inline
-   - File copies enqueued to workers
+   - File copies enqueued for concurrent execution
    - Snapshot updated during traversal
-4. Wait for copy queue to drain
-5. Disconnect all peers
-6. Log completion, exit
+   - Per-peer concurrency limits enforced (see concurrency.md)
+3. Wait for all transfers to complete
+4. Disconnect all peers
+5. Log completion, exit
 
-## File Copy (Worker Thread)
+## File Copy
 
-Each worker pulls entries from the queue. Each entry is a `(src_peer, path, dst_peer, path)` pair.
+Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one read slot on the source peer and one write slot on the destination peer before starting (see concurrency.md).
 
 1. **Transfer** to XFER staging on destination: `<target-parent>/.kitchensync/XFER/<timestamp>/<uuid>/<basename>`
 2. **Displace** existing file to `<file-parent>/.kitchensync/BACK/<timestamp>/<basename>`
@@ -42,9 +42,18 @@ Each worker pulls entries from the queue. Each entry is a `(src_peer, path, dst_
 
 Content is streamed, not buffered in memory.
 
+## Logging
+
+Every file copy and every deletion (displacement to BACK/) is logged at `info` level with a short format:
+
+- Copy: `C <relative-path>`
+- Delete: `X <relative-path>`
+
+Logged once per decision, not per peer. This gives the user visible progress output (see quartz-lifecycle.md, KitchenSync exceptions).
+
 ## XFER Staging
 
-Staged near the target for same-filesystem atomic rename. Inside `.kitchensync/` to stay hidden. UUID per worker prevents collisions. Stale dirs cleaned after `xfer-cleanup-days` (default: 2).
+Staged near the target for same-filesystem atomic rename. Inside `.kitchensync/` to stay hidden. UUID per transfer prevents collisions. Stale dirs cleaned after `xfer-cleanup-days` (default: 2).
 
 ## BACK Directory
 

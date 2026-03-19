@@ -15,13 +15,6 @@ function sync_directory(peers, path, snapshot):
     // Phase 2: Union entry names (peers + snapshot children)
     all_names = union(listings.keys(), snapshot_children(path))
 
-    // Phase 2b: Resolve .syncignore before other entries
-    if ".syncignore" in all_names:
-        decide and sync .syncignore (same decision rules as any file)
-        load winning .syncignore rules for this directory
-        remove ignored names from all_names
-        remove ".syncignore" from all_names
-
     // Phase 3: Decide and act on each entry
     for name in all_names:
         states = gather_states(peers, listings, name)
@@ -31,7 +24,7 @@ function sync_directory(peers, path, snapshot):
         if decision.type == directory:
             for peer in peers:
                 if peer needs dir created:  create_dir(peer, path/name)
-                if peer needs dir deleted:  delete_dir_if_empty(peer, path/name)
+                if peer needs dir deleted:  displace_to_back(peer, path/name)
             update_snapshot(path/name, decision)
             sync_directory(peers, path/name, snapshot)  // recurse
 
@@ -42,6 +35,15 @@ function sync_directory(peers, path, snapshot):
             for each peer where file should be deleted:
                 displace_to_back(peer, path/name)
 ```
+
+## Built-in Excludes
+
+Always excluded from listings (never synced):
+
+- `.kitchensync/` directories — sync metadata must not sync
+- Symbolic links (files and directories) — following symlinks could escape the sync root or create loops
+- Special files (devices, FIFOs, sockets)
+- `.git/` directories
 
 ## Entry Classification
 
@@ -76,11 +78,13 @@ The canonical peer's state wins unconditionally:
 
 Timestamp tolerance: 5 seconds in either direction. The tolerance applies to Entry Classification: a peer's mod_time is considered "same" as the snapshot if it differs by ≤ 5 seconds. When comparing two peers' mod_times in Decision Rules, timestamps within 5 seconds of each other are treated as equal (fall through to rule 6/7).
 
+## Orphaned Tombstones
+
+If an entry (file or directory) is absent on all reachable peers and exists only as a tombstone in the snapshot, the tombstone is removed.
+
 ## Directory Decisions
 
-Directories use the same entry classification and decision rules as files (mod_time comparison, newest wins, timestamp tolerance). The same rules (1–7) apply. Additionally:
-- Delete only if empty; non-empty directories are retried on a later run
-- Absent everywhere (tombstone in snapshot only) → remove tombstone
+Directories use the same entry classification and decision rules as files (mod_time comparison, newest wins, timestamp tolerance). The same rules (1–7) apply. Directories are displaced to BACK/ just like files.
 
 ## Type Conflicts
 
