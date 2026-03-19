@@ -7,7 +7,7 @@ Startup, logging, and instance management for quartz apps.
 On startup:
 
 1. Open/create SQLite database, set WAL mode, enforce foreign keys, execute schema.
-2. Read `config` table for `"serving-port"`. If found, POST `/app-path` on `127.0.0.1:{port}`. If the returned canonical path matches this app's path, print `Already running against <config-file-path>` and exit(0). On failure (no row, connection refused, path mismatch), continue.
+2. Read `config` table for `"serving-port"`. If found, POST `/app-path` on `127.0.0.1:{port}`. If the returned canonical path matches the current instance's config file path, print `Already running against <config-file-path>` and exit(0). On failure (no row, connection refused, path mismatch), continue.
 3. Bind `127.0.0.1:0` (OS-assigned port), upsert `"serving-port"`, log startup.
 
 If the process crashes, the OS releases the port. The next instance detects connection refused and takes over.
@@ -16,13 +16,13 @@ If the process crashes, the OS releases the port. The next instance detects conn
 
 Localhost only.
 
-**POST /app-path** — returns canonical path to running binary (JSON string).
+**POST /app-path** — request body is empty. Returns the canonical path to the resolved config file (JSON string).
 
-**POST /shutdown** — body: `{"timestamp": "YYYYMMDDTHHmmss.ffffffZ"}`, must be within 5 seconds in either direction of server time. Responds `{"shutting_down": true}`.
+**POST /shutdown** — body: `{"timestamp": "YYYYMMDDTHHmmss.ffffffZ"}`, must be within 5 seconds in either direction of server time. Responds `{"shutting_down": true}`, flushes the response, then exits the process immediately (exit code 0) regardless of any in-progress work. If the timestamp is absent, malformed, or outside the ±5-second window, responds HTTP 403 with `{"error": "invalid timestamp"}`. If the body is not valid JSON, responds HTTP 400.
 
 ## Post-Completion Linger
 
-After all work is complete, the app continues serving HTTP endpoints for 5 seconds, then the process exits with code 0. The process must terminate on its own — it must not hang or wait for a `/shutdown` request. A test that launches the binary with a valid config and two reachable `file://` peers must see the process exit within 15 seconds of launch.
+After all work is complete, the app continues serving HTTP endpoints for 5 seconds, then the process exits with code 0. The process must terminate on its own — it must not hang or wait for a `/shutdown` request. A valid `/shutdown` request received during the linger period causes immediate exit (code 0).
 
 ## Logging
 
@@ -43,4 +43,4 @@ KitchenSync exceptions (CLI tool, not a service):
 - Does not print the port on startup (step 3).
 - Configuration errors are printed to stdout and cause immediate exit.
 - `info` and `error` log messages are also printed to stdout (in addition to being written to `applog`).
-- `/app-path` returns the canonical path to the resolved config file (not the binary). The instance check compares config file paths — multiple KitchenSync binaries may run simultaneously as long as they use different config files.
+- Only one instance may run per config file. Multiple KitchenSync binaries may run simultaneously as long as they use different config files.

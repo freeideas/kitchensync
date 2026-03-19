@@ -1,68 +1,98 @@
 # Configuration
 
-Config file format, settings, defaults, and peer definitions.
+Config file format, settings with defaults, peer definitions, URL schemes, and authentication.
 
-## $REQ_CONF_001: JSON5 Config Format
+## $REQ_CONFIG_001: JSON5 Config Format
 **Source:** ./README.md (Section: "Quick Start")
 
 The config file (`kitchensync-conf.json`) uses JSON5 format.
 
-## $REQ_CONF_002: Peers Section Required
+## $REQ_CONFIG_002: Peers Definition
+**Source:** ./README.md (Section: "Quick Start")
+
+The config file contains a `peers` object where each key is a peer name and each value contains a `urls` array.
+
+## $REQ_CONFIG_003: Minimum Two Peers
+**Source:** ./specs/sync.md (Section: "Startup")
+
+The config must define at least two peers, validated at parse time.
+
+## $REQ_CONFIG_004: Peer Name Format
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The config must contain a `peers` section. At least two peers are required.
+Peer names must match `[a-zA-Z0-9][a-zA-Z0-9_-]*` and be at most 64 characters.
 
-## $REQ_CONF_003: Peer URLs Array
+## $REQ_CONFIG_005: Multiple URLs Per Peer
+**Source:** ./README.md (Section: "Why KitchenSync?")
+
+Each peer can have multiple URLs. They are tried in order; the first successful connection is used.
+
+## $REQ_CONFIG_006: SFTP URL Scheme
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-Each peer has a `urls` array of one or more URLs. URLs are tried top-to-bottom; the first successful connection wins.
+SFTP URLs follow the format `sftp://user@host/path`, with optional port (`sftp://user@host:port/path`) and optional inline password (`sftp://user:password@host/path`). SFTP paths are absolute from filesystem root.
 
-## $REQ_CONF_004: Database Setting
+## $REQ_CONFIG_007: File URL Scheme - Absolute
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `database` setting specifies the SQLite database path. Default: `"kitchensync.db"`.
+`file:///absolute/path` specifies a local absolute path.
 
-## $REQ_CONF_005: Connection Timeout Setting
+## $REQ_CONFIG_008: File URL Scheme - Relative
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `connection-timeout` setting specifies seconds before an SSH connection attempt is aborted. Default: 30.
+`file://./relative/path` specifies a local path relative to the config file's directory.
 
-## $REQ_CONF_006: Workers Setting
+## $REQ_CONFIG_009: Password Percent Encoding
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `workers` setting specifies the number of concurrent file copy threads. Default: 10.
+Special characters in URL passwords must be percent-encoded (`@` → `%40`, `:` → `%3A`).
 
-## $REQ_CONF_007: XFER Cleanup Days Setting
+## $REQ_CONFIG_010: Authentication Fallback Chain
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `xfer-cleanup-days` setting specifies days before stale staging directories are deleted. Default: 2.
+SFTP authentication uses a fallback chain, stopping at first success: (1) inline password from URL, (2) SSH agent (`SSH_AUTH_SOCK`), (3) `~/.ssh/id_ed25519`, (4) `~/.ssh/id_ecdsa`, (5) `~/.ssh/id_rsa`.
 
-## $REQ_CONF_008: BACK Retention Days Setting
+## $REQ_CONFIG_011: Host Key Verification
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `back-retention-days` setting specifies days before displaced files are deleted. Default: 90.
+Host keys are verified via `~/.ssh/known_hosts`. Unknown hosts are rejected.
 
-## $REQ_CONF_009: Tombstone Retention Days Setting
+## $REQ_CONFIG_012: Database Path Setting
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `tombstone-retention-days` setting specifies days before deletion records are forgotten. Default: 180.
+The `database` setting specifies the SQLite database path (default: `kitchensync.db`). If relative, it resolves from the config file's directory. If absolute, it is used as-is.
 
-## $REQ_CONF_010: Log Retention Days Setting
+## $REQ_CONFIG_013: Connection Timeout Setting
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-The `log-retention-days` setting specifies days before log entries are purged. Default: 32.
+The `connection-timeout` setting specifies the number of seconds for SSH connect to be aborted (default: 30).
 
-## $REQ_CONF_011: Relative Paths Resolve From Config Directory
+## $REQ_CONFIG_014: Max Connections Setting
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-All relative paths in the config resolve from the config file's directory.
+The `max-connections` setting specifies the maximum concurrent connections per peer (default: 10).
 
-## $REQ_CONF_012: Peer URL .kitchensync Adjustment
+## $REQ_CONFIG_015: XFER Cleanup Days Setting
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-If the config file is inside a `.kitchensync/` directory, peer URL paths back up to the parent of `.kitchensync/` (so `"."` becomes `".."`). This adjustment applies only to peer URLs, not to other settings like `"database"`.
+The `xfer-cleanup-days` setting specifies when to delete stale staging dirs (default: 2 days).
 
-## $REQ_CONF_013: Peer Name Format
+## $REQ_CONFIG_016: Back Retention Days Setting
 **Source:** ./specs/help.md (Section: "Help Screen")
 
-Peer names must match `[a-zA-Z0-9][a-zA-Z0-9_-]*`, maximum 64 characters.
+The `back-retention-days` setting specifies when to delete displaced files (default: 90 days).
+
+## $REQ_CONFIG_017: Tombstone Retention Days Setting
+**Source:** ./specs/help.md (Section: "Help Screen")
+
+The `tombstone-retention-days` setting specifies when to forget deletion records (default: 180 days).
+
+## $REQ_CONFIG_018: Log Retention Days Setting
+**Source:** ./specs/help.md (Section: "Help Screen")
+
+The `log-retention-days` setting specifies when to purge log entries (default: 32 days).
+
+## $REQ_CONFIG_019: Kitchensync Directory Not a Sync Target
+**Source:** ./specs/help.md (Section: "Help Screen")
+
+`.kitchensync/` can never be a sync target. Peer URL paths must not resolve to a `.kitchensync/` directory.

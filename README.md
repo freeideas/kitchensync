@@ -75,13 +75,12 @@ kitchensync <config> [--canon <peer-name>]
 
 Convention: place the config file and database in a `.kitchensync/` directory. Contents:
 
-| Path                    | Purpose                                      |
-| ----------------------- | -------------------------------------------- |
-| `kitchensync-conf.json` | Peer configuration (JSON5)                   |
-| `kitchensync.db`        | SQLite database: snapshot, config, logs      |
-| `BACK/`                 | Displaced files, recoverable for 90 days     |
+| Path                    | Purpose                                 |
+| ----------------------- | --------------------------------------- |
+| `kitchensync-conf.json` | Peer configuration (JSON5)              |
+| `kitchensync.db`        | SQLite database: snapshot, config, logs |
 
-Transfer staging uses `.kitchensync/XFER/` directories near target files for atomic swaps.
+Displaced files are moved to `<file-parent>/.kitchensync/BACK/<timestamp>/<basename>`, recoverable for 90 days. Transfer staging uses `<target-parent>/.kitchensync/XFER/<timestamp>/<uuid>/<basename>` for atomic swaps. Both are created near the affected files throughout the tree.
 
 ## Cleanup
 

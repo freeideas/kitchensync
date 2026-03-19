@@ -1,195 +1,324 @@
-mod cleanup;
+#![allow(dead_code, unused_variables, unused_imports, unused_mut)]
+
 mod config;
+mod copy;
 mod database;
-mod decision;
 mod hash;
-mod ignore;
 mod lifecycle;
 mod local_peer;
+mod logging;
 mod peer;
+mod pool;
 mod sftp_peer;
-mod sync;
+mod sync_engine;
 mod timestamp;
-mod worker;
 
-use std::collections::HashMap;
+use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
-const HELP_TEXT: &str = include_str!("help.txt");
+const HELP_TEXT: &str = r#"Usage: kitchensync <config> [OPTIONS]
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+Synchronize file trees across multiple peers.
 
-    // Parse CLI
-    let mut config_arg: Option<&str> = None;
-    let mut canon_peer: Option<String> = None;
-    let mut i = 1;
+Arguments:
+  <config>  Path to config file, .kitchensync/ directory, or parent directory.
+
+Options:
+      --canon <peer>  Named peer is authoritative (its state always wins)
+  -h, --help          Print this help
+
+Config file resolution:
+  1. Path to a .json file         -> use directly
+  2. Path to a .kitchensync/ dir  -> append kitchensync-conf.json
+  3. Path to any other dir        -> append .kitchensync/kitchensync-conf.json
+
+Path resolution:
+  All relative paths in the config resolve from the config file's directory.
+  Peer URLs have one extra rule: .kitchensync/ can never be a sync target.
+  If the config is inside a .kitchensync/ directory, peer URL paths back up
+  to the parent of .kitchensync/ (so "." becomes ".."). Config at
+  mydir/.kitchensync/kitchensync-conf.json with peer URL file://./
+  refers to mydir/. This adjustment applies only to peer URLs, not to
+  other settings like "database".
+
+Setup:
+  1. mkdir mydir/.kitchensync
+  2. Create mydir/.kitchensync/kitchensync-conf.json:
+
+     {
+       peers: {
+         nas:   { urls: ["sftp://user@host/path"] },
+         local: { urls: ["file://./"] }
+       }
+     }
+
+  3. Run: kitchensync mydir/
+
+Full example config with all settings at their defaults (JSON5):
+
+  {
+    "database": "kitchensync.db",           // SQLite database path, relative to config dir
+    "connection-timeout": 30,               // seconds for SSH connect to be aborted
+    "max-connections": 10,                  // max concurrent connections per peer
+    "xfer-cleanup-days": 2,                 // delete stale staging dirs after N days
+    "back-retention-days": 90,              // delete displaced files after N days
+    "tombstone-retention-days": 180,        // forget deletion records after N days
+    "log-retention-days": 32,               // purge log entries after N days
+
+    // Peers: at least two required. URLs tried top-to-bottom; first success wins.
+    peers: {
+      nas: {
+        urls: [
+          "sftp://bilbo@192.168.1.50/volume1/docs",
+          "sftp://bilbo@nas.tail12345.ts.net/volume1/docs"
+        ]
+      },
+      laptop: {
+        urls: [
+          "sftp://bilbo@laptop.local/home/bilbo/docs",
+          "sftp://bilbo@laptop.tail12345.ts.net/home/bilbo/docs"
+        ]
+      },
+      usb: {
+        urls: ["file:///media/bilbo/usb-backup/docs"]
+      }
+    }
+  }
+
+URL schemes:
+  sftp://user@host/path              Remote over SSH (port 22)
+  sftp://user@host:port/path         Non-standard SSH port
+  sftp://user:password@host/path     Inline password (prefer SSH keys)
+  file:///absolute/path              Local, absolute
+  file://./relative/path             Local, relative to config dir
+
+  Percent-encode special characters in passwords (@ -> %40, : -> %3A).
+  SFTP paths are absolute from filesystem root.
+
+Authentication (fallback chain, stops at first success):
+  1. Inline password from URL
+  2. SSH agent (SSH_AUTH_SOCK)
+  3. ~/.ssh/id_ed25519
+  4. ~/.ssh/id_ecdsa
+  5. ~/.ssh/id_rsa
+
+  Host keys verified via ~/.ssh/known_hosts. Unknown hosts rejected.
+
+Peer names:
+  Must match [a-zA-Z0-9][a-zA-Z0-9_-]*, max 64 characters."#;
+
+struct Args {
+    config_path: String,
+    canon: Option<String>,
+    help: bool,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return Err("Missing <config> argument. Use -h for help.".to_string());
+    }
+
+    let mut config_path = None;
+    let mut canon = None;
+    let mut help = false;
+    let mut i = 0;
+
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                print!("{}", HELP_TEXT);
-                std::process::exit(0);
+                help = true;
             }
             "--canon" => {
                 i += 1;
                 if i >= args.len() {
-                    println!("--canon requires a peer name");
-                    std::process::exit(1);
+                    return Err("--canon requires a peer name".to_string());
                 }
-                canon_peer = Some(args[i].clone());
+                canon = Some(args[i].clone());
             }
-            arg => {
-                if config_arg.is_some() {
-                    println!("Unexpected argument: {}", arg);
-                    std::process::exit(1);
+            _ => {
+                if config_path.is_none() {
+                    config_path = Some(args[i].clone());
+                } else {
+                    return Err(format!("Unexpected argument: {}", args[i]));
                 }
-                config_arg = Some(arg);
             }
         }
         i += 1;
     }
 
-    let config_arg = match config_arg {
-        Some(a) => a,
-        None => {
-            print!("{}", HELP_TEXT);
-            std::process::exit(0);
+    if help {
+        return Ok(Args {
+            config_path: String::new(),
+            canon: None,
+            help: true,
+        });
+    }
+
+    match config_path {
+        Some(p) => Ok(Args {
+            config_path: p,
+            canon,
+            help: false,
+        }),
+        None => Err("Missing <config> argument. Use -h for help.".to_string()),
+    }
+}
+
+fn main() {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            println!("{}", e);
+            process::exit(1);
         }
     };
 
+    if args.help {
+        println!("{}", HELP_TEXT);
+        process::exit(0);
+    }
+
     // Resolve config file
-    let config_path = match config::resolve_config_path(config_arg) {
+    let config_file = match config::resolve_config_path(&args.config_path) {
         Ok(p) => p,
         Err(e) => {
             println!("{}", e);
-            std::process::exit(1);
+            process::exit(1);
         }
     };
 
     // Load config
-    let cfg = match config::load_config(&config_path) {
+    let cfg = match config::load_config(&config_file) {
         Ok(c) => c,
         Err(e) => {
             println!("{}", e);
-            std::process::exit(1);
+            process::exit(1);
         }
     };
 
     // Validate --canon peer exists in config
-    if let Some(ref canon) = canon_peer {
-        if !cfg.peers.contains_key(canon) {
-            println!("Unknown peer in --canon: {}", canon);
-            std::process::exit(1);
+    if let Some(ref canon_name) = args.canon {
+        if !cfg.peers.contains_key(canon_name) {
+            println!("Unknown peer in --canon: {}", canon_name);
+            process::exit(1);
         }
     }
 
     // Open database
-    let conn = match database::open(&cfg.database_path) {
-        Ok(c) => c,
+    let db_path = config::resolve_database_path(&cfg);
+    let db = match database::Database::open(&db_path) {
+        Ok(d) => Arc::new(d),
         Err(e) => {
             println!("{}", e);
-            std::process::exit(1);
+            process::exit(1);
         }
     };
 
+    let config_canonical = cfg
+        .config_file_path
+        .to_string_lossy()
+        .to_string();
+
     // Instance check
-    if let Err(e) = lifecycle::instance_check(&conn, &config_path) {
-        println!("{}", e);
-        std::process::exit(1);
+    if let Some(port_str) = db.get_config("serving-port") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            if lifecycle::check_existing_instance(port, &config_canonical) {
+                println!("Already running against {}", config_canonical);
+                process::exit(0);
+            }
+        }
     }
 
-    // Start HTTP server for instance management
-    let conn_arc = Arc::new(std::sync::Mutex::new(conn));
-    if let Err(e) = lifecycle::start_server(conn_arc.clone(), &config_path, cfg.log_retention_days)
-    {
-        println!("{}", e);
-        std::process::exit(1);
-    }
+    // Start lifecycle HTTP server
+    let server = match lifecycle::LifecycleServer::start(&db, &config_canonical) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Lifecycle server error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let logger = Arc::new(logging::Logger::new(db.clone(), cfg.log_retention_days));
+    logger.info("kitchensync starting");
 
     // Connect to all peers in parallel
-    let mut connected_peers: HashMap<String, Box<dyn peer::Peer>> = HashMap::new();
-    let mut unreachable: Vec<String> = Vec::new();
+    let peers: Vec<Arc<pool::ConnectedPeer>> = {
+        let results: Vec<(String, Result<pool::ConnectedPeer, peer::PeerError>)> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = cfg
+                    .peers
+                    .values()
+                    .map(|pc| {
+                        let name = pc.name.clone();
+                        let pc = pc.clone();
+                        let max_conn = cfg.max_connections;
+                        let timeout = cfg.connection_timeout;
+                        let logger = logger.clone();
+                        s.spawn(move || {
+                            let result = pool::ConnectedPeer::connect(&pc, max_conn, timeout, logger);
+                            (name, result)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
-    for (name, peer_cfg) in &cfg.peers {
-        match peer::connect_peer(name, &peer_cfg.urls, cfg.connection_timeout) {
-            Some(p) => {
-                connected_peers.insert(name.clone(), p);
+        let mut connected = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(p) => connected.push(Arc::new(p)),
+                Err(e) => {
+                    logger.error(&format!("Peer {} unreachable: {}", name, e));
+                }
             }
-            None => {
-                unreachable.push(name.clone());
-                eprintln!("WARNING: Peer {} unreachable, skipping", name);
-                let conn = conn_arc.lock().unwrap();
-                database::log(
-                    &conn,
-                    "warning",
-                    &format!("Peer {} unreachable, skipping", name),
-                    cfg.log_retention_days,
-                );
-            }
+        }
+        connected
+    };
+
+    // Check canon peer is reachable
+    if let Some(ref canon_name) = args.canon {
+        if !peers.iter().any(|p| p.name == *canon_name) {
+            println!("Canon peer '{}' is unreachable", canon_name);
+            process::exit(1);
         }
     }
 
-    // Canon peer must be reachable
-    if let Some(ref canon) = canon_peer {
-        if !connected_peers.contains_key(canon) {
-            println!("Canon peer {} is unreachable", canon);
-            std::process::exit(1);
-        }
-    }
-
-    // Need at least two reachable peers (or one with --canon)
-    if canon_peer.is_some() {
-        if connected_peers.is_empty() {
-            println!("No reachable peers");
-            std::process::exit(1);
-        }
-    } else if connected_peers.len() < 2 {
+    // Check minimum reachable peers
+    if args.canon.is_none() && peers.len() < 2 {
         println!(
-            "Need at least 2 reachable peers, found {}",
-            connected_peers.len()
+            "Need at least 2 reachable peers, only {} connected",
+            peers.len()
         );
-        std::process::exit(1);
+        process::exit(1);
+    }
+    if args.canon.is_some() && peers.is_empty() {
+        println!("No reachable peers");
+        process::exit(1);
     }
 
-    let peers = Arc::new(connected_peers);
+    // Purge old data
+    db.purge_tombstones(cfg.tombstone_retention_days);
+    db.purge_logs(cfg.log_retention_days);
 
-    // Purge expired data
-    {
-        let conn = conn_arc.lock().unwrap();
-        cleanup::purge_all(
-            &conn,
-            &peers,
-            cfg.xfer_cleanup_days,
-            cfg.back_retention_days,
-            cfg.tombstone_retention_days,
-            cfg.log_retention_days,
-        );
-    }
+    // Run sync
+    let sync_stamp = timestamp::now();
+    sync_engine::run(
+        &peers,
+        &db,
+        &logger,
+        args.canon.as_deref(),
+        &sync_stamp,
+        &cfg,
+    );
 
-    // Start worker threads
-    let pool = worker::WorkerPool::new(cfg.workers, peers.clone());
+    logger.info("kitchensync complete");
 
-    // Run multi-tree sync
-    {
-        let conn = conn_arc.lock().unwrap();
-        sync::run_sync(&conn, &peers, &pool, canon_peer.as_deref());
-    }
+    // Disconnect peers
+    drop(peers);
 
-    // Wait for copies to complete
-    pool.wait();
-
-    // Log completion
-    {
-        let conn = conn_arc.lock().unwrap();
-        database::log(
-            &conn,
-            "info",
-            "Sync complete",
-            cfg.log_retention_days,
-        );
-    }
-
-    // Sync complete — linger for 5 seconds serving HTTP, then exit
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    std::process::exit(0);
+    // Post-completion linger (5 seconds)
+    server.linger(Duration::from_secs(5));
 }

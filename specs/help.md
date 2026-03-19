@@ -44,14 +44,13 @@ Setup:
 Full example config with all settings at their defaults (JSON5):
 
   {
-    database: "kitchensync.db",       // SQLite database path, relative to config dir
-    connection-timeout: 30,           // seconds for SSH connect to be aborted
-    max-reads: 10,                    // max concurrent reads per peer
-    max-writes: 10,                   // max concurrent writes per peer
-    xfer-cleanup-days: 2,             // delete stale staging dirs after N days
-    back-retention-days: 90,          // delete displaced files after N days
-    tombstone-retention-days: 180,    // forget deletion records after N days
-    log-retention-days: 32,           // purge log entries after N days
+    "database": "kitchensync.db",           // SQLite database path, relative to config dir
+    "connection-timeout": 30,               // seconds for SSH connect to be aborted
+    "max-connections": 10,                  // max concurrent connections per peer
+    "xfer-cleanup-days": 2,                 // delete stale staging dirs after N days
+    "back-retention-days": 90,              // delete displaced files after N days
+    "tombstone-retention-days": 180,        // forget deletion records after N days
+    "log-retention-days": 32,               // purge log entries after N days
 
     // Peers: at least two required. URLs tried top-to-bottom; first success wins.
     peers: {

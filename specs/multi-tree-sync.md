@@ -2,7 +2,7 @@
 
 ## Overview
 
-Synchronizes N file trees in a single recursive traversal. At each directory level: list all peers in parallel, union the entries, decide the authoritative state for each, act, and recurse.
+Synchronizes N file trees in a single recursive combined-tree walk. At each directory level: list all peers in parallel, union their entries, decide the authoritative state for each, act, and recurse. The snapshot is consulted per-peer for reconciliation (detecting deletions and modifications) but does not contribute entries to the union — only live peer listings drive traversal.
 
 ## Algorithm
 
@@ -10,31 +10,54 @@ Synchronizes N file trees in a single recursive traversal. At each directory lev
 function sync_directory(peers, path, snapshot):
     // Phase 1: List all peers in parallel
     listings = parallel_for_each(peers):
-        list_directory(peer, path)  // returns entries or empty on error
+        list_directory(peer, path)  // returns entries or error
 
-    // Phase 2: Union entry names (peers + snapshot children)
-    all_names = union(listings.keys(), snapshot_children(path))
+    // Phase 1b: Drop peers with listing errors
+    failed = [p for p in peers if listings[p] is error]
+    for p in failed:
+        log(error, "listing failed for {p} at {path}, excluding from this subtree")
+    active_peers = peers - failed
+
+    // Phase 2: Union entry names across active peers
+    all_names = union(active_peers.listings.keys())
 
     // Phase 3: Decide and act on each entry
     for name in all_names:
-        states = gather_states(peers, listings, name)
-        snap = snapshot_lookup(path/name)
+        states = gather_states(active_peers, listings, name)
+        snap = snapshot_lookup_per_peer(path/name)
         decision = decide(states, snap)
 
         if decision.type == directory:
-            for peer in peers:
-                if peer needs dir created:  create_dir(peer, path/name)
-                if peer needs dir deleted:  displace_to_back(peer, path/name)
+            recursion_peers = []
+            for peer in active_peers:
+                if peer has wrong type at path/name:
+                    displace(peer, path/name)
+                if peer needs dir created:
+                    create_dir(peer, path/name)
+                    set_mod_time(peer, path/name, decision.mod_time)  // match source directory
+                if peer needs dir deleted:
+                    displace(peer, path/name)
+                else:
+                    recursion_peers.append(peer)
             update_snapshot(path/name, decision)
-            sync_directory(peers, path/name, snapshot)  // recurse
+            if recursion_peers:
+                sync_directory(recursion_peers, path/name, snapshot)  // recurse
 
         if decision.type == file:
             update_snapshot(path/name, decision)
+            for peer that has directory at path/name:
+                displace(peer, path/name)  // type conflict
             for each dst_peer that needs the file:
                 enqueue_copy(decision.src_peer, path/name, dst_peer, path/name)
             for each peer where file should be deleted:
-                displace_to_back(peer, path/name)
+                displace(peer, path/name)
 ```
+
+**All displacement is inline.** Every displacement (type conflicts, deletions) executes during the combined-tree walk, not in the operation queue. Displacement is a same-filesystem rename to BACK/ — fast on any transport. Running it inline eliminates ordering dependencies between displacement and file copies (e.g., a type-conflict directory must be gone before a file copy can rename into that path).
+
+**Directory deletion:** Do not recurse into a directory that is being displaced on a peer. The displacement moves the entire subtree in a single rename, and the snapshot cascade marks all children as deleted. Only peers that are keeping the directory participate in recursion.
+
+**Listing errors:** If `list_directory` fails for a specific path on a reachable peer, that peer is excluded from decisions for that directory and its entire subtree (equivalent to an offline peer for that path). The error is logged at `error` level. The peer's snapshot rows for that subtree are not modified — `last_seen` is not updated, so no false deletions are inferred.
 
 ## Built-in Excludes
 
@@ -45,17 +68,28 @@ Always excluded from listings (never synced):
 - Special files (devices, FIFOs, sockets)
 - `.git/` directories
 
+## BACK/XFER Cleanup During Traversal
+
+After processing the union of entry names at each directory level, separately check each peer for a `.kitchensync/` directory at the current path (using `list_dir` or `stat` directly — this is a metadata operation, not a sync operation, so the built-in exclude does not apply). If present, list its `BACK/` and `XFER/` subdirectories and purge expired entries:
+
+- `.kitchensync/BACK/<timestamp>/` — remove entries older than `back-retention-days`
+- `.kitchensync/XFER/<timestamp>/` — remove entries older than `xfer-cleanup-days`
+
+This piggybacks on the existing traversal — no separate tree walk is needed. The `<timestamp>` component of each subdirectory name determines its age.
+
 ## Entry Classification
 
-For each entry, compare each peer's state to the snapshot:
+For each entry, compare each active peer's state to that peer's snapshot row:
 
-| Peer State               | Snapshot          | Classification |
-| ------------------------ | ----------------- | -------------- |
-| Live, same mod_time      | Live              | Unchanged      |
-| Live, different mod_time | Live              | Modified       |
-| Live                     | Absent or Deleted | New            |
-| Absent                   | Live              | Deleted        |
-| Absent                   | Absent or Deleted | —              |
+| Peer State               | Snapshot row for **this peer** | `deleted_time`  | Classification                              |
+| ------------------------ | ------------------------------ | --------------- | ------------------------------------------- |
+| Live, same mod_time      | Exists                         | NULL            | Unchanged                                   |
+| Live, different mod_time | Exists                         | NULL            | Modified                                    |
+| Live                     | Exists                         | NOT NULL        | Modified (resurrection — clear `deleted_time`) |
+| Live                     | No row                         | —               | New (peer has never had this entry)         |
+| Absent                   | Exists                         | NOT NULL        | Deleted (estimate = `deleted_time`)         |
+| Absent                   | Exists                         | NULL            | Absent-unconfirmed (see rule 4b)            |
+| Absent                   | No row                         | —               | — (never existed on this peer, no opinion)  |
 
 ## Decision Rules
 
@@ -70,21 +104,27 @@ The canonical peer's state wins unconditionally:
 
 1. **All unchanged** → no action
 2. **Modified** → newest mod_time wins; push to all that don't match
-3. **New** → newest mod_time wins; push to all that lack it
-4. **Deleted + unchanged** → deletion wins (it's more recent than the last sync; the unchanged copies haven't been touched)
-5. **Deleted + modified** → modification wins (active edit beats deletion)
-6. **Same mod_time, different size** → larger file wins
-7. **Ties** → keep data (existence over deletion, larger over smaller)
+3. **New** → newest mod_time wins; push to all peers that lack it (including peers with no snapshot row)
+4. **Deleted + existing** → compare the deletion estimate against the existing file's mod_time. The deletion estimate is the `last_seen` or `deleted_time` of the absent peer (see 4b for which applies). If multiple peers have deleted the entry, use the most recent estimate among the deleting peers. If the deletion estimate > mod_time, deletion wins (displace the file on all peers that have it; the absent peers' `last_seen` becomes `deleted_time` for all peers). If mod_time ≥ the deletion estimate, the existing file wins (push to peers that lack it)
+4b. **Absent-unconfirmed** (absent, snapshot row exists, `deleted_time` NULL) → compare `last_seen` against the max mod_time of peers that have the entry. If `last_seen` > max mod_time, this is a deletion — the entry was confirmed present on this peer after the latest modification anywhere, and has since been removed. Apply rule 4 using `last_seen` as the deletion estimate. If `last_seen` ≤ max mod_time (or `last_seen` is NULL), this is a failed copy or the peer has never successfully received the file — re-enqueue the copy, no deletion vote
+5. **Same mod_time, different size** → larger file wins
+6. **Ties** → keep data (existence over deletion, larger over smaller)
 
-Timestamp tolerance: 5 seconds in either direction. The tolerance applies to Entry Classification: a peer's mod_time is considered "same" as the snapshot if it differs by ≤ 5 seconds. When comparing two peers' mod_times in Decision Rules, timestamps within 5 seconds of each other are treated as equal (fall through to rule 6/7).
+Peers with no snapshot row for the entry ("never had it") do not vote — they are simply targets for propagation once a winner is decided.
 
-## Orphaned Tombstones
+If the winning entry already exists on a peer with a matching mod_time (within tolerance) and matching byte_size, no copy is performed for that peer — only the snapshot row is created/updated.
 
-If an entry (file or directory) is absent on all reachable peers and exists only as a tombstone in the snapshot, the tombstone is removed.
+Timestamp tolerance: 5 seconds in either direction. The tolerance applies to Entry Classification: a peer's mod_time is considered "same" as the snapshot row's mod_time if it differs by ≤ 5 seconds. When comparing peers' mod_times in Decision Rules, find the maximum mod_time among all peers that have the entry. Any peer whose mod_time is within 5 seconds of the maximum is treated as tied with the maximum (fall through to rules 5/6). Peers whose mod_time is more than 5 seconds behind the maximum lose to it. The same tolerance applies when comparing a deletion estimate (`deleted_time`) against a file's mod_time in rule 4.
+
+## Orphaned Snapshot Rows
+
+Snapshot rows for entries that no longer appear in any peer's listing are never visited during traversal. They are cleaned up by the startup purge (see sync.md, Run step 1): tombstone rows (where `deleted_time IS NOT NULL`) with `deleted_time` older than `tombstone-retention-days` are deleted. Additionally, rows where `deleted_time IS NULL` and `last_seen` is older than `tombstone-retention-days` (or `last_seen` is NULL) are also deleted — these are stale rows from entries that disappeared from all peers without being visited.
 
 ## Directory Decisions
 
-Directories use the same entry classification and decision rules as files (mod_time comparison, newest wins, timestamp tolerance). The same rules (1–7) apply. Directories are displaced to BACK/ just like files.
+Directories use the same entry classification and decision rules as files (mod_time comparison, newest wins, timestamp tolerance). The same rules (1–6) apply. Directories are displaced to BACK/ just like files.
+
+When a directory is created on a peer, the snapshot records the mod_time of the source directory (the one that won the decision). On subsequent runs, a directory's mod_time is compared using the same 5-second tolerance. The implementation should use the mod_time reported by the peer filesystem abstraction's `stat` operation.
 
 ## Type Conflicts
 
@@ -92,8 +132,32 @@ When the same path is a file on one peer and a directory on another, the standar
 
 ## Snapshot Updates
 
-The snapshot is updated during traversal to reflect decisions, before file copies complete. If the app exits before copies finish, the next run detects discrepancies between snapshot and peer state and re-enqueues them.
+Per-peer snapshot rows are updated during traversal, as soon as a decision is made — before the actual file operations (create, delete, copy) execute. The snapshot reflects the decided state of the shared tree, not what has physically happened yet.
+
+- **Entry confirmed present** on a peer: upsert row with current mod_time, byte_size, `last_seen` set to the current sync timestamp, and `deleted_time = NULL`
+- **Entry confirmed absent** on a peer with an existing row where `deleted_time` is NULL: set `deleted_time` to the row's current `last_seen` value (the deletion happened sometime after that point). Do not update `last_seen`.
+- **Entry confirmed absent** on a peer with an existing row where `deleted_time` is already set: no change (tombstone already recorded)
+- **Decision: push to a peer**: upsert row for the destination peer with the winning entry's mod_time, byte_size, and `deleted_time = NULL`. Do **not** update `last_seen` — it is only set when the entry is confirmed present (in a listing or after a completed copy). If no row exists yet, `last_seen` is NULL.
+- **Copy completed**: after a file copy finishes successfully, set `last_seen` to the current sync timestamp on the destination peer's snapshot row. This is the only post-traversal snapshot update.
+- **Inline directory creation completed**: after `create_dir` and `set_mod_time` succeed on a destination peer, set `last_seen` to the current sync timestamp on that peer's snapshot row. Directory creation is both decided and confirmed in one step (unlike file copies, which are enqueued).
+- **Decision: delete from a peer**: set `deleted_time` to the row's current `last_seen` on the row for that peer (the entry is being displaced to BACK/). Then cascade to descendants using a single recursive CTE scoped to the displaced entry's subtree:
+  ```sql
+  WITH RECURSIVE subtree(id) AS (
+      VALUES(?displaced_id)
+      UNION ALL
+      SELECT s.id FROM snapshot s
+      JOIN subtree st ON s.parent_id = st.id
+      WHERE s.peer = ?peer AND s.deleted_time IS NULL
+  )
+  UPDATE snapshot
+  SET deleted_time = ?deleted_time
+  WHERE peer = ?peer AND deleted_time IS NULL
+  AND id IN (SELECT id FROM subtree);
+  ```
+  This walks down from the displaced directory's `id` through `parent_id` links, marking only its descendants — not unrelated rows that happen to have a tombstoned parent. If the cascade cannot reach all descendants due to purged intermediate rows, those orphaned rows will be cleaned up by the startup purge when their `last_seen` exceeds `tombstone-retention-days`.
+
+If the app exits before copies finish, the destination row has `deleted_time = NULL` and `last_seen` unchanged (NULL for first-time targets, or the old confirmation time). The next run sees the entry as absent-unconfirmed and applies rule 4b: since `last_seen` is NULL or old, it does not exceed the source's mod_time, so the copy is re-enqueued.
 
 ## Offline Peers
 
-Unreachable peers are simply not listed. No decisions are made about their files. On the next run when they're reachable, the snapshot reveals discrepancies and they're brought up to date.
+Unreachable peers are excluded entirely — they do not participate in listings or decisions. Their snapshot rows are not modified (`last_seen` is not updated). On the next run when they're reachable, discrepancies between their filesystem state and their snapshot rows drive sync decisions, bringing them up to date.

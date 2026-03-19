@@ -1,9 +1,7 @@
 #!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
-# dependencies = [
-#     "requests",
-# ]
+# dependencies = []
 # ///
 
 import sys
@@ -17,215 +15,162 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import urllib.request
+import zipfile
 import stat
 
 def main():
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    os.chdir("..")  # project root
+    # Determine paths relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    tools_dir = os.path.join(project_root, "tools")
+    compiler_dir = os.path.join(tools_dir, "compiler")
+    released_dir = os.path.join(project_root, "released")
+    code_dir = script_dir
 
     system = platform.system().lower()
     machine = platform.machine().lower()
 
-    print(f"✓ Platform: {system} {machine}")
+    print(f"✓ Platform: {system} ({machine})")
 
-    # Ensure Rust toolchain
-    ensure_rust_toolchain(system, machine)
+    # Step 1: Ensure Rust is available
+    cargo_bin = ensure_rust(compiler_dir, system, machine)
 
-    # Clean released/
-    released_dir = os.path.join(".", "released")
+    # Step 2: Verify compiler
+    print("✓ Verifying Rust compiler...")
+    result = subprocess.run(
+        [cargo_bin, "--version"],
+        capture_output=True, text=True, encoding='utf-8'
+    )
+    if result.returncode != 0:
+        print(f"✗ Cargo verification failed: {result.stderr}")
+        sys.exit(1)
+    print(f"  {result.stdout.strip()}")
+
+    rustc_bin = os.path.join(os.path.dirname(cargo_bin), "rustc" + ext(system))
+    result = subprocess.run(
+        [rustc_bin, "--version"],
+        capture_output=True, text=True, encoding='utf-8'
+    )
+    if result.returncode == 0:
+        print(f"  {result.stdout.strip()}")
+
+    # Step 3: Delete everything in released/
     if os.path.exists(released_dir):
         shutil.rmtree(released_dir)
     os.makedirs(released_dir, exist_ok=True)
-    print("✓ Cleaned released/")
+    print("✓ Cleaned released/ directory")
 
-    # Build
-    cargo = find_cargo(system)
-    print(f"✓ Using cargo: {cargo}")
-
+    # Step 4: Build
+    print("✓ Building kitchensync...")
     env = os.environ.copy()
-    rustup_home = os.path.abspath(os.path.join(".", "tools", "compiler", "rustup"))
-    cargo_home = os.path.abspath(os.path.join(".", "tools", "compiler", "cargo"))
-    env["RUSTUP_HOME"] = rustup_home
-    env["CARGO_HOME"] = cargo_home
-    env["PATH"] = os.path.join(cargo_home, "bin") + os.pathsep + env.get("PATH", "")
+    env["RUSTUP_HOME"] = os.path.join(compiler_dir, "rustup")
+    env["CARGO_HOME"] = os.path.join(compiler_dir, "cargo")
 
-    print("Building kitchensync (release)...")
     result = subprocess.run(
-        [cargo, "build", "--release", "--manifest-path", os.path.join(".", "code", "Cargo.toml")],
+        [cargo_bin, "build", "--release"],
+        cwd=code_dir,
+        text=True, encoding='utf-8',
         env=env,
-        text=True,
-        encoding='utf-8',
-        capture_output=True,
     )
     if result.returncode != 0:
-        print("Build FAILED:")
-        print(result.stderr)
-        print(result.stdout)
+        print("✗ Build failed")
         sys.exit(1)
     print("✓ Build succeeded")
 
-    # Copy artifact to released/
-    target_dir = os.path.join(".", "code", "target", "release")
+    # Step 5: Copy artifact to released/
     if system == "windows":
-        src_name = "kitchensync.exe"
-        dst_name = "kitchensync.exe"
+        src_binary = os.path.join(code_dir, "target", "release", "kitchensync.exe")
+        dst_binary = os.path.join(released_dir, "kitchensync.exe")
     elif system == "darwin":
-        src_name = "kitchensync"
-        dst_name = "kitchensync.mac"
+        src_binary = os.path.join(code_dir, "target", "release", "kitchensync")
+        dst_binary = os.path.join(released_dir, "kitchensync.mac")
     else:
-        src_name = "kitchensync"
-        dst_name = "kitchensync.linux"
+        src_binary = os.path.join(code_dir, "target", "release", "kitchensync")
+        dst_binary = os.path.join(released_dir, "kitchensync.linux")
 
-    src_path = os.path.join(target_dir, src_name)
-    dst_path = os.path.join(released_dir, dst_name)
-
-    if not os.path.exists(src_path):
-        print(f"ERROR: Expected binary not found: {src_path}")
+    if not os.path.exists(src_binary):
+        print(f"✗ Binary not found: {src_binary}")
         sys.exit(1)
 
-    shutil.copy2(src_path, dst_path)
+    shutil.copy2(src_binary, dst_binary)
     # Make executable
-    os.chmod(dst_path, os.stat(dst_path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    print(f"✓ Copied {dst_name} to released/")
+    os.chmod(dst_binary, os.stat(dst_binary).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    size_mb = os.path.getsize(dst_binary) / (1024 * 1024)
+    print(f"✓ Copied to {os.path.relpath(dst_binary, project_root)} ({size_mb:.1f} MB)")
+
     print("✓ Build complete!")
 
 
-def find_cargo(system):
-    if system == "windows":
-        cargo = os.path.abspath(os.path.join(".", "tools", "compiler", "cargo", "bin", "cargo.exe"))
-    else:
-        cargo = os.path.abspath(os.path.join(".", "tools", "compiler", "cargo", "bin", "cargo"))
-    if os.path.exists(cargo):
-        return cargo
-    # Fallback: check PATH
-    which = shutil.which("cargo")
-    if which:
-        return which
-    raise RuntimeError("Cargo not found. Run ensure_rust_toolchain first.")
+def ext(system):
+    return ".exe" if system == "windows" else ""
 
 
-def ensure_rust_toolchain(system, machine):
-    cargo_bin = os.path.join(".", "tools", "compiler", "cargo", "bin")
-    cargo_exe = "cargo.exe" if system == "windows" else "cargo"
-    if os.path.exists(os.path.join(cargo_bin, cargo_exe)):
-        print("✓ Rust toolchain already installed")
-        # Verify it works
-        verify_cargo(os.path.join(cargo_bin, cargo_exe), system)
-        return
+def ensure_rust(compiler_dir, system, machine):
+    """Ensure Rust toolchain is available in compiler_dir."""
+    cargo_home = os.path.join(compiler_dir, "cargo")
+    rustup_home = os.path.join(compiler_dir, "rustup")
+    cargo_bin = os.path.join(cargo_home, "bin", "cargo" + ext(system))
 
-    print("Installing Rust toolchain to ./tools/compiler/...")
-    os.makedirs(os.path.join(".", "tools", "compiler"), exist_ok=True)
+    if os.path.exists(cargo_bin):
+        print("✓ Rust compiler found")
+        return cargo_bin
 
-    rustup_home = os.path.abspath(os.path.join(".", "tools", "compiler", "rustup"))
-    cargo_home = os.path.abspath(os.path.join(".", "tools", "compiler", "cargo"))
+    print("✓ Downloading Rust toolchain...")
+    os.makedirs(compiler_dir, exist_ok=True)
 
     env = os.environ.copy()
     env["RUSTUP_HOME"] = rustup_home
     env["CARGO_HOME"] = cargo_home
 
     if system == "windows":
-        download_rustup_windows(env)
+        # Download rustup-init.exe
+        rustup_url = "https://win.rustup.rs/x86_64"
+        rustup_init = os.path.join(compiler_dir, "rustup-init.exe")
+        download_file(rustup_url, rustup_init)
+        subprocess.run(
+            [rustup_init, "-y", "--default-toolchain", "stable-x86_64-pc-windows-gnu", "--no-modify-path"],
+            env=env, text=True, encoding='utf-8',
+        )
     else:
-        download_rustup_unix(system, machine, env)
+        # Download rustup-init shell script
+        rustup_url = "https://sh.rustup.rs"
+        rustup_script = os.path.join(compiler_dir, "rustup-init.sh")
+        download_file(rustup_url, rustup_script)
+        os.chmod(rustup_script, 0o755)
 
-    verify_cargo(os.path.join(cargo_bin, cargo_exe), system)
-
-
-def download_rustup_unix(system, machine, env):
-    import requests
-
-    # Determine target triple
-    if system == "darwin":
-        if machine in ("arm64", "aarch64"):
-            target = "aarch64-apple-darwin"
+        # Determine target triple
+        if system == "darwin":
+            if "arm" in machine or "aarch64" in machine:
+                target = "stable-aarch64-apple-darwin"
+            else:
+                target = "stable-x86_64-apple-darwin"
         else:
-            target = "x86_64-apple-darwin"
-    else:  # linux
-        if machine in ("aarch64", "arm64"):
-            target = "aarch64-unknown-linux-gnu"
-        else:
-            target = "x86_64-unknown-linux-gnu"
+            if "aarch64" in machine or "arm" in machine:
+                target = "stable-aarch64-unknown-linux-gnu"
+            else:
+                target = "stable-x86_64-unknown-linux-gnu"
 
-    url = f"https://static.rust-lang.org/rustup/dist/{target}/rustup-init"
-    tmp_dir = os.path.join(".", "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    rustup_init = os.path.join(tmp_dir, "rustup-init")
+        result = subprocess.run(
+            ["sh", rustup_script, "-y", "--default-toolchain", target, "--no-modify-path"],
+            env=env, text=True, encoding='utf-8',
+        )
+        if result.returncode != 0:
+            print("✗ Rust installation failed")
+            sys.exit(1)
 
-    print(f"  Downloading rustup-init for {target}...")
-    resp = requests.get(url, stream=True)
-    resp.raise_for_status()
-    with open(rustup_init, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-    os.chmod(rustup_init, 0o755)
-
-    print("  Running rustup-init...")
-    result = subprocess.run(
-        [rustup_init, "-y", "--default-toolchain", "stable", "--no-modify-path",
-         "--profile", "minimal"],
-        env=env,
-        text=True,
-        encoding='utf-8',
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(f"rustup-init failed:\n{result.stderr}\n{result.stdout}")
+    if not os.path.exists(cargo_bin):
+        print(f"✗ Cargo not found after installation: {cargo_bin}")
         sys.exit(1)
 
     print("✓ Rust toolchain installed")
+    return cargo_bin
 
 
-def download_rustup_windows(env):
-    import requests
-
-    url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe"
-    tmp_dir = os.path.join(".", "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    rustup_init = os.path.join(tmp_dir, "rustup-init.exe")
-
-    print("  Downloading rustup-init.exe for windows-gnu...")
-    resp = requests.get(url, stream=True)
-    resp.raise_for_status()
-    with open(rustup_init, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-    print("  Running rustup-init.exe...")
-    result = subprocess.run(
-        [rustup_init, "-y", "--default-toolchain", "stable-x86_64-pc-windows-gnu",
-         "--no-modify-path", "--profile", "minimal"],
-        env=env,
-        text=True,
-        encoding='utf-8',
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(f"rustup-init failed:\n{result.stderr}\n{result.stdout}")
-        sys.exit(1)
-
-    print("✓ Rust toolchain installed (windows-gnu)")
-
-
-def verify_cargo(cargo_path, system):
-    env = os.environ.copy()
-    rustup_home = os.path.abspath(os.path.join(".", "tools", "compiler", "rustup"))
-    cargo_home = os.path.abspath(os.path.join(".", "tools", "compiler", "cargo"))
-    env["RUSTUP_HOME"] = rustup_home
-    env["CARGO_HOME"] = cargo_home
-    env["PATH"] = os.path.join(cargo_home, "bin") + os.pathsep + env.get("PATH", "")
-
-    result = subprocess.run(
-        [cargo_path, "--version"],
-        env=env,
-        text=True,
-        encoding='utf-8',
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        print(f"✓ Cargo version: {result.stdout.strip()}")
-    else:
-        print(f"WARNING: cargo --version failed: {result.stderr}")
+def download_file(url, dest):
+    """Download a file from url to dest."""
+    print(f"  Downloading {url}...")
+    urllib.request.urlretrieve(url, dest)
 
 
 if __name__ == "__main__":
