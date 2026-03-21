@@ -45,3 +45,4 @@ KitchenSync exceptions (CLI tool, not a service):
 - Does not print the port on startup (step 3).
 - Configuration errors are printed to stdout and cause immediate exit.
 - `info` and `error` log messages are also printed to stdout (in addition to being written to `applog`).
+- On startup, before loading the config file, print the resolved config file path to stdout: `config: <absolute-path-to-kitchensync-conf.json>`.

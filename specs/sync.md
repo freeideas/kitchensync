@@ -3,16 +3,16 @@
 ## Command Line
 
 ```
-kitchensync [--cfg [<path>]] <url>... [key=value...] [-h|--help]
+kitchensync [--cfgdir [<path>]] <url>... [key=value...] [-h|--help]
 ```
 
-No arguments, `-h`/`--help`, or any invalid command line: print help and exit 0 (see help.md).
+No arguments, `-h`, or `--help`: print help and exit 0 (see help.md).
 
 `<url>`: one or more peer URLs or local paths. Each is a peer to sync. Bare paths are treated as `file://` URLs. A trailing `!` marks the URL as canon (e.g. `c:/photos!`).
 
 `key=value`: settings that apply to the current run and are persisted to the config file (see help.md, "Settings").
 
-`--cfg [<path>]`: config directory. If `<path>` ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent). Otherwise, `.kitchensync/` is appended to `<path>`. Default (or `--cfg` alone with no path): `~/.kitchensync/`.
+`--cfgdir [<path>]`: config directory. If `<path>` ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent). Otherwise, `.kitchensync/` is appended to `<path>`. Default (or `--cfgdir` alone with no path): `~/.kitchensync/`.
 
 ## Config Directory
 
@@ -39,7 +39,7 @@ CLI URLs are merged into the config file before reconciliation. The config file 
 5. Run peer identity reconciliation (see database.md, Startup Reconciliation). If reconciliation succeeds, write the merged config file. If reconciliation fails, exit with error — the original config file is unchanged.
 6. The group must have at least two peers. At least two must be reachable at runtime; with a canon peer, one reachable peer (the canon itself) is sufficient.
 7. If none of the group's peers have any snapshot data and no canon peer is designated, exit with error: bidirectional sync requires snapshot history or a canon peer. On a first run with no canon, suggest: "First sync? Mark the authoritative peer with a trailing !"
-8. Connect to all peers in parallel (skip unreachable, log warnings).
+8. Connect to all peers in parallel (skip unreachable, log warnings). Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. If directory creation fails, treat the peer as unreachable (log warning, try next fallback URL).
 9. If canon peer is unreachable, exit with error.
 
 ## Canon Peer

@@ -2,13 +2,11 @@
 
 ## Strategy
 
-All automated tests use `file://` URLs exclusively. SFTP is verified manually.
-
-This works because all sync logic operates through the peer filesystem trait (see sync.md, "Peer Filesystem Abstraction"). The `file://` and `sftp://` implementations expose identical operations with identical error semantics. No sync logic touches protocol-specific code. Testing with `file://` exercises every code path that `sftp://` will hit — the only untested surface is the SSH library itself.
+Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
 
 ## What Tests Should Cover
 
-Using `file://` URLs and temporary directories:
+Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdirectories under `/home/ace/Desktop/prjx/kitchensync/tmp/testks/`):
 
 - **Multi-tree traversal** — parallel listing, union, correct decisions across N peers
 - **Decision rules** — timestamp-based (newer wins, ties keep data), canon peer override
@@ -19,7 +17,7 @@ Using `file://` URLs and temporary directories:
 - **Peer identity** — URL normalization, peer recognition across runs, fallback URLs sharing a peer ID, startup reconciliation (two-pass)
 - **XFER staging** — atomic swaps, recheck, cleanup of stale dirs
 - **BACK directories** — displaced files recoverable, retention cleanup
-- **Config directory** — default `~/.kitchensync/`, `--cfg` override, config file accumulation
+- **Config directory** — default `~/.kitchensync/`, `--cfgdir` override, config file accumulation
 - **Offline peers** — skipped gracefully, caught up on next run
 - **Single instance** — second run against same config directory detects first and exits
 - **Connection pools** — per-URL pools, `max-connections` limit applies to `file://` too
@@ -33,7 +31,7 @@ Tests are Python scripts in `./tests/`. Each test:
 1. Creates temporary directories for simulated peers
 2. Creates a config directory with `kitchensync-conf.json` containing `file://` URLs grouped appropriately
 3. Sets up initial file states
-4. Runs `kitchensync --cfg <config-dir> <url>...` or `kitchensync --cfg <config-dir>` (if config already has groups)
+4. Runs `kitchensync --cfgdir <config-dir> <url>...` or `kitchensync --cfgdir <config-dir>` (if config already has groups)
 5. Verifies outcomes (files synced, snapshot correct, BACK/ contents)
 6. Cleans up
 

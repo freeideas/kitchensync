@@ -50,7 +50,7 @@ Every connection to a peer — whether for directory listing or from the transfe
 
 1. Try the peer's primary URL first, then each fallback URL in order
 2. For SFTP URLs, `connection-timeout` (default: 30 seconds) bounds the SSH handshake; if it expires, try the next URL
-3. For `file://` URLs, the connection is a lightweight local handle — `connection-timeout` does not apply
+3. For `file://` URLs, the connection is a lightweight local handle — `connection-timeout` does not apply. If the local path does not exist, create it (and any missing parents) before connecting
 4. First successful connection wins — remaining URLs are not tried. All subsequent connections for this peer use the winning URL's pool
 5. If all URLs fail, the peer is **unreachable** for this connection attempt
 
