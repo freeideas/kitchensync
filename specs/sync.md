@@ -3,25 +3,57 @@
 ## Command Line
 
 ```
-kitchensync <config> [--canon <peer-name>] [-h|--help]
+kitchensync [--cfg [<path>]] <url>... [key=value...] [-h|--help]
 ```
 
-`<config>`: path to config file, `.kitchensync/` directory, or parent directory (see help.md).
+No arguments, `-h`/`--help`, or any invalid command line: print help and exit 0 (see help.md).
 
-`--canon <peer-name>`: named peer is authoritative for all decisions.
+`<url>`: one or more peer URLs or local paths. Each is a peer to sync. Bare paths are treated as `file://` URLs. A trailing `!` marks the URL as canon (e.g. `c:/photos!`).
+
+`key=value`: settings that apply to the current run and are persisted to the config file (see help.md, "Settings").
+
+`--cfg [<path>]`: config directory. If `<path>` ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent). Otherwise, `.kitchensync/` is appended to `<path>`. Default (or `--cfg` alone with no path): `~/.kitchensync/`.
+
+## Config Directory
+
+Every run uses a config directory (default `~/.kitchensync/`) containing two fixed-name files:
+- `kitchensync-conf.json` — configuration (peer groups, settings)
+- `kitchensync.db` — SQLite database (snapshots, logs, instance state)
+
+These filenames are not configurable. The database is always colocated with the config file.
+
+## Peer Groups
+
+A peer group is a set of peers that synchronize with each other. Groups are identified by their member URLs — specifying any URL from a group selects the entire group.
+
+The config file is the source of truth for group membership. The database's `peer` and `peer_url` tables are reconciled against the config file on every startup (see database.md, Startup Reconciliation). The database does not track groups — only peer identity (URL → peer ID mapping). Edits to the config file take effect on the next run. Snapshot history is preserved through reconciliation — it is keyed by stable peer IDs, not by group structure.
+
+CLI URLs are merged into the config file before reconciliation. The config file accumulates state across runs — URLs, peers, and settings are persisted, not just applied transiently.
 
 ## Startup
 
-1. Resolve config file path (see help.md)
-2. Open database (WAL mode), run schema
-3. Instance check — if another instance is using this database, print `Already running against <config-file-path>` and exit 0
-4. Connect to all peers in parallel (skip unreachable, log warnings)
-5. If `--canon` peer is unreachable, exit with error
-6. The config must define at least two peers (validated at parse time). At runtime, require at least two reachable peers; with `--canon`, one reachable peer (the canon peer itself) is sufficient — the snapshot is updated from the canon peer's state so that when other peers come online, the sync can detect and propagate bidirectional changes rather than treating everything as new
+1. Resolve the config directory. Create it if it does not exist.
+2. Load config file if it exists, merge CLI URLs and settings into it. Do not write yet.
+3. Open database (`kitchensync.db`), WAL mode, run schema.
+4. Instance check — if another instance is already running against this config directory, print `Already running` and exit 0.
+5. Run peer identity reconciliation (see database.md, Startup Reconciliation). If reconciliation succeeds, write the merged config file. If reconciliation fails, exit with error — the original config file is unchanged.
+6. The group must have at least two peers. At least two must be reachable at runtime; with a canon peer, one reachable peer (the canon itself) is sufficient.
+7. If none of the group's peers have any snapshot data and no canon peer is designated, exit with error: bidirectional sync requires snapshot history or a canon peer. On a first run with no canon, suggest: "First sync? Mark the authoritative peer with a trailing !"
+8. Connect to all peers in parallel (skip unreachable, log warnings).
+9. If canon peer is unreachable, exit with error.
+
+## Canon Peer
+
+A canon peer is authoritative — its state wins all conflicts.
+
+- **`!` on the command line** (`c:/photos!`): canon for this run only. Not persisted to the config file. Intended for one-time bootstrapping.
+- **`"canon": true` in the config file**: permanent canon. The user must edit the config file to set this.
+
+At most one peer per group may be canon. Canon is required when no peer in the group has snapshot history (first run). Once snapshots exist, bidirectional sync works without a canon peer.
 
 ## Run
 
-1. Purge snapshot tombstones (rows where `deleted_time IS NOT NULL`) with `deleted_time` older than `tombstone-retention-days`. Also purge stale rows where `deleted_time IS NULL` and `last_seen` is older than `tombstone-retention-days` (or `last_seen` is NULL) — these are orphaned rows from entries that vanished from all peers. Purge expired log entries
+1. Purge snapshot tombstones older than `tombstone-retention-days`. Also purge stale rows where `deleted_time IS NULL` and `last_seen` is older than `tombstone-retention-days` (or `last_seen` is NULL). Purge expired log entries.
 2. Run combined-tree walk (see multi-tree-sync.md)
    - Directory creation and displacement (to BACK/) inline
    - File copies enqueued for concurrent execution
@@ -37,7 +69,7 @@ File copies are enqueued during the combined-tree walk and executed concurrently
 
 ### File Copy
 
-Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting.
+Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's active URL pool and one from the destination peer's active URL pool before starting (see concurrency.md).
 
 1. **Transfer** to XFER staging on destination: `<target-parent>/.kitchensync/XFER/<timestamp>/<uuid>/<basename>`
 2. **If** the destination already has a file at the target path, **displace** it to `<file-parent>/.kitchensync/BACK/<timestamp>/<basename>`
@@ -96,7 +128,7 @@ This is the sole mechanism that lets us test with `file://` and trust the result
 
 ## Errors
 
-- **Config errors** (bad JSON5, unknown peer in `--canon`, missing file) → print to stdout, exit 1
+- **Config errors** (invalid settings, multiple canon peers, URLs from different groups, no canon and no snapshot history for group) → print to stdout, exit 1
 - **Unreachable peer** → skip, log warning, continue with others
 - **Transfer failure** → log, skip file (re-discovered next run)
 - **Displacement failure** (cannot rename to BACK/) → log error, skip the displacement (file remains in place). If the displacement was part of a file copy sequence, the copy is also skipped (XFER staging file is cleaned up)

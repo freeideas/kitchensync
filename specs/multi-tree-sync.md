@@ -93,14 +93,14 @@ For each entry, compare each active peer's state to that peer's snapshot row:
 
 ## Decision Rules
 
-### With `--canon <peer>`
+### With a canon peer
 
 The canonical peer's state wins unconditionally:
 - Canon has file → push to all others
 - Canon lacks file → delete everywhere else
 - Canon is unreachable → exit with error at startup
 
-### Without `--canon`
+### Without a canon peer
 
 1. **All unchanged** → no action
 2. **Modified** → newest mod_time wins; push to all that don't match
@@ -114,7 +114,7 @@ Peers with no snapshot row for the entry ("never had it") do not vote — they a
 
 If the winning entry already exists on a peer with a matching mod_time (within tolerance) and matching byte_size, no copy is performed for that peer — only the snapshot row is created/updated.
 
-Timestamp tolerance: 5 seconds in either direction. The tolerance applies to Entry Classification: a peer's mod_time is considered "same" as the snapshot row's mod_time if it differs by ≤ 5 seconds. When comparing peers' mod_times in Decision Rules, find the maximum mod_time among all peers that have the entry. Any peer whose mod_time is within 5 seconds of the maximum is treated as tied with the maximum (fall through to rules 5/6). Peers whose mod_time is more than 5 seconds behind the maximum lose to it. The same tolerance applies when comparing a deletion estimate (`deleted_time`) against a file's mod_time in rule 4.
+Timestamp tolerance: 5 seconds in either direction. The tolerance applies to Entry Classification: a peer's mod_time is considered "same" as the snapshot row's mod_time if it differs by ≤ 5 seconds. When comparing peers' mod_times in Decision Rules, find the maximum mod_time among all peers that have the entry. Any peer whose mod_time is within 5 seconds of the maximum is treated as tied with the maximum (fall through to rules 5/6). Peers whose mod_time is more than 5 seconds behind the maximum lose to it. The same tolerance applies when comparing a deletion estimate (`deleted_time`) against a file's mod_time in rule 4. The same tolerance applies to rule 4b: `last_seen` must exceed `max mod_time` by more than 5 seconds to be considered a deletion.
 
 ## Orphaned Snapshot Rows
 
@@ -147,11 +147,11 @@ Per-peer snapshot rows are updated during traversal, as soon as a decision is ma
       UNION ALL
       SELECT s.id FROM snapshot s
       JOIN subtree st ON s.parent_id = st.id
-      WHERE s.peer = ?peer AND s.deleted_time IS NULL
+      WHERE s.peer_id = ?peer_id AND s.deleted_time IS NULL
   )
   UPDATE snapshot
   SET deleted_time = ?deleted_time
-  WHERE peer = ?peer AND deleted_time IS NULL
+  WHERE peer_id = ?peer_id AND deleted_time IS NULL
   AND id IN (SELECT id FROM subtree);
   ```
   This walks down from the displaced directory's `id` through `parent_id` links, marking only its descendants — not unrelated rows that happen to have a tombstoned parent. If the cascade cannot reach all descendants due to purged intermediate rows, those orphaned rows will be cleaned up by the startup purge when their `last_seen` exceeds `tombstone-retention-days`.

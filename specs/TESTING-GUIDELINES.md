@@ -11,15 +11,19 @@ This works because all sync logic operates through the peer filesystem trait (se
 Using `file://` URLs and temporary directories:
 
 - **Multi-tree traversal** — parallel listing, union, correct decisions across N peers
-- **Decision rules** — timestamp-based (newer wins, ties keep data), `--canon` override
+- **Decision rules** — timestamp-based (newer wins, ties keep data), canon peer override
+- **Peer groups** — group formation from CLI URLs, group recognition from a single URL, accumulation in config file
+- **Canon peer** — required on first sync (no snapshot), optional after snapshots exist
 - **Tombstones** — deletion propagation, resurrection, expiry
 - **Snapshot** — updated during traversal, discrepancies detected on next run
+- **Peer identity** — URL normalization, peer recognition across runs, fallback URLs sharing a peer ID, startup reconciliation (two-pass)
 - **XFER staging** — atomic swaps, recheck, cleanup of stale dirs
 - **BACK directories** — displaced files recoverable, retention cleanup
-- **Config resolution** — all three forms (file, .kitchensync/ dir, parent dir)
+- **Config directory** — default `~/.kitchensync/`, `--cfg` override, config file accumulation
 - **Offline peers** — skipped gracefully, caught up on next run
-- **Single instance** — second run detects first and exits
-- **Edge cases** — empty directories, deep paths, timestamp tolerance
+- **Single instance** — second run against same config directory detects first and exits
+- **Connection pools** — per-URL pools, `max-connections` limit applies to `file://` too
+- **Edge cases** — empty directories, deep paths, timestamp tolerance (5 seconds)
 - **Abstraction boundary** — every test interacts with peers only through the trait; no test bypasses it to manipulate files directly after setup
 
 ## Test Structure
@@ -27,9 +31,9 @@ Using `file://` URLs and temporary directories:
 Tests are Python scripts in `./tests/`. Each test:
 
 1. Creates temporary directories for simulated peers
-2. Creates `kitchensync-conf.json` with `file://` URLs
+2. Creates a config directory with `kitchensync-conf.json` containing `file://` URLs grouped appropriately
 3. Sets up initial file states
-4. Runs `kitchensync <config>`
+4. Runs `kitchensync --cfg <config-dir> <url>...` or `kitchensync --cfg <config-dir>` (if config already has groups)
 5. Verifies outcomes (files synced, snapshot correct, BACK/ contents)
 6. Cleans up
 

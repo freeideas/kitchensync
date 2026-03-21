@@ -18,4 +18,4 @@ A build produces one of the following binaries in `./released/`:
 
 ## Help Flag
 
-`-h` or `--help` prints the help text defined in `specs/help.md` (embedded at build time) and exits 0.
+`-h`, `--help`, or no arguments at all prints the help text defined in `specs/help.md` (embedded at build time) and exits 0.
