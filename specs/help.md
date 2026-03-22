@@ -3,7 +3,7 @@
 `-h` or `--help` (or no arguments at all) prints the following text verbatim to stdout and exits 0. The text is embedded in the binary at build time.
 
 ```
-Usage: kitchensync [--cfgdir [<path>]] <url>... [key=value...] [-h|--help]
+Usage: kitchensync [--cfgdir <path>] [<url>...] [key=value...] [-h|--help]
 
 Synchronize file trees across multiple peers.
 
@@ -12,8 +12,9 @@ Running with no arguments prints this help. See README.md for full docs.
 Arguments:
   <url>         Peer URLs or local paths to sync. Trailing ! marks canon*.
   key=value     Settings (persisted to config file).
-  --cfgdir [path]  Config directory. If path ends with .kitchensync/ or
-                .kitchensync, used as-is; otherwise .kitchensync/ is appended.
+  --cfgdir path    Config directory (path required). Always ends with
+                .kitchensync/ — appended if not already present.
+                Example: --cfgdir ~ uses ~/.kitchensync/.
                 Default: ~/.kitchensync/.
 
 Quick start:
@@ -48,7 +49,8 @@ Peer groups:
 
 Config directory (~/.kitchensync/ by default):
   kitchensync-conf.json    Accumulated config (peer groups, settings)
-  kitchensync.db           Database (snapshots, logs, state)
+  kitchensync.db           Database (peer identity, snapshots)
+  quartz.db                Database (instance state, logs)
 
 No file is ever destroyed — displaced files go to .kitchensync/BACK/.
 

@@ -59,14 +59,14 @@ KitchenSync looks up the group containing `c:/photos/`, finds all its peers (`c:
 ## Command Line
 
 ```
-kitchensync [--cfg [<path>]] <url>... [key=value...] [-h|--help]
+kitchensync [--cfgdir <path>] [<url>...] [key=value...] [-h|--help]
 ```
 
 No arguments prints help.
 
-- **`<url>`** — peer URLs or local paths. Each is a peer to sync. Bare paths (no `file://` prefix) are treated as local `file://` URLs. A trailing `!` marks the URL as canon.
+- **`<url>`** — peer URLs or local paths. Each is a peer to sync. Bare paths (no `file://` prefix) are treated as local `file://` URLs. A trailing `!` marks the URL as canon. If no URLs are given, all groups in the config file are synced.
 - **`key=value`** — settings persisted to the config file (see Settings below).
-- **`--cfg [<path>]`** — config directory. If `<path>` ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent). Otherwise, `.kitchensync/` is appended. Default (or `--cfg` alone): `~/.kitchensync/`.
+- **`--cfgdir <path>`** — config directory. `<path>` is required. The config directory always ends with `.kitchensync/` — if `<path>` already ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent); otherwise `.kitchensync/` is appended. Examples: `--cfgdir ~` → `~/.kitchensync/`, `--cfgdir /mnt/usb` → `/mnt/usb/.kitchensync/`. Default (when `--cfgdir` is omitted entirely): `~/.kitchensync/`.
 
 ### How arguments are parsed
 
@@ -135,14 +135,15 @@ For **permanent canon** (every run treats a peer as authoritative), edit the con
 
 ## Config Directory
 
-Default: `~/.kitchensync/`. Override with `--cfg <path>`.
+Default: `~/.kitchensync/`. Override with `--cfgdir <path>` (path is required when the flag is used).
 
-Contains two fixed-name files:
+Contains three fixed-name files:
 
-| File                    | Purpose                                  |
-| ----------------------- | ---------------------------------------- |
+| File                    | Purpose                                    |
+| ----------------------- | ------------------------------------------ |
 | `kitchensync-conf.json` | Accumulated config (peer groups, settings) |
-| `kitchensync.db`        | SQLite database (snapshots, logs, state) |
+| `kitchensync.db`        | SQLite database (peer identity, snapshots) |
+| `quartz.db`             | SQLite database (instance state, logs)     |
 
 ### Config file accumulation
 

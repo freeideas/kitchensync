@@ -3,24 +3,23 @@
 ## Command Line
 
 ```
-kitchensync [--cfgdir [<path>]] <url>... [key=value...] [-h|--help]
+kitchensync [--cfgdir <path>] [<url>...] [key=value...] [-h|--help]
 ```
 
 No arguments, `-h`, or `--help`: print help and exit 0 (see help.md).
 
-`<url>`: one or more peer URLs or local paths. Each is a peer to sync. Bare paths are treated as `file://` URLs. A trailing `!` marks the URL as canon (e.g. `c:/photos!`).
+`<url>`: zero or more peer URLs or local paths. Each is a peer to sync. Bare paths are treated as `file://` URLs. A trailing `!` marks the URL as canon (e.g. `c:/photos!`). If no URLs are given, all groups in the config file are synced in parallel (each group runs independently). If the config file has no groups and no URLs are given, exit with error.
 
 `key=value`: settings that apply to the current run and are persisted to the config file (see help.md, "Settings").
 
-`--cfgdir [<path>]`: config directory. If `<path>` ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent). Otherwise, `.kitchensync/` is appended to `<path>`. Default (or `--cfgdir` alone with no path): `~/.kitchensync/`.
+`--cfgdir <path>`: config directory. `<path>` is required when the flag is used. The config directory always ends with `.kitchensync/` — if `<path>` already ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent); otherwise `.kitchensync/` is appended. Examples: `--cfgdir ~` → `~/.kitchensync/`, `--cfgdir /mnt/usb` → `/mnt/usb/.kitchensync/`, `--cfgdir ~/.kitchensync` → `~/.kitchensync/`. Default (when `--cfgdir` is omitted entirely): `~/.kitchensync/`.
 
 ## Config Directory
 
-Every run uses a config directory (default `~/.kitchensync/`) containing two fixed-name files:
+Every run uses a config directory (default `~/.kitchensync/`) containing:
 - `kitchensync-conf.json` — configuration (peer groups, settings)
-- `kitchensync.db` — SQLite database (snapshots, logs, instance state)
-
-These filenames are not configurable. The database is always colocated with the config file.
+- `kitchensync.db` — SQLite database (peer identity, snapshots)
+- `quartz.db` — SQLite database (instance state, logs) — see quartz-lifecycle.md
 
 ## Peer Groups
 
@@ -34,19 +33,22 @@ CLI URLs are merged into the config file before reconciliation. The config file 
 
 1. Resolve the config directory. Create it if it does not exist.
 2. Load config file if it exists, merge CLI URLs and settings into it. Do not write yet.
-3. Open database (`kitchensync.db`), WAL mode, run schema.
-4. Instance check — if another instance is already running against this config directory, print `Already running` and exit 0.
+3. Open databases (`quartz.db` and `kitchensync.db`), WAL mode, run schemas.
+4. Instance check (via `quartz.db`) — if another instance is already running against this config directory, print `Already running` and exit 0.
 5. Run peer identity reconciliation (see database.md, Startup Reconciliation). If reconciliation succeeds, write the merged config file. If reconciliation fails, exit with error — the original config file is unchanged.
-6. The group must have at least two peers. At least two must be reachable at runtime; with a canon peer, one reachable peer (the canon itself) is sufficient.
-7. If none of the group's peers have any snapshot data and no canon peer is designated, exit with error: bidirectional sync requires snapshot history or a canon peer. On a first run with no canon, suggest: "First sync? Mark the authoritative peer with a trailing !"
-8. Connect to all peers in parallel (skip unreachable, log warnings). Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. If directory creation fails, treat the peer as unreachable (log warning, try next fallback URL).
-9. If canon peer is unreachable, exit with error.
+
+Steps 6–9 apply independently to each group being synced. A group that fails validation is skipped with an error log; other groups proceed.
+
+6. The group must have at least two peers.
+7. If none of the group's peers have any snapshot data and no canon peer is designated, skip the group with error: bidirectional sync requires snapshot history or a canon peer. On a first run with no canon, suggest: "First sync? Mark the authoritative peer with a trailing !"
+8. Connect to all peers in parallel (skip unreachable, log warnings). Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. If directory creation fails, treat the peer as unreachable (log warning, try next fallback URL). If fewer than two peers are reachable (or fewer than one when a canon peer is designated), skip the group with error.
+9. If canon peer is unreachable, skip the group with error.
 
 ## Canon Peer
 
 A canon peer is authoritative — its state wins all conflicts.
 
-- **`!` on the command line** (`c:/photos!`): canon for this run only. Not persisted to the config file. Intended for one-time bootstrapping.
+- **`!` on the command line** (`c:/photos!`): designates the marked peer as canon and de-canons every other peer in the group, for this run only. Not persisted to the config file. A config-file `"canon": true` on another peer is overridden for the duration of the run. Intended for one-time bootstrapping.
 - **`"canon": true` in the config file**: permanent canon. The user must edit the config file to set this.
 
 At most one peer per group may be canon. Canon is required when no peer in the group has snapshot history (first run). Once snapshots exist, bidirectional sync works without a canon peer.
@@ -74,7 +76,7 @@ Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires 
 1. **Transfer** to XFER staging on destination: `<target-parent>/.kitchensync/XFER/<timestamp>/<uuid>/<basename>`
 2. **If** the destination already has a file at the target path, **displace** it to `<file-parent>/.kitchensync/BACK/<timestamp>/<basename>`
 3. **Swap** — rename from XFER to final path (same filesystem, atomic)
-4. **Set mod_time** — set the destination file's modification time to the source file's mod_time
+4. **Set mod_time** — set the destination file's modification time to the winning mod_time from the decision (not re-read from the source)
 5. **Clean up** empty XFER directories
 
 Content is streamed, not buffered entirely in memory. Each transfer spawns two concurrent tasks connected by a bounded channel: a reader task that reads chunks from the source and pushes them into the channel, and a writer task that pulls chunks and writes them to the destination. The reader and writer operate simultaneously — the channel provides backpressure (reader blocks when the channel is full, writer blocks when it is empty). A single-loop read-then-write pattern is not acceptable. On transfer failure, delete the XFER staging file/directory for that transfer before returning the connections to the pool.
@@ -94,11 +96,11 @@ Logged once per decision, not per peer. This gives the user visible progress out
 
 ## XFER Staging
 
-Staged near the target for same-filesystem atomic rename. Inside `.kitchensync/` to stay hidden. UUID per transfer prevents collisions. Stale dirs cleaned after `xfer-cleanup-days` (default: 2).
+Staged near the target for same-filesystem atomic rename. Inside `.kitchensync/` to stay hidden. UUID per transfer prevents collisions. The `<timestamp>` in the path uses the format defined in database.md (`YYYY-MM-DD_HH-mm-ss_ffffffZ`). Stale dirs cleaned after `xfer-cleanup-days` (default: 2).
 
 ## BACK Directory
 
-No file is ever destroyed. Displaced entries are recoverable from BACK/. Cleaned after `back-retention-days` (default: 90).
+No file is ever destroyed. Displaced entries are recoverable from BACK/. The `<timestamp>` in the path uses the format defined in database.md (`YYYY-MM-DD_HH-mm-ss_ffffffZ`). Cleaned after `back-retention-days` (default: 90).
 
 ## Peer Filesystem Abstraction
 
@@ -133,6 +135,7 @@ This is the sole mechanism that lets us test with `file://` and trust the result
 - **Transfer failure** → log, skip file (re-discovered next run)
 - **Displacement failure** (cannot rename to BACK/) → log error, skip the displacement (file remains in place). If the displacement was part of a file copy sequence, the copy is also skipped (XFER staging file is cleaned up)
 - **XFER staging failure** (cannot create staging directory or write staging file) → treat as transfer failure
+- **Multi-group exit code** → exit 0 if all groups completed successfully, exit 1 if any group was skipped due to error
 
 ## Case Sensitivity
 

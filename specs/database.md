@@ -1,23 +1,10 @@
 # Database
 
-Single SQLite database at `kitchensync.db` inside the config directory (default `~/.kitchensync/`). The database path is not separately configurable. WAL mode. Foreign keys enabled.
+SQLite database at `kitchensync.db` inside the config directory (default `~/.kitchensync/`). WAL mode. Foreign keys enabled. Separate from `quartz.db` (see quartz-lifecycle.md) — the two databases share the same config directory but have no cross-database dependencies.
 
 ## Schema
 
 ```sql
-CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS applog (
-    log_id INTEGER PRIMARY KEY,
-    stamp TEXT NOT NULL,
-    level TEXT NOT NULL,
-    message TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_applog_stamp ON applog(stamp);
-
 CREATE TABLE IF NOT EXISTS peer (
     peer_id INTEGER PRIMARY KEY
 );
@@ -135,7 +122,7 @@ When the user specifies URLs on the command line:
 1. Normalize each URL, look it up in `peer_url`.
 2. If any URL matches an existing peer, load that peer's group from the config file. That is the active group for this run.
 3. If URLs match peers in different groups (per the config file), that is a config error.
-4. New URLs (not in the database) are added to the active group as new peers — or a new group is created if no URLs matched.
+4. New URLs (not in the database) are added to the active group as new peers — or a new group is created if no URLs matched. Auto-generated names use `group_1`, `group_2`, ... for groups and `peer_1`, `peer_2`, ... for peers, picking the lowest number not already used in the config file.
 5. The updated group is written back to the config file.
 
 ## Snapshot
@@ -144,7 +131,7 @@ Tracks per-peer state — one row per path per peer that has (or had) the entry.
 
 - **id**: xxHash64 of full relative path (forward slashes), base62-encoded (11 characters)
 - **peer_id**: stable integer, foreign key to `peer` table
-- **parent_id**: xxHash64 of parent path with trailing `/`, base62-encoded. Root entries use the hash of `/`.
+- **parent_id**: xxHash64 of parent directory's relative path (no trailing slash), base62-encoded. Same value as the parent directory's `id`. Root entries use the hash of `/` as a sentinel.
 - **basename**: final path component
 - **mod_time**: `YYYY-MM-DD_HH-mm-ss_ffffffZ` — the entry's mod_time as last observed on this peer
 - **byte_size**: bytes for files, -1 for directories
@@ -161,12 +148,12 @@ When a file is confirmed absent on a peer where a snapshot row exists with `dele
 
 Paths are hashed with xxHash64 (seed 0) and encoded as base62 (digits `0-9`, uppercase `A-Z`, lowercase `a-z`). 64 bits → 11 characters, zero-padded.
 
-- Forward slashes, no leading slash
-- Trailing slash for directories and parent paths
+- Forward slashes, no leading slash, no trailing slash (files and directories are hashed identically; `byte_size = -1` distinguishes directories)
 - `docs/readme.txt` → hash of `docs/readme.txt`
-- `docs/notes/` (dir) → hash of `docs/notes/`
-- Parent of `docs/readme.txt` → hash of `docs/`
-- Parent of root entries → hash of `/`
+- `docs/notes` (dir) → hash of `docs/notes`
+- Parent of `docs/readme.txt` → hash of `docs`
+- Parent of `docs/notes` → hash of `docs`
+- Parent of root entries → hash of `/` (sentinel)
 - The sync root directory itself is not tracked in the snapshot — only its children are. Traversal begins by listing the root; the root has no snapshot row.
 
 ## Timestamps
