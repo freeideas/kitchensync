@@ -2,17 +2,14 @@
 
 ## Connection Pool
 
-Connection pools are keyed by URL, not by peer. Each URL that successfully connects gets its own pool of connections. For SFTP URLs, these are real SSH/SFTP connections. For `file://` URLs, connections are lightweight handles.
+Connection pools are keyed by URL, not by peer. Each URL that successfully connects gets its own pool of connections. For SFTP URLs, these are real SSH/SFTP connections. For `file://` URLs, connections are lightweight handles. The `--mc` pool limit applies equally to both — it bounds the number of concurrent operations against any single URL regardless of scheme.
 
-| Limit              | Default | Config key           |
-| ------------------ | ------- | -------------------- |
-| Max connections    | 10      | `max-connections`    |
-| Connection timeout | 30      | `connection-timeout` |
+| Setting            | Default | Global flag | Per-URL query param |
+| ------------------ | ------- | ----------- | ------------------- |
+| Max connections    | 10      | `--mc`      | `mc`                |
+| Connection timeout | 30s     | `--ct`      | `ct`                |
 
-Both settings can be set at two levels (most specific wins):
-
-1. **Per-URL** — on a URL object in the peer's fallback URL list (config file only)
-2. **Global default** — in the config root or on the command line
+Per-URL settings (query string) override global settings. Example: `"sftp://host/path?mc=20&ct=60"`
 
 A file transfer from peer A to peer B acquires one connection from A's active URL pool and one from B's active URL pool for the duration of the transfer. Both connections must be available before the transfer begins. When the transfer completes (or fails), both connections are returned to their respective pools.
 
@@ -22,39 +19,29 @@ Connections are reused across transfers. The pool is created lazily: connections
 
 ## Fallback URLs
 
-A peer can have multiple URLs in its `urls` list — these are fallback network paths to the same data. They share one `peer_id` and one set of snapshot rows. URLs are tried in order; the first that connects wins.
+A peer can have multiple URLs grouped in square brackets on the command line — these are fallback network paths to the same data. URLs are tried in order; the first that connects wins.
 
-```json5
-{
-  "peer_groups": [
-    {
-      "name": "docs",
-      "peers": [
-        { "name": "local", "urls": ["file:///home/user/docs"] },
-        { "name": "nas", "urls": [
-            { "url": "sftp://bilbo@192.168.1.50/docs", "max-connections": 20 },
-            { "url": "sftp://bilbo@nas.vpn/docs", "max-connections": 3, "connection-timeout": 60 }
-          ]
-        }
-      ]
-    }
-  ]
-}
+```
+kitchensync [sftp://192.168.1.50/photos,sftp://nas.vpn/photos] /local/photos
 ```
 
-On the CLI, each URL argument is a separate peer (single URL). Multiple fallback URLs per peer are a config-file feature.
+Per-URL settings apply to individual URLs within the group:
+
+```
+kitchensync "[sftp://192.168.1.50/photos?mc=20,sftp://nas.vpn/photos?mc=3&ct=60]" /local/photos
+```
 
 ## Connection Establishment
 
 Every connection to a peer — whether for directory listing or from the transfer pool — is established the same way:
 
 1. Try the peer's primary URL first, then each fallback URL in order
-2. For SFTP URLs, `connection-timeout` (default: 30 seconds) bounds the SSH handshake; if it expires, try the next URL
-3. For `file://` URLs, the connection is a lightweight local handle — `connection-timeout` does not apply. If the local path does not exist, create it (and any missing parents) before connecting
+2. For SFTP URLs, `--ct` (default: 30 seconds) bounds the SSH handshake; if it expires, try the next URL. After the handshake succeeds, check whether the peer's root path exists on the remote server. If not, create it (and any missing parents) via SFTP. If creation fails, the URL is treated as failed (try next fallback)
+3. For `file://` URLs, the connection is a lightweight local handle — connection timeout does not apply. If the local path does not exist, create it (and any missing parents) before connecting
 4. First successful connection wins — remaining URLs are not tried. All subsequent connections for this peer use the winning URL's pool
 5. If all URLs fail, the peer is **unreachable** for this connection attempt
 
-At startup, one connection per peer is established for directory listing (see below). The winning URL determines which pool is used for that peer's transfers for the remainder of the run. If all URLs fail, the peer is unreachable for the entire run (see sync.md startup step 7). Pool connections are opened lazily using the same procedure; a pool connection failure during a transfer is a transfer failure (see sync.md Errors).
+At startup, one connection per peer is established for directory listing (see below). The winning URL determines which pool is used for that peer's transfers for the remainder of the run. If all URLs fail, the peer is unreachable for the entire run (see sync.md startup). Pool connections are opened lazily using the same procedure; a pool connection failure during a transfer is a transfer failure (see sync.md Errors).
 
 ## Directory Listing
 
@@ -62,13 +49,13 @@ Directory listing uses its own connection per peer, outside the transfer pool. D
 
 ## Trace Logging
 
-When log level is `trace`, log every pool change:
+When verbosity level is `trace` (`-vl trace`), log every pool change:
 
 ```
 url=<url> connections=<n>/<max>
 ```
 
-Logged on every acquire and release. This allows tests to reconstruct the concurrency timeline from the `applog` table and verify that limits were never exceeded.
+Logged on every acquire and release.
 
 ## Parallel directory listing test
 

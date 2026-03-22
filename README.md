@@ -4,86 +4,132 @@ Synchronize file trees across multiple peers.
 
 ## Why KitchenSync?
 
+**Fast!** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them. Written in Rust.
+
+**Never lose files!** Old copies of overwritten or deleted files go to `.kitchensync/BAK/`. Multiple previous versions are kept for 90 days (configurable).
+
 **Zero infrastructure on peers.** Only needs SSH access — no daemons, no ports, no services. If you can `ssh user@host`, KitchenSync can sync with it.
 
-**Any peer, anywhere.** The local filesystem isn't special — it's just another peer. Sync two remote servers without touching the local machine, or include a local directory alongside remotes.
+**Fully command-line driven.** No config files, no setup wizards, no JSON. Just URLs on a command line. Want a fancy config file? Write a shell script. Or don't — it's up to you.
 
-**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections — plug them in and KitchenSync brings them current. The snapshot knows what the world should look like; discrepancies are detected and resolved automatically.
+**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections — plug them in and KitchenSync brings them current. Each peer carries its own snapshot history, so it always knows what changed.
 
-**N-way sync in one pass.** All peers are listed in parallel at each directory level. Decisions are made once, copies fan out to all peers that need them.
+**Multiple paths to every peer.** Each peer can have several fallback URLs — local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the cloud drive over your LAN; at the office it goes through the VPN. One command, no switching.
 
-**Multiple paths to every peer.** Each peer can have several fallback URLs — local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the NAS over your LAN; at the office it goes through the VPN. One config, no switching.
+**Native on Windows, Linux, and macOS.** A single binary, no dependencies. No Cygwin, no WSL, no MinGW — just download and run. Paths like `c:\photos` work exactly as you'd expect.
 
-**Never destructive.** Old copies of overwritten or deleted files go to `.kitchensync/BACK/`. Multiple versions are kept for 90 days (configurable).
+**No central server.** Every peer is equal (unless you say otherwise). No account, no cloud, no subscription.
 
-**No central server.** Every peer is equal (unless you mark one as canon). No account, no cloud, no subscription.
+## The `+` and `-` URL Prefixes
 
-**Quick one-off syncs from the command line.** Define peers inline — no config file needed. `kitchensync c:/photos! sftp://host/photos` syncs right now, remembers the group for next time.
-
-## How It Compares
-
-|                          | KitchenSync             | rsync  | Syncthing        | Unison      |
-| ------------------------ | ----------------------- | ------ | ---------------- | ----------- |
-| Software needed on peers | No more than SSH        | rsync  | Syncthing daemon | Unison      |
-| Bidirectional            | Yes                     | No     | Yes              | Yes         |
-| Multi-peer mesh          | Yes                     | No     | Yes              | Pairwise    |
-| Deletion propagation     | Yes                     | Manual | Yes              | Yes         |
-| Conflict resolution      | Automatic (newest wins) | N/A    | Manual or LWW    | Interactive |
+- **`+`** — this peer wins every disagreement (canon)
+- **`-`** — this peer loses every disagreement (subordinate)
+- **(no prefix)** — bidirectional; newest wins
 
 ## Quick Start
 
-**First sync — two peers, local is canon:**
+Any peer without a snapshot is automatically treated as `-` — it receives the group's state without influencing decisions.
+
+Sync your photos to a cloud drive. First time, use `+` so your local copy wins every disagreement:
 
 ```
-kitchensync c:/photos! sftp://bilbo@nas/volume1/photos
+kitchensync +c:/photos sftp://bilbo@cloud/volume1/photos
 ```
 
-This syncs `c:/photos/` to the NAS. The `!` marks the local directory as canon (its state wins conflicts). A peer group is created and remembered.
+That's it. Both directories are now in sync. No config file was created. No database was installed anywhere central. Each peer just got a tiny `.kitchensync/` directory with its snapshot.
 
-**Add another peer to the same group:**
+## Next Time
 
-```
-kitchensync c:/photos/ d:/backup/photos
-```
-
-KitchenSync recognizes `c:/photos/` from the previous run, finds its group, and adds `d:/backup/photos` as a new peer. All three peers are now synced.
-
-**Run the group again (just name any URL in it):**
+Run the same thing without `+`. KitchenSync uses the snapshots from last time to sync bidirectionally — changes on either side propagate. You don't have to remember which files you changed on which device; KitchenSync knows what to update, copy, and/or archive.
 
 ```
-kitchensync c:/photos/
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos
 ```
 
-KitchenSync looks up the group containing `c:/photos/`, finds all its peers (`c:/photos/`, `sftp://bilbo@nas/volume1/photos`, `d:/backup/photos`), and syncs them all.
+## Add More Peers
 
-## Command Line
+Just add them to the command:
 
 ```
-kitchensync [--cfgdir <path>] [<url>...] [key=value...] [-h|--help]
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos d:/backup/photos
 ```
 
-No arguments prints help.
+The new peer has no snapshot yet, so it's automatically subordinate — it receives the group's state without influencing decisions.
 
-- **`<url>`** — peer URLs or local paths. Each is a peer to sync. Bare paths (no `file://` prefix) are treated as local `file://` URLs. A trailing `!` marks the URL as canon. If no URLs are given, all groups in the config file are synced.
-- **`key=value`** — settings persisted to the config file (see Settings below).
-- **`--cfgdir <path>`** — config directory. `<path>` is required. The config directory always ends with `.kitchensync/` — if `<path>` already ends with `.kitchensync/` or `.kitchensync`, it is used as-is (with a trailing `/` added if absent); otherwise `.kitchensync/` is appended. Examples: `--cfgdir ~` → `~/.kitchensync/`, `--cfgdir /mnt/usb` → `/mnt/usb/.kitchensync/`. Default (when `--cfgdir` is omitted entirely): `~/.kitchensync/`.
+## Add a USB Drive
 
-### How arguments are parsed
+Use `-` to explicitly mark a peer as subordinate, even if it already has a snapshot:
 
-Arguments without `=` are peer URLs. Arguments with `=` are settings. This is unambiguous because URLs never contain `=`.
+```
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos -/mnt/usb/photos
+```
 
-### URL schemes
+Next time the USB is plugged in, drop the `-` and it participates as a full bidirectional peer.
+
+## Fallback URLs
+
+Your cloud drive has a local IP and a VPN address? Group them with brackets — KitchenSync tries each in order:
+
+```
+kitchensync c:/photos [h:/office-share/photos,sftp://192.168.1.50:2222/photos,sftp://cloud.vpn/photos]
+```
+
+At home it connects over LAN. At the office it falls back to VPN. One command.
+
+## Per-URL Tuning
+
+Slow VPN link? Limit its connections. Fast LAN? Crank them up. Use query-string parameters:
+
+```
+kitchensync c:/photos "[sftp://192.168.1.50/photos?mc=20,sftp://cloud.vpn/photos?mc=3&ct=60]"
+```
+
+(Quotes needed because of the `?` — your shell would glob it otherwise.)
+
+## Global Options
+
+Set defaults for the whole run:
+
+```
+kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
+```
+
+| Flag   | Default | Meaning                                     |
+| ------ | ------- | ------------------------------------------- |
+| `--mc` | 10      | Max concurrent connections per URL          |
+| `--ct` | 30      | SSH handshake timeout (seconds)             |
+| `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
+| `--xd` | 2       | Delete stale staging after N days           |
+| `--bd` | 90      | Delete displaced files after N days         |
+| `--td` | 180     | Forget deletion records after N days        |
+
+## How It Compares
+
+|                           | KitchenSync             | rsync        | Syncthing        | Unison       |
+| ------------------------- | ----------------------- | ------------ | ---------------- | ------------ |
+| Deleted/Overwritten files | Recoverable for a while | LOST FOREVER | LOST FOREVER     | LOST FOREVER |
+| Needed on peers           | SSH or nothing          | SSH + rsync  | Syncthing daemon | SSH + Unison |
+| Bidirectional             | Yes                     | No           | Yes              | Yes          |
+| Multi-peer mesh           | Yes                     | No           | Yes              | Tricky       |
+| Delete propagation        | Yes                     | Opt-in       | Yes              | Yes          |
+| Conflict resolution       | Newest Wins             | Overwrite    | Configurable     | Interactive  |
+| Config files              | No                      | No           | OMG Yes          | Yes          |
+| Windows support           | Excellent               | Tricky       | Excellent        | OK           |
+
+## URL Schemes
 
 | Form                                 | Meaning                           |
 | ------------------------------------ | --------------------------------- |
-| `/path` or `c:\path` or `./relative` | Local path (becomes `file://`)    |
+| `/path` or `c:\path` or `./relative` | Local path (same as `file://`)    |
 | `sftp://user@host/path`              | Remote over SSH (port 22)         |
 | `sftp://user@host:port/path`         | Non-standard SSH port             |
 | `sftp://user:password@host/path`     | Inline password (prefer SSH keys) |
 
-Percent-encode special characters in SFTP passwords (`@` → `%40`, `:` → `%3A`). SFTP paths are absolute from filesystem root.
+## Authentication
 
-### Authentication (fallback chain)
+For remote peers, just make sure you can reach the directory via SSH. If `ssh user@host` `cd /path` works, KitchenSync can sync it.
+
+KitchenSync tries these in order:
 
 1. Inline password from URL
 2. SSH agent (`SSH_AUTH_SOCK`)
@@ -93,157 +139,30 @@ Percent-encode special characters in SFTP passwords (`@` → `%40`, `:` → `%3A
 
 Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
-## Peer Groups
+## The `.kitchensync/` Directory
 
-A peer group is a set of peers that synchronize with each other. Groups are the core organizing concept in KitchenSync.
+The snapshot database lives at the peer root. BAK/ and TMP/ directories are created alongside affected files at any directory level.
 
-### How groups form
+| Path                                                        | Purpose                          |
+| ----------------------------------------------------------- | -------------------------------- |
+| `.kitchensync/snapshot.db`                                  | Peer's snapshot history (SQLite) |
+| `<parent>/.kitchensync/BAK/<timestamp>/<basename>`          | Displaced files (recoverable)    |
+| `<parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>`   | Transfer staging (atomic swap)   |
 
-When you run `kitchensync url1 url2`, both URLs are placed in the same peer group. If either URL already belongs to an existing group, the other is added to it.
-
-### How groups are recognized
-
-Every URL is normalized and stored in the database. On the next run, specifying any single URL from a group selects the entire group. You don't need to list all peers every time.
-
-### URL normalization
-
-URLs are normalized before storage and lookup: scheme and hostname are lowercased, default ports are removed, consecutive slashes are collapsed, trailing slashes are removed, and bare paths are resolved to absolute `file://` URLs.
-
-### Group conflicts
-
-If you specify URLs that belong to two different existing groups, that's an error. To merge groups, edit the config file (`~/.kitchensync/kitchensync-conf.json`).
-
-## Canon Peer
-
-A canon peer is authoritative — its state wins all conflicts unconditionally.
-
-The `!` suffix on the command line marks a peer as canon **for this run only** — it is not persisted to the config file:
-
-```
-kitchensync c:/photos! sftp://host/photos
-```
-
-**Canon is required on the first sync** of a new group (when no snapshot history exists). Without snapshot history, KitchenSync can't tell which files are new vs deleted, so it needs one peer to be the source of truth.
-
-**After the first sync**, snapshot history exists and bidirectional sync works without canon. You can drop the `!`:
-
-```
-kitchensync c:/photos/
-```
-
-For **permanent canon** (every run treats a peer as authoritative), edit the config file and set `"canon": true` on the peer entry. At most one peer per group may be canon.
-
-## Config Directory
-
-Default: `~/.kitchensync/`. Override with `--cfgdir <path>` (path is required when the flag is used).
-
-Contains three fixed-name files:
-
-| File                    | Purpose                                    |
-| ----------------------- | ------------------------------------------ |
-| `kitchensync-conf.json` | Accumulated config (peer groups, settings) |
-| `kitchensync.db`        | SQLite database (peer identity, snapshots) |
-| `quartz.db`             | SQLite database (instance state, logs)     |
-
-### Config file accumulation
-
-The config file accumulates state across runs. Every CLI setting and URL is merged into the file and persisted. If you run:
-
-```
-kitchensync c:/photos/ sftp://host/photos max-connections=5
-```
-
-The next run inherits `max-connections=5` and knows about both peers, even if you only specify one URL.
-
-### Config file format
-
-The config file is JSON with `//` and `/* */` comments allowed. Comments are stripped before parsing.
-
-```json5
-{
-  // Global settings
-  "max-connections": 10,
-  "connection-timeout": 30,
-  "xfer-cleanup-days": 2,
-  "back-retention-days": 90,
-  "tombstone-retention-days": 180,
-  "log-retention-days": 32,
-
-  // Peer groups
-  "peer_groups": [
-    {
-      "name": "photos",
-      "peers": [
-        { "name": "local", "urls": ["file:///c:/photos"], "canon": true },
-        { "name": "nas", "urls": ["sftp://bilbo@nas/volume1/photos"] },
-        { "name": "backup", "urls": ["file:///d:/backup/photos"] }
-      ]
-    },
-    {
-      "name": "docs",
-      "peers": [
-        { "name": "laptop", "urls": ["file:///home/bilbo/docs"] },
-        { "name": "nas", "urls": [
-            "sftp://bilbo@192.168.1.50/docs",
-            { "url": "sftp://bilbo@nas.vpn/docs", "max-connections": 3, "connection-timeout": 60 }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Fallback URLs
-
-A peer can have multiple URLs in its `urls` list — these are different network paths to the same data (e.g., LAN IP vs VPN hostname). They share one peer identity and snapshot history. URLs are tried in order; the first that connects wins. On the CLI, each URL argument is a separate peer. Multiple fallback URLs per peer are a config-file feature.
-
-## Settings
-
-| Setting                    | Default | Meaning                                       |
-| -------------------------- | ------- | --------------------------------------------- |
-| `max-connections`          | 10      | Max concurrent connections per URL            |
-| `connection-timeout`       | 30      | Seconds for SSH handshake timeout             |
-| `log-level`                | `info`  | Log level (`error`, `info`, `debug`, `trace`) |
-| `xfer-cleanup-days`        | 2       | Delete stale staging dirs after N days        |
-| `back-retention-days`      | 90      | Delete displaced files after N days           |
-| `tombstone-retention-days` | 180     | Forget deletion records after N days          |
-| `log-retention-days`       | 32      | Purge log entries after N days                |
-
-Settings can be specified on the CLI as `key=value` or in the config file. CLI values are merged into the config file and persisted.
-
-## The `.kitchensync/` Directory (in peer trees)
-
-Each peer's file tree may contain `.kitchensync/` directories for operational data:
-
-| Path                                              | Purpose                        |
-| ------------------------------------------------- | ------------------------------ |
-| `.kitchensync/BACK/<timestamp>/<basename>`        | Displaced files (recoverable)  |
-| `.kitchensync/XFER/<timestamp>/<uuid>/<basename>` | Transfer staging (atomic swap) |
-
-These are created near the affected files throughout the tree. `.kitchensync/` directories are never synced between peers.
+These are never synced between peers.
 
 ## How Sync Works
 
-1. List all peers' directories in parallel at each level
-2. Union the entries across peers
-3. For each entry, decide the authoritative state (canon wins, or newest mod_time wins)
-4. Enqueue file copies, create/remove directories as needed
-5. Execute copies concurrently (subject to connection limits)
-6. Update snapshot in the database
+1. Connect to all peers in parallel (fallback URLs tried in order)
+2. Download each peer's snapshot to a local temp directory
+3. Walk the combined directory tree, listing all peers in parallel at each level
+4. Union the entries across peers
+5. For each entry, decide the authoritative state (canon wins, or newest mod_time wins)
+6. Enqueue file copies, create/remove directories as needed
+7. Execute copies concurrently (subject to connection limits)
+8. Upload updated snapshots back to each peer (atomic rename)
 
-Decisions are made once per entry, not per peer pair. The snapshot tracks what each peer had last time, enabling deletion detection and conflict resolution.
-
-## Peer Identity in the Database
-
-Each peer is assigned a stable integer ID, and its URLs are stored in a lookup table. Snapshot rows (file state) are keyed by this peer ID. On every startup, the database's peer/URL tables are reconciled against the config file in two passes: first recognize known URLs (read-only), then rewrite the URL mappings to match the config.
-
-This means:
-- Specifying any URL from a group reconstitutes the entire group
-- Adding a new URL alongside a known one adds it to the existing group
-- Renaming a URL in the config preserves all snapshot history (same peer ID)
-- Reorganizing groups in the config is a free operation — snapshot data is per-peer, not per-group
-- Fallback URLs (multiple paths to the same data) share one peer ID
+Decisions are made once per entry, not per peer pair. Snapshots track what each peer had last time, enabling deletion detection and conflict resolution.
 
 ## Building
 
