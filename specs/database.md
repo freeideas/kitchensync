@@ -2,7 +2,7 @@
 
 Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQLite, WAL mode, foreign keys enabled.
 
-At the start of a run, each peer's `snapshot.db` is downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). All reads and writes happen against this local copy. After sync completes, the updated database is written back atomically: upload as `snapshot-new.db`, then rename to `snapshot.db`. If a peer has no existing `snapshot.db`, a new one is created locally.
+At the start of a run, each peer's `snapshot.db` is downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). All reads and writes happen against this local copy. After sync completes, the updated database is written back using TMP staging — the same mechanism used for file copies (see sync.md, TMP Staging): upload to `{peer-root}/.kitchensync/TMP/<timestamp>/<uuid>/snapshot.db`, then rename to `{peer-root}/.kitchensync/snapshot.db`. If the upload fails, the TMP staging file is left behind and cleaned up after `--xd` days like any other stale staging file. If a peer has no existing `snapshot.db`, a new one is created locally.
 
 ## Schema
 

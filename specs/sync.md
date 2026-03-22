@@ -111,7 +111,7 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
    - Snapshot updated during traversal
    - Per-peer concurrency limits enforced (see concurrency.md)
 3. Wait for all enqueued file copies to complete
-4. Write updated snapshots back to peers atomically: upload as `snapshot-new.db`, rename to `snapshot.db` (see database.md)
+4. Write updated snapshots back to peers using TMP staging: upload to `.kitchensync/TMP/<timestamp>/<uuid>/snapshot.db`, rename to `.kitchensync/snapshot.db` (see database.md). Failed uploads leave staging files that are cleaned up after `--xd` days like any other stale TMP file
 5. Disconnect all peers
 6. Log completion, exit 0
 
@@ -192,7 +192,7 @@ This is the sole mechanism that lets us test with `file://` and trust the result
 - **Transfer failure** → log, skip file (re-discovered next run)
 - **Displacement failure** (cannot rename to BAK/) → log error, skip the displacement (file remains in place). If the displacement was part of a file copy sequence, the copy is also skipped (TMP staging file is cleaned up)
 - **TMP staging failure** (cannot create staging directory or write staging file) → treat as transfer failure
-- **Snapshot upload failure** → log error (peer's snapshot will be stale on next run, leading to redundant but correct copies)
+- **Snapshot upload failure** → log error, leave TMP staging file for `--xd` cleanup (peer's snapshot will be stale on next run, leading to redundant but correct copies)
 
 ## Case Sensitivity
 

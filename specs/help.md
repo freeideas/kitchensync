@@ -42,9 +42,12 @@ Quick start:
   kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)
   kitchensync c:/photos sftp://host/photos            Bidirectional
   kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
+  kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password
 
 Canon (+) is required on first sync when no peer has snapshot history.
 After the first sync, bidirectional sync works without canon.
+
+Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 
 No file is ever destroyed — displaced files go to .kitchensync/BAK/.
 ```
