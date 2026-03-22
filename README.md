@@ -108,7 +108,7 @@ kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
 |                           | KitchenSync             | rsync        | Syncthing        | Unison       |
 | ------------------------- | ----------------------- | ------------ | ---------------- | ------------ |
 | Deleted/Overwritten files | Recoverable for a while | LOST FOREVER | LOST FOREVER     | LOST FOREVER |
-| Needed on peers           | SSH or nothing          | SSH + rsync  | Syncthing daemon | SSH + Unison |
+| Needed on peers           | SSH or maybe nothing *  | rsync + SSH  | Syncthing daemon | SSH + Unison |
 | Bidirectional             | Yes                     | No           | Yes              | Yes          |
 | Multi-peer mesh           | Yes                     | No           | Yes              | Tricky       |
 | Delete propagation        | Yes                     | Opt-in       | Yes              | Yes          |
@@ -116,6 +116,8 @@ kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
 | Config files              | No                      | No           | OMG Yes          | Yes          |
 | Windows support           | Excellent               | Tricky       | Excellent        | OK           |
 
+*Maybe slightly misleading because rsync and KitchenSync can both operate on local file systems without SSH. But on Windows, without SSH has some extra-meaningful usefulness — e.g. Windows server file shares — and rsync is difficult to install on Windows.*
+ 
 ## URL Schemes
 
 | Form                                 | Meaning                           |
@@ -143,11 +145,11 @@ Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
 The snapshot database lives at the peer root. BAK/ and TMP/ directories are created alongside affected files at any directory level.
 
-| Path                                                        | Purpose                          |
-| ----------------------------------------------------------- | -------------------------------- |
-| `.kitchensync/snapshot.db`                                  | Peer's snapshot history (SQLite) |
-| `<parent>/.kitchensync/BAK/<timestamp>/<basename>`          | Displaced files (recoverable)    |
-| `<parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>`   | Transfer staging (atomic swap)   |
+| Path                                                      | Purpose                          |
+| --------------------------------------------------------- | -------------------------------- |
+| `.kitchensync/snapshot.db`                                | Peer's snapshot history (SQLite) |
+| `<parent>/.kitchensync/BAK/<timestamp>/<basename>`        | Displaced files (recoverable)    |
+| `<parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>` | Transfer staging (atomic swap)   |
 
 These are never synced between peers.
 
