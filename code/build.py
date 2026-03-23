@@ -29,14 +29,90 @@ CARGO_HOME = os.path.join(COMPILER_DIR, "cargo")
 RELEASED_DIR = os.path.join(PROJECT_ROOT, "released")
 CODE_DIR = SCRIPT_DIR
 
+# Cache for MSVC environment variables (populated once on first use)
+_msvc_env_cache = None
+
+
+def _find_vcvarsall():
+    """Find vcvarsall.bat from VS Build Tools or VS Community."""
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                     "Microsoft Visual Studio", "2022", "BuildTools",
+                     "VC", "Auxiliary", "Build", "vcvarsall.bat"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                     "Microsoft Visual Studio", "2022", "Community",
+                     "VC", "Auxiliary", "Build", "vcvarsall.bat"),
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                     "Microsoft Visual Studio", "2022", "BuildTools",
+                     "VC", "Auxiliary", "Build", "vcvarsall.bat"),
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                     "Microsoft Visual Studio", "2022", "Community",
+                     "VC", "Auxiliary", "Build", "vcvarsall.bat"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _get_msvc_env():
+    """Capture environment variables from vcvarsall.bat x64. Returns dict or None."""
+    global _msvc_env_cache
+    if _msvc_env_cache is not None:
+        return _msvc_env_cache
+
+    vcvarsall = _find_vcvarsall()
+    if not vcvarsall:
+        return None
+
+    # Run vcvarsall.bat and dump the resulting environment
+    bat_cmd = f'call "{vcvarsall}" x64 >nul 2>&1 && set'
+    result = subprocess.run(
+        ["cmd.exe", "/c", bat_cmd],
+        capture_output=True, text=True, encoding='utf-8',
+    )
+    if result.returncode != 0:
+        return None
+
+    msvc_env = {}
+    for line in result.stdout.splitlines():
+        if '=' in line:
+            key, _, value = line.partition('=')
+            msvc_env[key] = value
+
+    _msvc_env_cache = msvc_env
+    print(f"  ✓ Loaded MSVC environment from {os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(vcvarsall))))}")
+    return msvc_env
+
 
 def run(cmd, **kwargs):
     """Run a command with Rust environment."""
     env = os.environ.copy()
+
+    # On Windows, load MSVC environment (PATH, LIB, INCLUDE, etc.) so that
+    # Rust can find link.exe and Windows SDK libs instead of picking up the
+    # GNU link.exe from Git Bash's /usr/bin/.
+    if platform.system().lower() == "windows":
+        msvc_env = _get_msvc_env()
+        if msvc_env:
+            # Merge MSVC env — keys like PATH, LIB, INCLUDE, LIBPATH are critical
+            for key in ("PATH", "LIB", "INCLUDE", "LIBPATH", "WINDOWSSDKDIR",
+                        "WINDOWSSDKVERSION", "VCTOOLSINSTALLDIR", "UCRTCONTENTSDIR"):
+                if key in msvc_env:
+                    env[key] = msvc_env[key]
+
     env["RUSTUP_HOME"] = RUSTUP_HOME
     env["CARGO_HOME"] = CARGO_HOME
     cargo_bin = os.path.join(CARGO_HOME, "bin")
-    env["PATH"] = cargo_bin + os.pathsep + env.get("PATH", "")
+
+    # On Windows, add Strawberry Perl to PATH for OpenSSL build
+    strawberry_perl = os.path.join(TOOLS_DIR, "strawberry", "perl", "bin")
+    strawberry_c = os.path.join(TOOLS_DIR, "strawberry", "c", "bin")
+    extra_paths = []
+    if os.path.isdir(strawberry_perl):
+        extra_paths.extend([strawberry_perl, strawberry_c])
+
+    env["PATH"] = os.pathsep.join([cargo_bin] + extra_paths + [env.get("PATH", "")])
 
     print(f"  ✓ Running: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
     result = subprocess.run(
@@ -77,12 +153,28 @@ def ensure_rust():
     """Ensure Rust toolchain is installed in ./tools/compiler/."""
     cargo_bin = os.path.join(CARGO_HOME, "bin", "cargo")
     rustc_bin = os.path.join(CARGO_HOME, "bin", "rustc")
+    rustup_bin = os.path.join(CARGO_HOME, "bin", "rustup")
+
+    # Check if executables exist (on Windows, add .exe)
+    if platform.system().lower() == "windows":
+        cargo_bin += ".exe"
+        rustc_bin += ".exe"
+        rustup_bin += ".exe"
 
     if os.path.isfile(cargo_bin) and os.path.isfile(rustc_bin):
         result = run([rustc_bin, "--version"])
         if result.returncode == 0:
             print(f"  ✓ Rust already installed: {result.stdout.strip()}")
             return
+        # Rustc exists but --version failed, may need to set default toolchain
+        if os.path.isfile(rustup_bin):
+            print("  • Setting default toolchain...")
+            default_result = run([rustup_bin, "default", "stable"])
+            if default_result.returncode == 0:
+                result = run([rustc_bin, "--version"])
+                if result.returncode == 0:
+                    print(f"  ✓ Rust already installed: {result.stdout.strip()}")
+                    return
 
     print("• Installing Rust toolchain...")
     os.makedirs(COMPILER_DIR, exist_ok=True)
@@ -120,7 +212,7 @@ def detect_platform():
     elif system == "darwin":
         return "x86_64-apple-darwin" if "x86_64" in machine else "aarch64-apple-darwin"
     elif system == "windows":
-        return "x86_64-pc-windows-gnu"
+        return "x86_64-pc-windows-msvc"
     return "x86_64-unknown-linux-gnu"
 
 
@@ -130,7 +222,7 @@ def build_native(target):
     cmd = [cargo, "build", "--release", "--target", target]
 
     print(f"• Building for {target} (native)...")
-    result = run(cmd, cwd=CODE_DIR, timeout=600)
+    result = run(cmd, cwd=CODE_DIR, timeout=1800)  # 30 minutes for vendored OpenSSL build
 
     if result.returncode != 0:
         print(f"  ✗ Build failed for {target}")
@@ -221,10 +313,19 @@ def main():
     print("KitchenSync Build")
     print("=" * 60)
 
-    # Step 0: Delete everything in released/ (per spec)
-    if os.path.isdir(RELEASED_DIR):
-        shutil.rmtree(RELEASED_DIR)
+    # Step 0: Delete only current platform's binary (preserve other platforms)
     os.makedirs(RELEASED_DIR, exist_ok=True)
+    system = platform.system().lower()
+    if system == "linux":
+        current_binary = "kitchensync.linux"
+    elif system == "darwin":
+        current_binary = "kitchensync.mac"
+    else:
+        current_binary = "kitchensync.exe"
+    current_binary_path = os.path.join(RELEASED_DIR, current_binary)
+    if os.path.isfile(current_binary_path):
+        os.remove(current_binary_path)
+        print(f"  ✓ Removed old {current_binary}")
     os.makedirs(TOOLS_DIR, exist_ok=True)
 
     # Step 1: Ensure Rust
