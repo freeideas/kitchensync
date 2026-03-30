@@ -12,10 +12,22 @@ A build produces one of the following binaries in `./released/`:
 
 ## Process
 
-1. Delete only the current platform's binary from `./released/` (preserve other platforms' binaries)
-2. Build the binary for the current platform
-3. Copy to `./released/` with the platform-appropriate name
+1. Delete only the current platform's binary from `./released/` (preserve binaries from other platforms so that builds from multiple platforms accumulate)
+2. Build the binary for the current platform: `go build -o ./released/<platform-binary> ./cmd/kitchensync`
+3. Cross-compilation: `GOOS=<os> GOARCH=<arch> go build -o ./released/<binary> ./cmd/kitchensync`
+
+## Go Module
+
+The module is `kitchensync`. Source lives under `./code/`.
+
+## Dependencies
+
+Key Go libraries:
+- `github.com/pkg/sftp` + `golang.org/x/crypto/ssh` — SFTP/SSH
+- `github.com/mattn/go-sqlite3` or `modernc.org/sqlite` (pure Go, no CGO) — SQLite
+- `github.com/cespare/xxhash/v2` — xxHash64 for path hashing
+- `github.com/sabhiram/go-gitignore` — .syncignore pattern matching
 
 ## Help Flag
 
-`-h`, `--help`, or no arguments at all prints the help text defined in `specs/help.md` (embedded at build time) and exits 0.
+`-h`, `--help`, `/?`, or no arguments at all prints the help text defined in `specs/help.md` (embedded at build time) and exits 0.

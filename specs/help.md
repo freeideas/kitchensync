@@ -1,11 +1,12 @@
 # Help Screen
 
-`-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Argument validation errors (fewer than two peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the binary at build time.
+`-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Argument validation errors (no peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the binary at build time.
 
 ```
-Usage: kitchensync [options] <peer> <peer> [<peer>...]
+Usage: kitchensync [options] <peer> [<peer>...]
 
 Synchronize file trees across multiple peers.
+One peer: snapshot only (record what's there, no sync).
 
 Running with no arguments prints this help. See README.md for full docs.
 
@@ -39,6 +40,7 @@ Options:
   --td N             Forget deletion records after N days (default: 180)
 
 Quick start:
+  kitchensync /mnt/usb/photos                         Snapshot only (no sync)
   kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)
   kitchensync c:/photos sftp://host/photos            Bidirectional
   kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
@@ -49,5 +51,5 @@ After the first sync, bidirectional sync works without canon.
 
 Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 
-No file is ever destroyed — displaced files go to .kitchensync/BAK/.
+Displaced files are recoverable from .kitchensync/BAK/ (kept for --bd days).
 ```

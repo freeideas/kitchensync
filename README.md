@@ -4,7 +4,7 @@ Synchronize file trees across multiple peers.
 
 ## Why KitchenSync?
 
-**Fast!** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them. Written in Rust.
+**Fast!** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them. Written in Go.
 
 **Never lose files!** Old copies of overwritten or deleted files go to `.kitchensync/BAK/`. Multiple previous versions are kept for 90 days (configurable).
 
@@ -66,6 +66,16 @@ kitchensync c:/photos sftp://bilbo@cloud/volume1/photos -/mnt/usb/photos
 
 Next time the USB is plugged in, drop the `-` and it participates as a full bidirectional peer.
 
+## Snapshot a Peer Before Taking It Offline
+
+Run with a single peer to record what's there — no sync, just snapshot:
+
+```
+kitchensync /mnt/usb/photos
+```
+
+Later, when you sync it with others, it already has history. KitchenSync can distinguish files that were there from the start vs. files that appeared or disappeared since the snapshot.
+
 ## Fallback URLs
 
 Your cloud drive has a local IP and a VPN address? Group them with brackets — KitchenSync tries each in order:
@@ -117,7 +127,7 @@ kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
 | Windows support           | Excellent               | Tricky       | Excellent        | OK           |
 
 *Maybe slightly misleading because rsync and KitchenSync can both operate on local file systems without SSH. But on Windows, without SSH has some extra-meaningful usefulness — e.g. Windows server file shares — and rsync is difficult to install on Windows.*
- 
+
 ## URL Schemes
 
 | Form                                 | Meaning                           |
@@ -168,7 +178,7 @@ Decisions are made once per entry, not per peer pair. Snapshots track what each 
 
 ## Building
 
-Written in Rust. Binaries go to `./released/`:
+Written in Go. Binaries go to `./released/`:
 
 | Platform | Binary              |
 | -------- | ------------------- |

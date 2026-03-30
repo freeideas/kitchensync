@@ -2,11 +2,11 @@
 
 ## Strategy
 
-Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
+Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync.go/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
 
 ## What Tests Should Cover
 
-Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdirectories under `/home/ace/Desktop/prjx/kitchensync/tmp/testks/`):
+Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdirectories under the test root):
 
 - **Multi-tree traversal** — parallel listing, union, correct decisions across N peers
 - **Decision rules** — timestamp-based (newer wins, ties keep data), canon peer (`+`) override
@@ -21,7 +21,7 @@ Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdi
 - **Offline peers** — skipped gracefully, caught up on next run
 - **Connection pools** — per-URL pools, `--mc` limit applies to `file://` too
 - **Edge cases** — empty directories, deep paths, timestamp tolerance (5 seconds)
-- **Abstraction boundary** — every test interacts with peers only through the trait; no test bypasses it to manipulate files directly after setup
+- **Abstraction boundary** — every test interacts with peers only through the interface; no test bypasses it to manipulate files directly after setup
 - **Snapshot atomicity** — concurrent runs don't corrupt snapshot (atomic rename pattern)
 
 ## Test Structure
