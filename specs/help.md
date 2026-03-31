@@ -11,7 +11,7 @@ One peer: snapshot only (record what's there, no sync).
 Running with no arguments prints this help. See README.md for full docs.
 
 Peers:
-  /path or c:\path                 Local path (same as file://)
+  /path, c:\path, or ./relative    Local path (same as file://)
   sftp://user@host/path            Remote over SSH
   sftp://user@host:port/path       Non-standard SSH port
   sftp://user:password@host/path   Inline password (prefer SSH keys)
@@ -31,13 +31,13 @@ Per-URL settings (query string, inside quotes):
   "sftp://host/path?mc=5&ct=60"    Both
 
 Options:
-  -h, --help, /?                      Show this help
+  -h, --help, /?     Show this help
   --mc N             Max concurrent connections per URL (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
-  --xd N             Delete stale TMP staging after N days (default: 2)
-  --bd N             Delete displaced files (BAK/) after N days (default: 90)
-  --td N             Forget deletion records after N days (default: 180)
+  --xd N             Delete stale TMP staging after N days; 0=never (default: 2)
+  --bd N             Delete BAK/ files after N days; 0=never (default: 90)
+  --td N             Forget deletion records after N days; 0=never (default: 180)
 
 Quick start:
   kitchensync /mnt/usb/photos                         Snapshot only (no sync)

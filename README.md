@@ -109,9 +109,9 @@ kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
 | `--mc` | 10      | Max concurrent connections per URL          |
 | `--ct` | 30      | SSH handshake timeout (seconds)             |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
-| `--xd` | 2       | Delete stale staging after N days           |
-| `--bd` | 90      | Delete displaced files after N days         |
-| `--td` | 180     | Forget deletion records after N days        |
+| `--xd` | 2       | Delete stale staging after N days (0=never)    |
+| `--bd` | 90      | Delete displaced files after N days (0=never)  |
+| `--td` | 180     | Forget deletion records after N days (0=never) |
 
 ## How It Compares
 

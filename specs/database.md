@@ -36,11 +36,11 @@ Example: `2026-03-30_17-45-48_000000Z`
 
 This format is used everywhere timestamps appear: database columns, BAK/ directory names, TMP/ directory names, and log output. Note the separators: hyphens in the date, hyphens in the time (not colons), underscore between date and time, underscore before microseconds, trailing `Z`.
 
-Monotonic within a process: add 1us on collision.
+Monotonic within a process: add 1us on collision. The monotonic timestamp generator is process-global — a single generator is used for all BAK directory names, TMP directory names, and database timestamps, ensuring no collisions across concurrent operations.
 
 ## Path Hashing
 
-Paths are hashed with xxHash64 (seed 0) and encoded as base62 (digits `0-9`, uppercase `A-Z`, lowercase `a-z`). 64 bits -> 11 characters, zero-padded.
+Paths are hashed with xxHash64 (seed 0) and encoded as base62 (digits `0-9`, uppercase `A-Z`, lowercase `a-z`). 64 bits -> 11 characters, zero-padded. Alphabet: `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz` (0=`0`, 9=`9`, 10=`A`, 35=`Z`, 36=`a`, 61=`z`). Most-significant digit first, zero-padded to 11 characters.
 
 Rules:
 - Forward slashes, no leading slash, no trailing slash
@@ -50,6 +50,11 @@ Rules:
 - Parent of `docs/readme.txt` -> hash of `docs`
 - Parent of root entries -> hash of `/` (sentinel)
 - The sync root directory itself is not tracked — only its children. Traversal begins by listing the root; the root has no snapshot row.
+- A sentinel row must be inserted when creating a new snapshot database so that root-level entries satisfy the foreign key on `parent_id`. The sentinel's `parent_id` references itself:
+  ```sql
+  INSERT INTO snapshot (id, parent_id, basename, mod_time, byte_size)
+  VALUES ('<hash-of-/>', '<hash-of-/>', '', '0000-00-00_00-00-00_000000Z', -1);
+  ```
 
 ## URL Normalization
 

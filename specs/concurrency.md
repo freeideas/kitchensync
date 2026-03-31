@@ -11,7 +11,7 @@ Connection pools are keyed by URL, not by peer. Each URL that successfully conne
 
 Per-URL settings (query string) override global settings. Example: `"sftp://host/path?mc=20&ct=60"`
 
-A file transfer acquires one connection from the source pool and one from the destination pool for the duration. Both must be available before the transfer begins. On completion or failure, both are returned.
+A file transfer acquires one connection from the source pool and one from the destination pool for the duration. To prevent deadlock, always acquire the two pools in lexicographic order by URL (the normalized URL that keys the pool). If source and destination are the same pool (local-to-local copy), acquire two connections from that pool. On completion or failure, both are returned.
 
 Connections are reused across transfers. The pool is lazy: connections open on demand up to the maximum, then recycle.
 
@@ -39,7 +39,7 @@ SFTP connections must use OS hostname resolution (Go's `net.Dial`). Bare hostnam
 
 ## Directory Listing
 
-Directory listing uses its own connection per peer, outside the transfer pool. During multi-tree traversal, directory listings for all reachable peers at each level are issued concurrently (goroutines). With N reachable peers, wall-clock time for one level is approximately the slowest peer, not the sum.
+Directory listing uses its own connection per peer, outside the transfer pool. Inline operations during the walk (displace, create_dir, .syncignore reads) reuse this listing connection — they do not acquire from the transfer pool. During multi-tree traversal, directory listings for all reachable peers at each level are issued concurrently (goroutines). With N reachable peers, wall-clock time for one level is approximately the slowest peer, not the sum.
 
 ## Pipelined Transfers
 
@@ -54,3 +54,14 @@ url=sftp://host/path connections=2/10
 ```
 
 Logged on every acquire and release.
+
+Also at `trace`, log pipelined transfer goroutine lifecycle:
+
+```
+pipe reader-start src=sftp://host/path file=photos/img.jpg
+pipe writer-start dst=/local/photos file=photos/img.jpg
+pipe reader-done  src=sftp://host/path file=photos/img.jpg
+pipe writer-done  dst=/local/photos file=photos/img.jpg
+```
+
+Each goroutine logs `*-start` before its first I/O and `*-done` after its last. Concurrent operation is confirmed when `writer-start` appears before `reader-done` for the same file.

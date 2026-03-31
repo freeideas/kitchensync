@@ -2,7 +2,7 @@
 
 ## Strategy
 
-Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync.go/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
+Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
 
 ## What Tests Should Cover
 

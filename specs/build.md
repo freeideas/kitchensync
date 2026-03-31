@@ -18,7 +18,7 @@ A build produces one of the following binaries in `./released/`:
 
 ## Go Module
 
-The module is `kitchensync`. Source lives under `./code/`.
+The module is `kitchensync`. Source lives under `./code/` (where `go.mod` lives). All `go build` commands run from `./code/`; output paths in step 2/3 are relative to the project root.
 
 ## Dependencies
 

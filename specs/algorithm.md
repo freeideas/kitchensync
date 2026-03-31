@@ -8,8 +8,8 @@ This is the complete sync algorithm. It covers startup, the combined-tree walk, 
 def startup(args):
     options, peers = parse_args(args)
     # Validation: at least 1 peer, at most 1 canon (+), all option values valid
-    # Option values --mc, --ct, --xd, --bd, --td are positive integers (>= 1)
-    # --td 0 is a special case: purge all tombstones immediately
+    # Option values --mc, --ct are positive integers (>= 1)
+    # Option values --xd, --bd, --td are non-negative integers (>= 0); 0 means never
     # -vl is one of: error, info, debug, trace
     # On any validation error: print error + help text to stdout, exit 1
     # No args / -h / --help / /? : print help to stdout, exit 0
@@ -44,17 +44,21 @@ def startup(args):
         download peer's .kitchensync/snapshot.db to local temp dir
         if no snapshot.db on peer:
             create empty snapshot locally
-            peer.auto_subordinate = True   # no snapshot = auto subordinate
+            if not peer.is_canon:
+                peer.auto_subordinate = True   # no snapshot = auto subordinate (canon is exempt)
 
     if len(peers) >= 2 and no peer has snapshot data and no canon peer:
         exit(1, "First sync? Mark the authoritative peer with a leading +")
     if len(peers) >= 2 and no contributing peer reachable:
         exit(1, "No contributing peer reachable — cannot make sync decisions")
 
-    # Purge old tombstones
-    for each peer's snapshot:
-        delete rows where deleted_time IS NOT NULL and deleted_time older than --td days
-        delete rows where deleted_time IS NULL and (last_seen older than --td days or last_seen IS NULL)
+    # Purge old tombstones (skip entirely when --td is 0)
+    if options.td > 0:
+        for each peer's snapshot:
+            delete rows where deleted_time IS NOT NULL and deleted_time older than --td days
+            # Also purge stale non-tombstone rows that haven't been seen in --td days
+            # (but only when last_seen is set — rows with last_seen=NULL are pending copies)
+            delete rows where deleted_time IS NULL and last_seen IS NOT NULL and last_seen older than --td days
 
     # Run the walk
     sync_directory(reachable_peers, root_path)
@@ -153,8 +157,10 @@ def sync_directory(peers, path, parent_ignore_rules=None):
     for peer in active:
         ks_dir = path / ".kitchensync"
         if peer.exists(ks_dir):
-            cleanup_expired(peer, ks_dir / "BAK", max_age=options.bd)
-            cleanup_expired(peer, ks_dir / "TMP", max_age=options.xd)
+            if options.bd > 0:
+                cleanup_expired(peer, ks_dir / "BAK", max_age=options.bd)
+            if options.xd > 0:
+                cleanup_expired(peer, ks_dir / "TMP", max_age=options.xd)
 
     # Phase 5: Recurse into subdirectories (pre-order: all entries handled above first)
     for recursion_peers, subpath in dirs_to_recurse:
@@ -163,19 +169,21 @@ def sync_directory(peers, path, parent_ignore_rules=None):
 
 **Key invariant**: `displace()` is always a same-filesystem rename — it runs inline during the walk, never queued. A displaced directory is moved as a single rename, preserving its entire subtree. Because we handle every entry before recursing, a displaced directory's children are never visited individually.
 
+BAK/TMP cleanup age is determined from the timestamp directory name, not from filesystem modification time.
+
 ## Entry Classification
 
 For each **file** entry, compare each contributing peer's filesystem state to that peer's snapshot row:
 
-| Peer State               | Snapshot Row | `deleted_time` | Classification              |
-| ------------------------ | ------------ | -------------- | --------------------------- |
-| Live, same mod_time      | Exists       | NULL           | Unchanged                   |
-| Live, different mod_time | Exists       | NULL           | Modified                    |
-| Live                     | Exists       | NOT NULL       | Resurrection (clear tombstone) |
-| Live                     | No row       | —              | New                         |
-| Absent                   | Exists       | NOT NULL       | Deleted (estimate = `deleted_time`) |
-| Absent                   | Exists       | NULL           | Absent-unconfirmed (rule 4b) |
-| Absent                   | No row       | —              | No opinion (never existed here) |
+| Peer State               | Snapshot Row | `deleted_time` | Classification                  | `is_live` |
+| ------------------------ | ------------ | -------------- | ------------------------------- | --------- |
+| Live, same mod_time      | Exists       | NULL           | Unchanged                       | True      |
+| Live, different mod_time | Exists       | NULL           | Modified                        | True      |
+| Live                     | Exists       | NOT NULL       | Resurrection (clear tombstone)  | True      |
+| Live                     | No row       | —              | New                             | True      |
+| Absent                   | Exists       | NOT NULL       | Deleted                         | False     |
+| Absent                   | Exists       | NULL           | Absent-unconfirmed (rule 4b)    | False     |
+| Absent                   | No row       | —              | No opinion (never existed here) | False     |
 
 "Same mod_time" means within 5-second tolerance.
 
@@ -213,6 +221,10 @@ def decide(states, snap):
 
     # Handle absent-unconfirmed (rule 4b) before main decision
     for peer, s in absent_unconfirmed.items():
+        if s.last_seen is None:
+            # Never confirmed present — pending copy that never completed. Re-enqueue.
+            live[peer] = s
+            continue
         max_live_mtime = max(s.mod_time for s in live.values()) if live else None
         if max_live_mtime and s.last_seen > max_live_mtime + TOLERANCE:
             # Confirmed deletion: last_seen exceeds all live mod_times by > 5s
@@ -221,6 +233,11 @@ def decide(states, snap):
             # Failed copy or never received — re-enqueue, no deletion vote
             live[peer] = s  # treat as needing the file
 
+    # If live contains only absent-unconfirmed entries (no peer physically has the file),
+    # the file was expected but never materialized — treat as DELETE.
+    if live and all(not s.is_live for s in live.values()):
+        return Decision(action=DELETE)
+
     if live and not deleted:
         # Rules 2/3: Pick winner by mod_time (newest wins)
         max_mtime = max(s.mod_time for s in live.values())
@@ -228,6 +245,11 @@ def decide(states, snap):
         tied = {p: s for p, s in live.items() if max_mtime - s.mod_time <= TOLERANCE}
         if len(tied) > 1:
             # Rule 5: same mod_time, larger file wins
+            max_size = max(s.byte_size for _, s in tied.items())
+            size_tied = {p: s for p, s in tied.items() if s.byte_size == max_size}
+            if len(size_tied) == len(live):
+                # All peers agree (mod_time and byte_size match) — no copy needed
+                return Decision(action=NONE)
             winner = max(tied.items(), key=lambda ps: ps[1].byte_size)
         else:
             winner = max(live.items(), key=lambda ps: ps[1].mod_time)
@@ -250,6 +272,8 @@ def decide(states, snap):
             winner = pick_winner_from_live(live)  # by mod_time, then size
             return Decision(action=PUSH, src=winner, targets=peers_that_lack_it)
 ```
+
+**Deletion estimates**: For `DELETED` entries (absent, snapshot row has `deleted_time IS NOT NULL`), `deletion_estimate = deleted_time` from the snapshot row. For absent-unconfirmed entries promoted to DELETED by rule 4b, `deletion_estimate = last_seen`.
 
 **Timestamp tolerance**: 5 seconds in either direction. Applies to: classification (mod_time vs snapshot), decision comparisons (mod_time vs mod_time, deletion estimate vs mod_time), and rule 4b (last_seen vs max mod_time).
 
@@ -325,8 +349,8 @@ Each transfer acquires one connection from the source peer's pool and one from t
 
 ```python
 def copy_file(src_peer, path, dst_peer):
-    src_conn = src_peer.pool.acquire()
-    dst_conn = dst_peer.pool.acquire()
+    # Acquire in lexicographic URL order to prevent deadlock (see concurrency.md)
+    src_conn, dst_conn = acquire_ordered(src_peer.pool, dst_peer.pool)
     try:
         tmp_path = f"{path.parent}/.kitchensync/TMP/{timestamp()}/{uuid()}/{path.name}"
 
@@ -346,6 +370,9 @@ def copy_file(src_peer, path, dst_peer):
 
         # Set mod_time to the winning mod_time from the decision
         dst_conn.set_mod_time(path, decision.mod_time)
+
+        # Best-effort permission copy: try to set source permissions, ignore failures
+        dst_conn.set_permissions(path, src_conn.get_permissions(path))
 
         # Clean up empty TMP dirs
         cleanup_empty_parents(dst_conn, tmp_path)
@@ -404,7 +431,7 @@ Any peer without a snapshot is automatically subordinate (unless it's the canon 
 - **Canon peer unreachable** -> exit 1
 - **Fewer than two reachable** -> exit 1
 - **Transfer failure** -> log, skip file (re-discovered next run)
-- **Displacement failure** -> log error, skip (file remains). If part of a copy sequence, skip the copy too (clean up TMP)
+- **Displacement failure** -> log error, skip (file remains). If part of a copy sequence, skip the copy too (clean up TMP). For directories: exclude the peer from recursion and do not cascade tombstones — the snapshot is left unchanged so the next run re-attempts deletion
 - **TMP staging failure** -> treat as transfer failure
 - **Snapshot upload failure** -> log error, leave TMP for `--xd` cleanup
 
