@@ -32,9 +32,10 @@ Per-URL settings (query string, inside quotes):
 
 Options:
   -h, --help, /?     Show this help
+  -n, --dry-run      Show what would happen without making changes
   --mc N             Max concurrent connections per URL (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
-  -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
+  -vl LEVEL          Verbosity level: error, warn, info, debug, trace (default: info)
   --xd N             Delete stale TMP staging after N days; 0=never (default: 2)
   --bd N             Delete BAK/ files after N days; 0=never (default: 90)
   --td N             Forget deletion records after N days; 0=never (default: 180)

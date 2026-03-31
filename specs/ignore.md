@@ -8,6 +8,8 @@ Any directory may contain a `.syncignore` file listing patterns of files and dir
 
 `.syncignore` files are themselves synced like any other file — they participate in normal decision rules (canon wins, or newest mod_time wins). This keeps ignore rules consistent across all peers.
 
+If `.syncignore` exists but is a directory (not a file), it is ignored for pattern purposes — no patterns are loaded from it, and it syncs as a normal directory.
+
 ## Resolution During the Walk
 
 At each directory level, after listing all peers and computing the union of entry names, `.syncignore` is resolved **before** other entries:

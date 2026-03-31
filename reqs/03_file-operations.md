@@ -71,3 +71,13 @@ After a successful copy, empty parent directories in the TMP path are cleaned up
 **Source:** ./specs/algorithm.md (Section: "Errors")
 
 If displacement fails, the error is logged and the file is skipped (it remains in place). If part of a copy sequence, the copy is also skipped and TMP is cleaned up. For directories: the peer is excluded from recursion and tombstones are not cascaded.
+
+## $REQ_FILEOP_016: Set Mod-Time Failure Non-Fatal
+**Source:** ./specs/algorithm.md (Section: "Operation Queue")
+
+If setting the modification time fails after the atomic rename, the failure is logged at warn level but the copy is considered successful. The destination file retains its filesystem mod_time and will be reclassified on the next run.
+
+## $REQ_FILEOP_017: Permission Copy Windows Skipped
+**Source:** ./specs/algorithm.md (Section: "Operation Queue")
+
+On Windows, permission copying is skipped entirely (Windows uses ACLs which are not portable). Failures on any platform are logged at debug level and ignored.

@@ -15,6 +15,8 @@ A file transfer acquires one connection from the source pool and one from the de
 
 Connections are reused across transfers. The pool is lazy: connections open on demand up to the maximum, then recycle.
 
+Pool acquisition blocks until a connection is available; there is no acquisition timeout. This is acceptable because the transfer queue has finite size and connections are always returned. If a connection fails during transfer, it is removed from the pool and a new one is opened (up to the maximum) for subsequent transfers.
+
 ## Fallback URLs
 
 A peer can have multiple URLs in square brackets — fallback network paths to the same data. Tried in order; first that connects wins.
@@ -44,6 +46,8 @@ Directory listing uses its own connection per peer, outside the transfer pool. I
 ## Pipelined Transfers
 
 Each file transfer uses two goroutines connected by a buffered channel: a reader goroutine that reads chunks from the source and sends them into the channel, and a writer goroutine that receives chunks and writes to the destination. Reader and writer operate simultaneously — the channel provides backpressure. A single-loop read-then-write pattern is not acceptable.
+
+Recommended chunk size: 64KB. Channel buffer: 16 chunks. These are implementation hints, not requirements.
 
 ## Trace Logging
 

@@ -104,14 +104,15 @@ Set defaults for the whole run:
 kitchensync --mc 5 --ct 60 c:/photos sftp://host/photos
 ```
 
-| Flag   | Default | Meaning                                     |
-| ------ | ------- | ------------------------------------------- |
-| `--mc` | 10      | Max concurrent connections per URL          |
-| `--ct` | 30      | SSH handshake timeout (seconds)             |
-| `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
-| `--xd` | 2       | Delete stale staging after N days (0=never)    |
-| `--bd` | 90      | Delete displaced files after N days (0=never)  |
-| `--td` | 180     | Forget deletion records after N days (0=never) |
+| Flag            | Default | Meaning                                           |
+| --------------- | ------- | ------------------------------------------------- |
+| `-n, --dry-run` | off     | Show what would happen without making changes     |
+| `--mc`          | 10      | Max concurrent connections per URL                |
+| `--ct`          | 30      | SSH handshake timeout (seconds)                   |
+| `-vl`           | `info`  | Verbosity level (error, warn, info, debug, trace) |
+| `--xd`          | 2       | Delete stale staging after N days (0=never)       |
+| `--bd`          | 90      | Delete displaced files after N days (0=never)     |
+| `--td`          | 180     | Forget deletion records after N days (0=never)    |
 
 ## How It Compares
 

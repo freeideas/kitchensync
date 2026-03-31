@@ -36,3 +36,68 @@ During the walk, directory listings for all reachable peers at each level are is
 **Source:** ./specs/concurrency.md (Section: "Connection Pool")
 
 The `--mc` pool limit applies to each URL pool. Default is 10. Both SFTP and `file://` URLs are subject to the same limit.
+
+## $REQ_CONC_008: Pool Acquisition Blocks
+**Source:** ./specs/concurrency.md (Section: "Connection Pool")
+
+Pool acquisition blocks until a connection is available; there is no acquisition timeout.
+
+## $REQ_CONC_009: Failed Connection Replaced
+**Source:** ./specs/concurrency.md (Section: "Connection Pool")
+
+If a connection fails during transfer, it is removed from the pool and a new one is opened (up to the maximum) for subsequent transfers.
+
+## $REQ_CONC_010: Connection Timeout
+**Source:** ./specs/concurrency.md (Section: "Connection Pool")
+
+The `--ct` flag sets connection timeout (default 30 seconds). For SFTP URLs, this bounds the SSH handshake.
+
+## $REQ_CONC_011: Per-URL Settings Override Global
+**Source:** ./specs/concurrency.md (Section: "Connection Pool")
+
+Per-URL settings via query string (e.g., `?mc=20&ct=60`) override global flags.
+
+## $REQ_CONC_012: Fallback URLs Tried in Order
+**Source:** ./specs/concurrency.md (Section: "Fallback URLs")
+
+A peer can have multiple URLs in square brackets. They are tried in order; first that connects wins. All subsequent connections use the winning URL's pool.
+
+## $REQ_CONC_013: Connection Establishment Verifies Root Path
+**Source:** ./specs/concurrency.md (Section: "Connection Establishment")
+
+After connection, the peer's root path is verified or created. If creation fails, the next fallback URL is tried.
+
+## $REQ_CONC_019: File URL Timeout Does Not Apply
+**Source:** ./specs/concurrency.md (Section: "Connection Establishment")
+
+For `file://` URLs, the connection timeout (`--ct`) does not apply.
+
+## $REQ_CONC_020: Peer Unreachable When All URLs Fail
+**Source:** ./specs/concurrency.md (Section: "Connection Establishment")
+
+If all URLs (primary and fallbacks) fail to connect, the peer is unreachable.
+
+## $REQ_CONC_014: SFTP Uses OS Hostname Resolution
+**Source:** ./specs/concurrency.md (Section: "Connection Establishment")
+
+SFTP connections must use OS hostname resolution. Bare hostnames like `localhost` must resolve correctly.
+
+## $REQ_CONC_015: Pipelined Transfers with Concurrent Goroutines
+**Source:** ./specs/concurrency.md (Section: "Pipelined Transfers")
+
+Each file transfer uses a reader goroutine and a writer goroutine connected by a buffered channel. Reader and writer operate simultaneously. A single-loop read-then-write pattern is not acceptable.
+
+## $REQ_CONC_016: Connections Returned After Transfer
+**Source:** ./specs/concurrency.md (Section: "Connection Pool")
+
+On completion or failure, both source and destination connections are returned to their pools.
+
+## $REQ_CONC_017: Pool Change Trace Logging
+**Source:** ./specs/concurrency.md (Section: "Trace Logging")
+
+At verbosity `trace`, log every pool acquire and release in the format: `url=<url> connections=<current>/<max>`.
+
+## $REQ_CONC_018: Pipeline Goroutine Trace Logging
+**Source:** ./specs/concurrency.md (Section: "Trace Logging")
+
+At verbosity `trace`, log pipelined transfer goroutine lifecycle: `pipe reader-start`, `pipe writer-start`, `pipe reader-done`, `pipe writer-done` with source/destination and file path.

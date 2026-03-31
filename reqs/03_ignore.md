@@ -51,3 +51,8 @@ Special files (devices, FIFOs, sockets) are always excluded from sync.
 **Source:** ./specs/ignore.md (Section: "Configuration")
 
 Patterns in a `.syncignore` apply to the directory containing it and its subdirectories.
+
+## $REQ_IGNORE_011: Syncignore Directory Ignored
+**Source:** ./specs/ignore.md (Section: "Configuration")
+
+If `.syncignore` exists but is a directory (not a file), no patterns are loaded from it and it syncs as a normal directory.

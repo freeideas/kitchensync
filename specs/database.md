@@ -13,7 +13,7 @@ CREATE TABLE snapshot (
     id           TEXT PRIMARY KEY,  -- xxHash64 of relative path, base62-encoded (11 chars)
     parent_id    TEXT NOT NULL,     -- xxHash64 of parent dir's relative path, base62-encoded
     basename     TEXT NOT NULL,     -- final path component
-    mod_time     TEXT NOT NULL,     -- YYYY-MM-DD_HH-mm-ss_ffffffZ
+    mod_time     TEXT NOT NULL,     -- YYYY-MM-DD_HH-mm-ss_ffffffZ (for directories: filesystem mod_time, not used in decisions)
     byte_size    INTEGER NOT NULL,  -- bytes for files, -1 for directories
     last_seen    TEXT,              -- YYYY-MM-DD_HH-mm-ss_ffffffZ or NULL
     deleted_time TEXT,              -- YYYY-MM-DD_HH-mm-ss_ffffffZ or NULL
@@ -64,7 +64,7 @@ URLs are normalized before any comparison, lookup, or connection attempt:
 - Collapse consecutive slashes in the path
 - Remove trailing slash from the path
 - Bare paths (no scheme) are converted to `file://` URLs
-- `file://` URLs: resolve to absolute path (from cwd)
+- `file://` URLs: resolve to absolute path using the working directory at program startup
 - Percent-decode unreserved characters
 - Strip query-string parameters (`?mc=5` etc. are not part of identity)
 

@@ -48,7 +48,7 @@ A file that is absent on a peer where the snapshot row has `deleted_time IS NOT 
 A file that is absent on a peer where the snapshot row has `deleted_time IS NULL` is classified as Absent-unconfirmed.
 
 ## $REQ_SYNC_010: Five Second Mod-Time Tolerance
-**Source:** ./specs/algorithm.md (Section: "Entry Classification")
+**Source:** ./specs/algorithm.md (Section: "Decision Rules")
 
 A 5-second tolerance applies to mod_time comparisons: classification (mod_time vs snapshot), decision comparisons (mod_time vs mod_time, deletion estimate vs mod_time), and absent-unconfirmed rule 4b (last_seen vs max mod_time).
 
@@ -161,3 +161,33 @@ When an entry is confirmed absent on a peer and its snapshot row has `deleted_ti
 **Source:** ./specs/algorithm.md (Section: "Snapshot Updates")
 
 When a file copy completes successfully, `last_seen` is set to now on the destination peer's snapshot row.
+
+## $REQ_SYNC_033: Dry-Run Skips Mutations
+**Source:** ./specs/algorithm.md (Section: "Dry Run Mode")
+
+In dry-run mode (`--dry-run` or `-n`), all mutating operations are skipped: file copies, displacements to BAK/, directory creation/deletion, snapshot uploads, and BAK/TMP cleanup. Connections, snapshot downloads, directory walks, decisions, and logging still occur.
+
+## $REQ_SYNC_034: Dry-Run Logs Operations
+**Source:** ./specs/algorithm.md (Section: "Dry Run Mode")
+
+In dry-run mode, `C <path>` and `X <path>` are logged for every operation that would happen, identical to a real run.
+
+## $REQ_SYNC_035: Case Collision Warning
+**Source:** ./specs/algorithm.md (Section: "Case Sensitivity")
+
+When syncing to a case-insensitive filesystem with multiple files differing only in case, a warning is logged when case collision is detected. The last file encountered (lexicographic order) overwrites earlier ones.
+
+## $REQ_SYNC_036: Filename Byte Comparison
+**Source:** ./specs/algorithm.md (Section: "Unicode Normalization")
+
+Filenames are compared byte-for-byte as reported by the filesystem. No Unicode normalization is performed.
+
+## $REQ_SYNC_037: Copy and Delete Logging
+**Source:** ./specs/algorithm.md (Section: "Logging")
+
+Every file copy is logged as `C <relative-path>` and every deletion as `X <relative-path>` at info level. Logged once per decision, not per peer.
+
+## $REQ_SYNC_038: All Output to Stdout
+**Source:** ./specs/algorithm.md (Section: "Logging")
+
+All output goes to stdout. No output to stderr.

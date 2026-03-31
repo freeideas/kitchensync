@@ -65,7 +65,7 @@ Per-URL settings are specified via query string parameters: `mc` for max connect
 ## $REQ_CLI_013: Global Option -vl
 **Source:** ./README.md (Section: "Global Options")
 
-`-vl LEVEL` sets verbosity level. Valid values: error, info, debug, trace. Default: info.
+`-vl LEVEL` sets verbosity level. Valid values: error, warn, info, debug, trace. Default: info.
 
 ## $REQ_CLI_014: Global Option --xd
 **Source:** ./README.md (Section: "Global Options")
@@ -105,7 +105,7 @@ At most one peer may have the `+` (canon) prefix. Multiple `+` peers is a valida
 ## $REQ_CLI_021: Valid Verbosity Levels
 **Source:** ./specs/algorithm.md (Section: "Startup")
 
-`-vl` must be one of: error, info, debug, trace. Other values are a validation error.
+`-vl` must be one of: error, warn, info, debug, trace. Other values are a validation error.
 
 ## $REQ_CLI_022: Help Display
 **Source:** ./specs/help.md (Section: "Help Screen")
@@ -121,3 +121,8 @@ On any argument validation error, print the error message followed by help text 
 **Source:** ./specs/algorithm.md (Section: "Startup")
 
 At least one peer URL must be provided. Missing peers is a validation error.
+
+## $REQ_CLI_025: Dry-Run Flag
+**Source:** ./README.md (Section: "Global Options")
+
+`-n` or `--dry-run` shows what would happen without making changes.

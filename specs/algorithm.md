@@ -10,7 +10,8 @@ def startup(args):
     # Validation: at least 1 peer, at most 1 canon (+), all option values valid
     # Option values --mc, --ct are positive integers (>= 1)
     # Option values --xd, --bd, --td are non-negative integers (>= 0); 0 means never
-    # -vl is one of: error, info, debug, trace
+    # -vl is one of: error, warn, info, debug, trace
+    # --dry-run / -n is a boolean flag (no value)
     # On any validation error: print error + help text to stdout, exit 1
     # No args / -h / --help / /? : print help to stdout, exit 0
 
@@ -26,6 +27,7 @@ def startup(args):
             peer.reachable = False
 
     # Auto-create peer root dirs (both file:// and sftp://) on connect
+    # If root creation fails for a file:// URL without fallbacks, log error and mark peer unreachable
 
     if canon_peer and not canon_peer.reachable:
         exit(1, "canon peer unreachable")
@@ -47,7 +49,10 @@ def startup(args):
             if not peer.is_canon:
                 peer.auto_subordinate = True   # no snapshot = auto subordinate (canon is exempt)
 
-    if len(peers) >= 2 and no peer has snapshot data and no canon peer:
+    # A peer is_subordinate if it has the `-` prefix OR has auto_subordinate=True.
+    # is_subordinate = peer.explicit_subordinate or peer.auto_subordinate
+
+    if len(peers) >= 2 and no peer has snapshot rows (excluding the sentinel) and no canon peer:
         exit(1, "First sync? Mark the authoritative peer with a leading +")
     if len(peers) >= 2 and no contributing peer reachable:
         exit(1, "No contributing peer reachable — cannot make sync decisions")
@@ -153,6 +158,15 @@ def sync_directory(peers, path, parent_ignore_rules=None):
             for peer where file should be deleted:
                 displace(peer, entry_path)               # inline
 
+        # DELETE_SUBORDINATES_ONLY: no contributing peer has this entry.
+        # Do not modify contributing peers. Displace from subordinates only.
+        if decision.action == DELETE_SUBORDINATES_ONLY:
+            for peer in subordinates:
+                if peer has entry at entry_path:
+                    displace(peer, entry_path)
+                    # Update subordinate's snapshot with tombstone
+            # Do not modify contributing peer snapshots
+
     # Phase 4: BAK/TMP cleanup at this level
     for peer in active:
         ks_dir = path / ".kitchensync"
@@ -169,7 +183,7 @@ def sync_directory(peers, path, parent_ignore_rules=None):
 
 **Key invariant**: `displace()` is always a same-filesystem rename — it runs inline during the walk, never queued. A displaced directory is moved as a single rename, preserving its entire subtree. Because we handle every entry before recursing, a displaced directory's children are never visited individually.
 
-BAK/TMP cleanup age is determined from the timestamp directory name, not from filesystem modification time.
+BAK/TMP cleanup age is determined from the timestamp directory name, not from filesystem modification time. `cleanup_expired` deletes entire timestamp directories (and all contents) when the timestamp is older than the threshold. For TMP, this includes nested UUID directories. Directories are removed atomically with their contents.
 
 ## Entry Classification
 
@@ -200,10 +214,13 @@ Canon wins unconditionally:
 
 Only contributing (non-subordinate) peers vote. After the decision, subordinate peers are brought into conformance.
 
+Entry type is determined from the listings: `states` includes `is_dir` from each peer's listing. If any contributing peer reports the entry as a directory, it is treated as a directory; otherwise it is a file. The decision returns `Decision(type=DIRECTORY, ...)` or `Decision(type=FILE, ...)` accordingly.
+
 ```python
 def decide(states, snap):
-    # states: {peer: (classification, mod_time, byte_size)} for contributing peers only
+    # states: {peer: (classification, mod_time, byte_size, is_dir)} for contributing peers only
     # Peers with no row and absent state have no opinion — skip them
+    # entry_type = DIRECTORY if any(s.is_dir for s in states.values()) else FILE
 
     voters = {p: s for p, s in states.items() if s.classification != NO_OPINION}
 
@@ -286,6 +303,7 @@ Directories do not use mod_time for decisions. Directory mod_times are filesyste
 Existence-based only:
 - Any contributing peer has it -> create on peers that lack it
 - All contributing peers deleted it (tombstone + absent) -> delete everywhere (displace to BAK/)
+- Directory exists but is empty -> remains (no automatic cleanup of empty directories)
 - Canon overrides as usual
 
 ## Type Conflicts
@@ -347,6 +365,8 @@ File copies are enqueued during the walk and executed concurrently (subject to p
 
 Each transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting.
 
+UUID generation: Use UUID v4 (random). Any standard UUID library is acceptable.
+
 ```python
 def copy_file(src_peer, path, dst_peer):
     # Acquire in lexicographic URL order to prevent deadlock (see concurrency.md)
@@ -369,9 +389,14 @@ def copy_file(src_peer, path, dst_peer):
         dst_conn.rename(tmp_path, path)
 
         # Set mod_time to the winning mod_time from the decision
+        # If set_mod_time fails after the atomic rename, log at warn level but consider
+        # the copy successful. The destination file will have its filesystem mod_time
+        # rather than the source mod_time, and will be reclassified on the next run.
         dst_conn.set_mod_time(path, decision.mod_time)
 
-        # Best-effort permission copy: try to set source permissions, ignore failures
+        # Best-effort permission copy: On Unix, copy the file mode bits (rwxrwxrwx).
+        # On Windows, skip permission copying entirely (Windows uses ACLs which are
+        # not portable). Failures are logged at debug level and ignored.
         dst_conn.set_permissions(path, src_conn.get_permissions(path))
 
         # Clean up empty TMP dirs
@@ -412,7 +437,7 @@ Connection pool changes logged at `trace` level: `url=sftp://host/path connectio
 
 ## Offline Peers
 
-Unreachable peers are excluded entirely — they do not participate in listings or decisions. Their snapshot rows are not modified. On the next run, discrepancies between filesystem state and snapshot drive sync decisions, bringing them up to date. Failure to connect to one peer is non-fatal — exit 0 if at least one sync completes.
+Unreachable peers are excluded entirely — they do not participate in listings or decisions. Their snapshot rows are not modified. On the next run, discrepancies between filesystem state and snapshot drive sync decisions, bringing them up to date. Failure to connect to one peer is non-fatal — exit 0 if at least one sync completes, or if single-peer snapshot completes successfully.
 
 ## Subordinate Peers
 
@@ -450,6 +475,8 @@ All sync logic operates through a single interface that both `file://` and `sftp
 | `CreateDir(path)`          | Create directory (and parents as needed)                          |
 | `DeleteDir(path)`          | Remove empty directory                                            |
 | `SetModTime(path, time)`   | Set file/directory modification time                              |
+| `GetPermissions(path)`     | Return file mode/permissions (platform-appropriate)               |
+| `SetPermissions(path, mode)` | Set file mode/permissions (best-effort, ignore failures)        |
 
 `ListDir` returns only regular files and directories. Symbolic links, special files (devices, FIFOs, sockets), and any other non-regular entries are silently omitted. `Stat` returns "not found" for symlinks and special files.
 
@@ -457,6 +484,32 @@ All operations return the same error types regardless of transport: not found, p
 
 SFTP connections must use OS hostname resolution (e.g., Go's `net.Dial`), not numeric-only socket address parsing. `sftp://user@localhost/path` must work.
 
+## Dry Run Mode
+
+When `--dry-run` (or `-n`) is specified, the sync runs normally through decision-making but skips all mutating operations:
+
+**Still happens:**
+- Connect to all peers
+- Download snapshots (needed for decisions)
+- Walk directory trees in parallel
+- Make all sync decisions
+- Log `C <path>` and `X <path>` for every operation that *would* happen
+
+**Skipped:**
+- File copies
+- Displacements to BAK/
+- Directory creation and deletion
+- Snapshot uploads (no changes persisted)
+- BAK/TMP cleanup
+
+The output looks identical to a real run. Use dry-run to preview what a sync will do before committing.
+
 ## Case Sensitivity
 
-Filenames are preserved exactly as the filesystem reports them. Syncing between case-sensitive (Linux) and case-insensitive (Windows/macOS) filesystems may collapse or duplicate files that differ only in case. Deleted files are recoverable from BAK/.
+Filenames are preserved exactly as the filesystem reports them. When syncing to a case-insensitive filesystem (Windows, macOS) with multiple files differing only in case, the last one encountered (lexicographic order) overwrites earlier ones. A warning is logged when case collision is detected. Displaced files are recoverable from BAK/.
+
+The destination snapshot records only the winning filename (last lexicographically). The overwritten variant is not tracked -- it is treated as if it never existed on that peer. Source peer snapshots are unaffected.
+
+## Unicode Normalization
+
+Filenames are compared byte-for-byte as reported by the filesystem. No Unicode normalization is performed. On macOS (which uses NFD), files with composed vs decomposed characters are treated as distinct. This matches filesystem behavior and avoids data loss.

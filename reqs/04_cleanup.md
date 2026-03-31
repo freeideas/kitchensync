@@ -41,3 +41,8 @@ Setting `--td 0` skips tombstone and stale row purging entirely.
 **Source:** ./specs/algorithm.md (Section: "Errors")
 
 If snapshot upload fails, the TMP staging file is left in place for eventual `--xd` cleanup.
+
+## $REQ_CLEAN_009: Cleanup Removes Entire Timestamp Directory
+**Source:** ./specs/algorithm.md (Section: "Combined-Tree Walk")
+
+Cleanup deletes entire timestamp directories (and all contents) when the timestamp is older than the threshold, including nested UUID directories for TMP.
