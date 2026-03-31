@@ -62,6 +62,17 @@ func (u *NormalizedURL) Identity() string {
 	return s
 }
 
+// OSPath returns the path in OS-native format for filesystem operations.
+// On Windows, strips the leading slash from drive letter paths (e.g., /c:/foo -> c:/foo).
+func (u *NormalizedURL) OSPath() string {
+	p := u.Path
+	// On Windows, /c:/... needs the leading slash stripped for OS calls
+	if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p = p[1:]
+	}
+	return p
+}
+
 var multiSlash = regexp.MustCompile(`/{2,}`)
 
 // Normalize parses and normalizes a URL string.

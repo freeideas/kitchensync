@@ -77,6 +77,10 @@ Examples:
 
 Normalization is applied before any connection attempt — not just before storage.
 
+### OS-Native Paths for file:// URLs
+
+On Windows, the normalized URL path has a leading slash (`/c:/photos`), but OS filesystem calls require the native format (`c:/photos`). Provide a separate accessor that strips the leading slash on Windows drive-letter paths. Use this accessor for all filesystem operations (MkdirAll, Open, Stat, etc.) on `file://` URLs.
+
 ## Tombstones
 
 When an entry is confirmed absent on a peer where a snapshot row exists with `deleted_time = NULL`, the row is retained and `deleted_time` is set to the current value of `last_seen`. A row with `deleted_time IS NOT NULL` is a tombstone. Tombstones are purged when `deleted_time` is older than `--td` days (default: 180).

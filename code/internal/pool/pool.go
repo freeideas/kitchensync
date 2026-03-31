@@ -103,7 +103,7 @@ func (p *ConnPool) dial() (fsutil.PeerFS, error) {
 	u := p.url
 	switch u.Scheme {
 	case "file":
-		return fsutil.NewLocalFS(u.Path), nil
+		return fsutil.NewLocalFS(u.OSPath()), nil
 	case "sftp":
 		return fsutil.DialSFTP(u.User, u.Password, u.Host, u.Port, u.Path, p.timeout)
 	default:

@@ -228,12 +228,13 @@ func tryConnect(u *urlutil.NormalizedURL, opts cli.Options) fsutil.PeerFS {
 
 	switch u.Scheme {
 	case "file":
-		// Auto-create root dir
-		if err := os.MkdirAll(u.Path, 0755); err != nil {
-			log.Debug("cannot create local path %s: %v", u.Path, err)
+		// Auto-create root dir (use OSPath for native filesystem operations)
+		osPath := u.OSPath()
+		if err := os.MkdirAll(osPath, 0755); err != nil {
+			log.Debug("cannot create local path %s: %v", osPath, err)
 			return nil
 		}
-		return fsutil.NewLocalFS(u.Path)
+		return fsutil.NewLocalFS(osPath)
 	case "sftp":
 		conn, err := fsutil.DialSFTP(u.User, u.Password, u.Host, u.Port, u.Path, timeout)
 		if err != nil {
