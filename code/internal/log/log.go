@@ -10,6 +10,7 @@ type Level int
 
 const (
 	LevelError Level = iota
+	LevelWarn
 	LevelInfo
 	LevelDebug
 	LevelTrace
@@ -24,6 +25,8 @@ func ParseLevel(s string) (Level, bool) {
 	switch strings.ToLower(s) {
 	case "error":
 		return LevelError, true
+	case "warn":
+		return LevelWarn, true
 	case "info":
 		return LevelInfo, true
 	case "debug":
@@ -43,6 +46,7 @@ func log(level Level, prefix, format string, args ...any) {
 }
 
 func Error(format string, args ...any) { log(LevelError, "ERROR", format, args...) }
+func Warn(format string, args ...any)  { log(LevelWarn, "WARN", format, args...) }
 func Info(format string, args ...any)  { log(LevelInfo, "INFO", format, args...) }
 func Debug(format string, args ...any) { log(LevelDebug, "DEBUG", format, args...) }
 func Trace(format string, args ...any) { log(LevelTrace, "TRACE", format, args...) }

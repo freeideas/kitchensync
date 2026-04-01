@@ -5,6 +5,8 @@ import (
 	"io"
 	"path"
 
+	"github.com/google/uuid"
+
 	"kitchensync/internal/log"
 	"kitchensync/internal/peer"
 	"kitchensync/internal/pool"
@@ -27,7 +29,8 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 	if parentDir == "." {
 		parentDir = ""
 	}
-	tmpDir := path.Join(parentDir, ".kitchensync/TMP", ts, generateUUID())
+	tmpBase := path.Join(parentDir, ".kitchensync/TMP")
+	tmpDir := path.Join(tmpBase, ts, uuid.New().String())
 	tmpPath := path.Join(tmpDir, basename)
 
 	log.Trace("pipe reader-start src=%s file=%s", srcPeer.Label(), relPath)
@@ -55,6 +58,11 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 	// Writer goroutine
 	go func() {
 		err := dstConn.WriteFile(tmpPath, pr)
+		if err != nil {
+			// Close the pipe reader so the reader goroutine unblocks if WriteFile
+			// returned before consuming all data (e.g., MkdirAll or Create failed).
+			pr.CloseWithError(err)
+		}
 		errCh <- err
 		log.Trace("pipe writer-done  dst=%s file=%s", dstPeer.Label(), relPath)
 	}()
@@ -65,7 +73,7 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 	if err1 != nil || err2 != nil {
 		// Clean up TMP
 		dstConn.DeleteFile(tmpPath)
-		cleanupEmptyParents(dstConn, tmpDir, parentDir)
+		cleanupEmptyParents(dstConn, tmpDir, tmpBase)
 		if err1 != nil {
 			return err1
 		}
@@ -80,7 +88,7 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 			log.Error("displace existing at %s on %s: %v", relPath, dstPeer.Label(), err)
 			// Clean up TMP and abort
 			dstConn.DeleteFile(tmpPath)
-			cleanupEmptyParents(dstConn, tmpDir, parentDir)
+			cleanupEmptyParents(dstConn, tmpDir, tmpBase)
 			return err
 		}
 	}
@@ -89,13 +97,15 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 	if err := dstConn.Rename(tmpPath, relPath); err != nil {
 		log.Error("rename tmp to final at %s on %s: %v", relPath, dstPeer.Label(), err)
 		dstConn.DeleteFile(tmpPath)
-		cleanupEmptyParents(dstConn, tmpDir, parentDir)
+		cleanupEmptyParents(dstConn, tmpDir, tmpBase)
 		return err
 	}
 
 	// Set mod_time to winning mod_time
 	mt, _ := snapshot.ParseModTime(modTime)
-	dstConn.SetModTime(relPath, mt)
+	if err := dstConn.SetModTime(relPath, mt); err != nil {
+		log.Warn("set mod_time on %s at %s: %v", relPath, dstPeer.Label(), err)
+	}
 
 	// Best-effort permission copy
 	if perm, err := srcConn.GetPermissions(relPath); err == nil {
@@ -103,7 +113,7 @@ func CopyFile(srcPeer, dstPeer *peer.Peer, relPath string, modTime string, byteS
 	}
 
 	// Clean up empty TMP dirs
-	cleanupEmptyParents(dstConn, tmpDir, parentDir)
+	cleanupEmptyParents(dstConn, tmpDir, tmpBase)
 
 	// Post-copy snapshot update: set last_seen = now
 	nowStr := snapshot.NowStr()
@@ -117,13 +127,4 @@ func cleanupEmptyParents(fs interface{ DeleteDir(string) error }, dir, stopAt st
 		fs.DeleteDir(dir)
 		dir = path.Dir(dir)
 	}
-}
-
-// Simple UUID generation without external dependency.
-var uuidCounter uint64
-
-func generateUUID() string {
-	uuidCounter++
-	t := timestamp.Now()
-	return fmt.Sprintf("%x-%x", t.UnixNano(), uuidCounter)
 }

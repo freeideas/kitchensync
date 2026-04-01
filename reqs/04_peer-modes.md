@@ -35,7 +35,7 @@ Unreachable peers are excluded entirely — they do not participate in listings 
 ## $REQ_PEER_007: Offline Peer Non-Fatal
 **Source:** ./specs/algorithm.md (Section: "Offline Peers")
 
-Failure to connect to one peer is non-fatal — exit 0 if at least one sync completes.
+Failure to connect to one peer is non-fatal — exit 0 if at least one sync completes, or if single-peer snapshot completes successfully.
 
 ## $REQ_PEER_008: Offline Peer Catches Up
 **Source:** ./specs/algorithm.md (Section: "Offline Peers")

@@ -143,6 +143,11 @@ func parseLocal(path string, result *NormalizedURL) (*NormalizedURL, error) {
 	// Collapse multiple slashes
 	p = multiSlash.ReplaceAllString(p, "/")
 
+	// Percent-decode unreserved characters in path
+	if decoded, err := url.PathUnescape(p); err == nil {
+		p = decoded
+	}
+
 	result.Path = p
 	return result, nil
 }

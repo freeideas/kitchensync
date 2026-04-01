@@ -1,11 +1,8 @@
 package sync
 
 import (
-	"fmt"
 	"io"
 	"path"
-	"strconv"
-	"strings"
 	gosync "sync"
 	"time"
 
@@ -52,10 +49,12 @@ func NewEngine(opts cli.Options, peers []*peer.Peer, canon *peer.Peer) *Engine {
 		CopyJobs: make(chan CopyJob, 100),
 		logged:   make(map[string]bool),
 	}
-	// Start copy workers
-	for i := 0; i < opts.MC*2; i++ {
-		e.WG.Add(1)
-		go e.copyWorker()
+	if !opts.DryRun {
+		// Start copy workers
+		for i := 0; i < opts.MC*2; i++ {
+			e.WG.Add(1)
+			go e.copyWorker()
+		}
 	}
 	return e
 }
@@ -160,16 +159,28 @@ func (e *Engine) SyncDirectory(peers []*peer.Peer, dirPath string, parentRules *
 	}
 
 	if nameSet[".syncignore"] {
-		// Decide winning .syncignore using normal rules
-		syncIgnorePath := joinPath(dirPath, ".syncignore")
-		e.handleFileEntry(syncIgnorePath, ".syncignore", active, contributing, subordinates, listings)
-
-		// Read winning .syncignore content
-		content := e.readWinningSyncIgnore(syncIgnorePath, contributing, subordinates, listings)
-		if content != "" {
-			rules = rules.Merge(content)
+		// Check if .syncignore is a file (not a directory) on any peer.
+		// If it's a directory, skip special handling and sync it normally.
+		syncIgnoreIsFile := false
+		for _, p := range active {
+			if entry, ok := listings[p][".syncignore"]; ok && !entry.IsDir {
+				syncIgnoreIsFile = true
+				break
+			}
 		}
-		delete(nameSet, ".syncignore")
+
+		if syncIgnoreIsFile {
+			// Decide winning .syncignore using normal rules
+			syncIgnorePath := joinPath(dirPath, ".syncignore")
+			e.handleFileEntry(syncIgnorePath, ".syncignore", active, contributing, subordinates, listings)
+
+			// Read winning .syncignore content
+			content := e.readWinningSyncIgnore(syncIgnorePath, contributing, subordinates, listings)
+			if content != "" {
+				rules = rules.Merge(content)
+			}
+			delete(nameSet, ".syncignore")
+		}
 	}
 
 	// Collect all names, filter by ignore rules
@@ -232,15 +243,17 @@ func (e *Engine) SyncDirectory(peers []*peer.Peer, dirPath string, parentRules *
 		}
 	}
 
-	// Phase 4: BAK/TMP cleanup at this level
-	for _, p := range active {
-		ksDir := joinPath(dirPath, ".kitchensync")
-		if exists, _ := p.ListConn.Exists(ksDir); exists {
-			if e.Opts.BD > 0 {
-				cleanupExpired(p.ListConn, joinPath(ksDir, "BAK"), e.Opts.BD)
-			}
-			if e.Opts.XD > 0 {
-				cleanupExpired(p.ListConn, joinPath(ksDir, "TMP"), e.Opts.XD)
+	// Phase 4: BAK/TMP cleanup at this level (skip in dry-run)
+	if !e.Opts.DryRun {
+		for _, p := range active {
+			ksDir := joinPath(dirPath, ".kitchensync")
+			if exists, _ := p.ListConn.Exists(ksDir); exists {
+				if e.Opts.BD > 0 {
+					cleanupExpired(p.ListConn, joinPath(ksDir, "BAK"), e.Opts.BD)
+				}
+				if e.Opts.XD > 0 {
+					cleanupExpired(p.ListConn, joinPath(ksDir, "TMP"), e.Opts.XD)
+				}
 			}
 		}
 	}
@@ -269,8 +282,10 @@ func (e *Engine) handleDirEntry(entryPath, name string, active, contributing, su
 
 		// Type conflict: peer has file where dir should be
 		if hasEntry && !entry.IsDir {
-			if err := Displace(p, entryPath); err != nil {
-				continue
+			if !e.Opts.DryRun {
+				if err := Displace(p, entryPath); err != nil {
+					continue
+				}
 			}
 			MarkDeleted(p, entryPath)
 			hasEntry = false
@@ -279,9 +294,11 @@ func (e *Engine) handleDirEntry(entryPath, name string, active, contributing, su
 		if decision.Act == ActionDelete || decision.Act == ActionDeleteSubordinatesOnly {
 			if hasEntry {
 				if decision.Act == ActionDelete || p.IsSubordinate() {
-					if err := Displace(p, entryPath); err != nil {
-						// Displacement failed: exclude from recursion, don't cascade
-						continue
+					if !e.Opts.DryRun {
+						if err := Displace(p, entryPath); err != nil {
+							// Displacement failed: exclude from recursion, don't cascade
+							continue
+						}
 					}
 					CascadeTombstones(p, entryPath)
 					e.logDelete(entryPath)
@@ -292,9 +309,11 @@ func (e *Engine) handleDirEntry(entryPath, name string, active, contributing, su
 		} else {
 			// Create or keep
 			if !hasEntry {
-				if err := p.ListConn.CreateDir(entryPath); err != nil {
-					log.Error("create dir %s on %s: %v", entryPath, p.Label(), err)
-					continue
+				if !e.Opts.DryRun {
+					if err := p.ListConn.CreateDir(entryPath); err != nil {
+						log.Error("create dir %s on %s: %v", entryPath, p.Label(), err)
+						continue
+					}
 				}
 				p.Snap.Upsert(entryPath, parentPath, name, "0000-00-00_00-00-00_000000Z", -1, &nowStr, nil)
 			} else {
@@ -359,13 +378,15 @@ func (e *Engine) handleFileEntry(entryPath, name string, active, contributing, s
 				}
 				if needsCopy {
 					e.logCopy(entryPath)
-					p.Snap.UpsertWithNullLastSeen(entryPath, parentPath, name, conformanceModStr, conformanceSize)
-					e.CopyJobs <- CopyJob{
-						Src:     conformanceSrc,
-						Dst:     p,
-						RelPath: entryPath,
-						ModTime: conformanceModStr,
-						Size:    conformanceSize,
+					if !e.Opts.DryRun {
+						p.Snap.UpsertWithNullLastSeen(entryPath, parentPath, name, conformanceModStr, conformanceSize)
+						e.CopyJobs <- CopyJob{
+							Src:     conformanceSrc,
+							Dst:     p,
+							RelPath: entryPath,
+							ModTime: conformanceModStr,
+							Size:    conformanceSize,
+						}
 					}
 					continue
 				}
@@ -373,12 +394,14 @@ func (e *Engine) handleFileEntry(entryPath, name string, active, contributing, s
 
 			if has && !entry.IsDir {
 				modStr := snapshot.FormatModTime(entry.ModTime)
-				p.Snap.Upsert(entryPath, parentPath, name, modStr, entry.ByteSize, &nowStr, nil)
-			} else if has && entry.IsDir {
-				// Type conflict handled elsewhere
-			} else {
+				if !e.Opts.DryRun {
+					p.Snap.Upsert(entryPath, parentPath, name, modStr, entry.ByteSize, &nowStr, nil)
+				}
+			} else if !has {
 				// Absent: mark as deleted if row exists
-				MarkDeleted(p, entryPath)
+				if !e.Opts.DryRun {
+					MarkDeleted(p, entryPath)
+				}
 			}
 		}
 
@@ -390,8 +413,10 @@ func (e *Engine) handleFileEntry(entryPath, name string, active, contributing, s
 
 		modStr := snapshot.FormatModTime(decision.ModTime)
 
-		// Update source snapshot
-		decision.Src.Snap.Upsert(entryPath, parentPath, name, modStr, decision.Size, &nowStr, nil)
+		if !e.Opts.DryRun {
+			// Update source snapshot
+			decision.Src.Snap.Upsert(entryPath, parentPath, name, modStr, decision.Size, &nowStr, nil)
+		}
 
 		// Update all peers
 		for _, p := range active {
@@ -420,28 +445,34 @@ func (e *Engine) handleFileEntry(entryPath, name string, active, contributing, s
 			}
 
 			if needsCopy {
-				// Handle type conflict: peer has dir where file should be
-				if has && entry.IsDir {
-					if err := Displace(p, entryPath); err != nil {
-						continue
+				if !e.Opts.DryRun {
+					// Handle type conflict: peer has dir where file should be
+					if has && entry.IsDir {
+						if err := Displace(p, entryPath); err != nil {
+							continue
+						}
 					}
-				}
 
-				// Upsert with NULL last_seen (pending copy)
-				p.Snap.UpsertWithNullLastSeen(entryPath, parentPath, name, modStr, decision.Size)
+					// Upsert with NULL last_seen (pending copy)
+					p.Snap.UpsertWithNullLastSeen(entryPath, parentPath, name, modStr, decision.Size)
 
-				e.CopyJobs <- CopyJob{
-					Src:     decision.Src,
-					Dst:     p,
-					RelPath: entryPath,
-					ModTime: modStr,
-					Size:    decision.Size,
+					e.CopyJobs <- CopyJob{
+						Src:     decision.Src,
+						Dst:     p,
+						RelPath: entryPath,
+						ModTime: modStr,
+						Size:    decision.Size,
+					}
 				}
 			} else if has && !entry.IsDir {
 				// Peer already has matching file
-				p.Snap.Upsert(entryPath, parentPath, name, modStr, decision.Size, &nowStr, nil)
+				if !e.Opts.DryRun {
+					p.Snap.Upsert(entryPath, parentPath, name, modStr, decision.Size, &nowStr, nil)
+				}
 			} else {
-				MarkDeleted(p, entryPath)
+				if !e.Opts.DryRun {
+					MarkDeleted(p, entryPath)
+				}
 			}
 		}
 
@@ -451,12 +482,16 @@ func (e *Engine) handleFileEntry(entryPath, name string, active, contributing, s
 			entry, has := listings[p][name]
 			if has && !entry.IsDir {
 				if decision.Act == ActionDelete || p.IsSubordinate() {
-					if err := Displace(p, entryPath); err != nil {
-						continue
+					if !e.Opts.DryRun {
+						if err := Displace(p, entryPath); err != nil {
+							continue
+						}
 					}
 				}
 			}
-			MarkDeleted(p, entryPath)
+			if !e.Opts.DryRun {
+				MarkDeleted(p, entryPath)
+			}
 		}
 	}
 }
@@ -475,7 +510,9 @@ func (e *Engine) handleTypeConflict(entryPath, name string, active, contributing
 		// Directory wins: displace files, handle as dir
 		for _, p := range active {
 			if entry, ok := listings[p][name]; ok && !entry.IsDir {
-				Displace(p, entryPath)
+				if !e.Opts.DryRun {
+					Displace(p, entryPath)
+				}
 				MarkDeleted(p, entryPath)
 				delete(listings[p], name)
 			}
@@ -488,7 +525,9 @@ func (e *Engine) handleTypeConflict(entryPath, name string, active, contributing
 		// File wins: displace directories, handle as file
 		for _, p := range active {
 			if entry, ok := listings[p][name]; ok && entry.IsDir {
-				Displace(p, entryPath)
+				if !e.Opts.DryRun {
+					Displace(p, entryPath)
+				}
 				CascadeTombstones(p, entryPath)
 				delete(listings[p], name)
 			}
@@ -528,7 +567,6 @@ func (e *Engine) readWinningSyncIgnore(relPath string, contributing, subordinate
 	}
 	return string(data)
 }
-
 
 func joinPath(dir, name string) string {
 	if dir == "" || dir == "." {
@@ -577,17 +615,3 @@ func removeRecursive(fs fsutil.PeerFS, dirPath string) {
 	}
 	fs.DeleteDir(dirPath)
 }
-
-// ParseTimestampDir tries to parse a directory name as a KitchenSync timestamp.
-func ParseTimestampDir(name string) (time.Time, error) {
-	return timestamp.ParseTime(name)
-}
-
-// FormatInt converts an int to string for display.
-func FormatInt(n int) string {
-	return strconv.Itoa(n)
-}
-
-// Unused but satisfies potential import
-var _ = fmt.Sprintf
-var _ = strings.TrimSpace

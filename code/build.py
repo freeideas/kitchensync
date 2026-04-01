@@ -13,7 +13,7 @@ if sys.stdout.encoding != 'utf-8':
 import os
 import platform
 import subprocess
-import shutil
+
 
 def main():
     # Determine paths
@@ -21,29 +21,28 @@ def main():
     project_dir = os.path.dirname(code_dir)
     released_dir = os.path.join(project_dir, "released")
     go_bin = os.path.join(project_dir, "tools", "compiler", "go", "bin", "go")
+    go_root = os.path.join(project_dir, "tools", "compiler", "go")
+
+    # On Windows, go binary has .exe extension
+    if platform.system().lower() == "windows" and not go_bin.endswith(".exe"):
+        go_bin += ".exe"
+
+    if not os.path.exists(go_bin):
+        print(f"✗ Go compiler not found at {go_bin}")
+        print("  Download Go to ./tools/compiler/go/ first")
+        return 1
 
     # Determine current platform
     system = platform.system().lower()
     if system == "linux":
         current_binary = "kitchensync.linux"
-        current_goos = "linux"
     elif system == "darwin":
         current_binary = "kitchensync.mac"
-        current_goos = "darwin"
     elif system == "windows":
         current_binary = "kitchensync.exe"
-        current_goos = "windows"
     else:
         print(f"✗ Unsupported platform: {system}")
         return 1
-
-    machine = platform.machine().lower()
-    if machine in ("x86_64", "amd64"):
-        current_goarch = "amd64"
-    elif machine in ("aarch64", "arm64"):
-        current_goarch = "arm64"
-    else:
-        current_goarch = "amd64"
 
     # Ensure released directory exists
     os.makedirs(released_dir, exist_ok=True)
@@ -62,15 +61,15 @@ def main():
     ]
 
     env = os.environ.copy()
+    env["GOROOT"] = go_root
     env["GOPATH"] = os.path.join(project_dir, "tools", "gopath")
-    # CGO is needed for sqlite but modernc.org/sqlite is pure Go
+    # modernc.org/sqlite is pure Go, no CGO needed
     env["CGO_ENABLED"] = "0"
 
     for goos, goarch, binary_name in targets:
         output_path = os.path.join(released_dir, binary_name)
 
         # Skip if binary already exists from another platform's build
-        # (only rebuild current platform's binary, cross-compile the rest)
         if os.path.exists(output_path) and binary_name != current_binary:
             print(f"• Skipping {binary_name} (already exists)")
             continue

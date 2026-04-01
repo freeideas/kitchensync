@@ -11,12 +11,13 @@ import (
 
 // Options holds parsed global options.
 type Options struct {
-	MC int // max connections per URL
-	CT int // connection timeout seconds
-	VL log.Level
-	XD int // stale TMP cleanup days
-	BD int // BAK retention days
-	TD int // tombstone retention days
+	MC     int // max connections per URL
+	CT     int // connection timeout seconds
+	VL     log.Level
+	XD     int // stale TMP cleanup days
+	BD     int // BAK retention days
+	TD     int // tombstone retention days
+	DryRun bool
 }
 
 // PeerRole indicates the role prefix on a peer.
@@ -58,7 +59,14 @@ func Parse(args []string) (Options, []PeerArg, bool, error) {
 			return opts, nil, true, nil
 		}
 
-		// Options
+		// Dry-run flags
+		if arg == "-n" || arg == "--dry-run" {
+			opts.DryRun = true
+			i++
+			continue
+		}
+
+		// Options with values
 		if arg == "--mc" || arg == "--ct" || arg == "-vl" || arg == "--xd" || arg == "--bd" || arg == "--td" {
 			if i+1 >= len(args) {
 				return opts, nil, false, fmt.Errorf("option %s requires a value", arg)
@@ -81,7 +89,7 @@ func Parse(args []string) (Options, []PeerArg, bool, error) {
 			case "-vl":
 				level, ok := log.ParseLevel(val)
 				if !ok {
-					return opts, nil, false, fmt.Errorf("-vl must be one of: error, info, debug, trace; got %q", val)
+					return opts, nil, false, fmt.Errorf("-vl must be one of: error, warn, info, debug, trace; got %q", val)
 				}
 				opts.VL = level
 			case "--xd":
@@ -106,8 +114,8 @@ func Parse(args []string) (Options, []PeerArg, bool, error) {
 			continue
 		}
 
-		// Check for unrecognized flags
-		if strings.HasPrefix(arg, "--") && !strings.HasPrefix(arg, "--mc") && !strings.HasPrefix(arg, "--ct") && !strings.HasPrefix(arg, "--xd") && !strings.HasPrefix(arg, "--bd") && !strings.HasPrefix(arg, "--td") {
+		// Check for unrecognized flags (starts with -- but not a known option)
+		if strings.HasPrefix(arg, "--") {
 			return opts, nil, false, fmt.Errorf("unrecognized option: %s", arg)
 		}
 

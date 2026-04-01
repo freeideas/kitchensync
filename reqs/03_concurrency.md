@@ -58,7 +58,7 @@ The `--ct` flag sets connection timeout (default 30 seconds). For SFTP URLs, thi
 Per-URL settings via query string (e.g., `?mc=20&ct=60`) override global flags.
 
 ## $REQ_CONC_012: Fallback URLs Tried in Order
-**Source:** ./specs/concurrency.md (Section: "Fallback URLs")
+**Source:** ./specs/concurrency.md (Section: "Fallback URLs"), ./specs/concurrency.md (Section: "Connection Establishment")
 
 A peer can have multiple URLs in square brackets. They are tried in order; first that connects wins. All subsequent connections use the winning URL's pool.
 

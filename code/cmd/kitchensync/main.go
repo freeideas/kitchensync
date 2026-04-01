@@ -137,9 +137,11 @@ func run(args []string) int {
 		p := reachable[0]
 		singlePeerSnapshot(p, "")
 		// BAK/TMP cleanup (same as Phase 4 in the multi-peer walk)
-		singlePeerCleanup(p, "", opts)
+		if !opts.DryRun {
+			singlePeerCleanup(p, "", opts)
+		}
 		// Upload updated snapshot
-		if p.Snap != nil {
+		if !opts.DryRun && p.Snap != nil {
 			if err := uploadSnapshot(p); err != nil {
 				log.Error("upload snapshot for %s: %v", p.Label(), err)
 			}
@@ -153,8 +155,10 @@ func run(args []string) int {
 	}
 
 	// Create connection pools for reachable peers
-	for _, p := range reachable {
-		p.Pool = pool.NewPool(p.ActiveURL, opts.MC, opts.CT)
+	if !opts.DryRun {
+		for _, p := range reachable {
+			p.Pool = pool.NewPool(p.ActiveURL, opts.MC, opts.CT)
+		}
 	}
 
 	// Run the walk
@@ -164,11 +168,13 @@ func run(args []string) int {
 	// Wait for all copies
 	engine.Wait()
 
-	// Upload updated snapshots
-	for _, p := range reachable {
-		if p.Snap != nil {
-			if err := uploadSnapshot(p); err != nil {
-				log.Error("upload snapshot for %s: %v", p.Label(), err)
+	// Upload updated snapshots (skip in dry-run)
+	if !opts.DryRun {
+		for _, p := range reachable {
+			if p.Snap != nil {
+				if err := uploadSnapshot(p); err != nil {
+					log.Error("upload snapshot for %s: %v", p.Label(), err)
+				}
 			}
 		}
 	}
@@ -215,7 +221,7 @@ func connectPeers(peers []*peer.Peer, opts cli.Options) {
 			peers[r.idx].Reachable = true
 			peers[r.idx].ListConn = r.conn
 		} else {
-			log.Error("peer unreachable: %s", peers[r.idx].Label())
+			log.Warn("peer unreachable: %s", peers[r.idx].Label())
 		}
 	}
 }
@@ -249,7 +255,6 @@ func tryConnect(u *urlutil.NormalizedURL, opts cli.Options) fsutil.PeerFS {
 }
 
 // singlePeerSnapshot walks the peer's filesystem and records a snapshot.
-// Present files get last_seen = now, absent files get tombstoned.
 func singlePeerSnapshot(p *peer.Peer, dirPath string) {
 	entries, err := p.ListConn.ListDir(dirPath)
 	if err != nil {
@@ -273,9 +278,9 @@ func singlePeerSnapshot(p *peer.Peer, dirPath string) {
 	if err == nil {
 		for _, row := range children {
 			if !liveNames[row.Basename] && !row.DeletedTime.Valid {
-				// File/dir was in snapshot but is now absent — tombstone it
+				// File/dir was in snapshot but is now absent -- tombstone it
 				relPath := joinRelPath(dirPath, row.Basename)
-				p.Snap.SetDeletedTimeValue(relPath, nowStr)
+				p.Snap.SetDeletedTime(relPath)
 				if row.ByteSize == -1 {
 					// Directory: cascade tombstones to children
 					p.Snap.CascadeTombstones(relPath, nowStr)
@@ -310,8 +315,7 @@ func joinRelPath(dir, name string) string {
 	return dir + "/" + name
 }
 
-// singlePeerCleanup walks directories and cleans up expired BAK/TMP entries,
-// mirroring Phase 4 of the combined-tree walk for single-peer mode.
+// singlePeerCleanup walks directories and cleans up expired BAK/TMP entries.
 func singlePeerCleanup(p *peer.Peer, dirPath string, opts cli.Options) {
 	if opts.BD == 0 && opts.XD == 0 {
 		return
@@ -389,7 +393,7 @@ func downloadSnapshot(p *peer.Peer) error {
 	// Try to read peer's .kitchensync/snapshot.db
 	reader, err := p.ListConn.ReadFile(".kitchensync/snapshot.db")
 	if err != nil {
-		// No snapshot on peer — create empty
+		// No snapshot on peer -- create empty
 		db, err := snapshot.Open(localDBPath)
 		if err != nil {
 			return err
