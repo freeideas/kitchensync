@@ -11,34 +11,34 @@ One peer: snapshot only (record what's there, no sync).
 Running with no arguments prints this help. See README.md for full docs.
 
 Peers:
-  /path, c:\path, or ./relative    Local path (same as file://)
-  sftp://user@host/path            Remote over SSH
-  sftp://user@host:port/path       Non-standard SSH port
-  sftp://user:password@host/path   Inline password (prefer SSH keys)
+  /path, c:\path, or ./relative   Local path (same as file://)
+  sftp://user@host/path           Remote over SSH
+  sftp://user@host:port/path      Non-standard SSH port
+  sftp://user:password@host/path  Inline password (prefer SSH keys)
 
 Prefix modifiers:
-  +<peer>                          Canon — this peer's state wins all conflicts
-  -<peer>                          Subordinate — overwritten to match the group
+  +<peer>                         Canon — this peer's state wins all conflicts
+  -<peer>                         Subordinate — overwritten to match the group
 
 Fallback URLs (multiple paths to the same data):
-  [url1,url2,...]                  Try in order, first that connects wins
-  +[url1,url2,...]                 Canon peer with fallbacks
-  -[url1,url2,...]                 Subordinate peer with fallbacks
+  [url1,url2,...]                 Try in order, first that connects wins
+  +[url1,url2,...]                Canon peer with fallbacks
+  -[url1,url2,...]                Subordinate peer with fallbacks
 
 Per-URL settings (query string, inside quotes):
-  "sftp://host/path?mc=5"          Max connections for this URL
-  "sftp://host/path?ct=60"         Connection timeout for this URL
-  "sftp://host/path?mc=5&ct=60"    Both
+  "sftp://host/path?mc=5"         Max connections for this URL
+  "sftp://host/path?ct=60"        Connection timeout for this URL
+  "sftp://host/path?mc=5&ct=60"   Both
 
 Options:
   -h, --help, /?     Show this help
   -n, --dry-run      Show what would happen without making changes
   --mc N             Max concurrent connections per URL (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
-  -vl LEVEL          Verbosity level: error, warn, info, debug, trace (default: info)
-  --xd N             Delete stale TMP staging after N days; 0=never (default: 2)
+  -vl LEVEL          Verbosity: error, warn, info, debug, trace (def: info)
+  --xd N             Delete stale TMP staging after N days; 0=never (def: 2)
   --bd N             Delete BAK/ files after N days; 0=never (default: 90)
-  --td N             Forget deletion records after N days; 0=never (default: 180)
+  --td N             Forget deletion records after N days; 0=never (def: 180)
 
 Quick start:
   kitchensync /mnt/usb/photos                         Snapshot only (no sync)

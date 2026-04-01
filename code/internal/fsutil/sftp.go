@@ -1,12 +1,14 @@
 package fsutil
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -35,15 +37,21 @@ func DialSFTP(user, password, host string, port int, rootPath string, timeout ti
 		knownHostsPath = filepath.Join(home, ".ssh", "known_hosts")
 	}
 	hostKeyCallback := ssh.InsecureIgnoreHostKey()
+	var hostKeyAlgorithms []string
 	if cb, err := knownhosts.New(knownHostsPath); err == nil {
 		hostKeyCallback = cb
+		// Constrain key negotiation to algorithms in known_hosts for this host,
+		// so Go doesn't negotiate e.g. ecdsa when known_hosts only has ed25519.
+		addr := fmt.Sprintf("%s:%d", host, port)
+		hostKeyAlgorithms = hostKeyAlgorithmsFromFile(knownHostsPath, addr)
 	}
 
 	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         timeout,
+		User:              user,
+		Auth:              authMethods,
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: hostKeyAlgorithms,
+		Timeout:           timeout,
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -235,4 +243,55 @@ func (f *SFTPFS) Exists(p string) (bool, error) {
 func (f *SFTPFS) Close() error {
 	f.client.Close()
 	return f.sshc.Close()
+}
+
+// hostKeyAlgorithmsFromFile reads a known_hosts file and returns the key
+// algorithms recorded for the given host:port address. This ensures the SSH
+// handshake negotiates a key type that actually matches what's in known_hosts,
+// avoiding "key mismatch" errors when the server offers multiple key types.
+func hostKeyAlgorithmsFromFile(path, addr string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// Normalize: knownhosts stores non-standard ports as [host]:port,
+	// but standard port 22 is stored as just the hostname.
+	host, port, _ := net.SplitHostPort(addr)
+	lookups := []string{host}
+	if port != "" && port != "22" {
+		lookups = []string{fmt.Sprintf("[%s]:%s", host, port)}
+	}
+
+	var algos []string
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Skip @markers (like @cert-authority, @revoked)
+		if strings.HasPrefix(line, "@") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		hosts := strings.Split(fields[0], ",")
+		keyType := fields[1]
+		for _, h := range hosts {
+			for _, lookup := range lookups {
+				if h == lookup {
+					if !seen[keyType] {
+						seen[keyType] = true
+						algos = append(algos, keyType)
+					}
+				}
+			}
+		}
+	}
+	return algos
 }

@@ -152,6 +152,8 @@ KitchenSync tries these in order:
 
 Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
+**Important:** When a server offers multiple host key types (e.g. ed25519, ecdsa, rsa), KitchenSync must negotiate a key type that matches what's in `known_hosts`. If `known_hosts` only has `ssh-ed25519` for a host but the SSH handshake negotiates `ecdsa`, the connection fails with "key mismatch". KitchenSync handles this by reading `known_hosts` to determine which algorithms are recorded for each host and constraining the handshake accordingly.
+
 ## The `.kitchensync/` Directory
 
 The snapshot database lives at the peer root. BAK/ and TMP/ directories are created alongside affected files at any directory level.

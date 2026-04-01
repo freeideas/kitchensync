@@ -28,6 +28,14 @@ Key Go libraries:
 - `github.com/cespare/xxhash/v2` — xxHash64 for path hashing
 - `github.com/sabhiram/go-gitignore` — .syncignore pattern matching
 
+### SSH known_hosts and HostKeyAlgorithms
+
+**CRITICAL:** Go's `x/crypto/ssh/knownhosts` callback verifies the host key presented during the SSH handshake against `~/.ssh/known_hosts`. However, if the server offers multiple key types (e.g. ed25519, ecdsa, rsa) and Go's SSH client negotiates a different key type than what's recorded in `known_hosts`, the callback returns a "key mismatch" error -- even though the correct key IS in the file, just for a different algorithm.
+
+**Fix:** Before connecting, read `~/.ssh/known_hosts` to find which key algorithms are recorded for the target host, and set `ssh.ClientConfig.HostKeyAlgorithms` to that list. This constrains the handshake to negotiate only key types that `known_hosts` can verify.
+
+This is a well-known Go SSH pitfall. The `knownhosts.HostKeyAlgorithms()` function was added in later versions of `x/crypto` to solve this, but if your version lacks it, parse the file manually: match host entries, extract the key type field (column 2), and return the list.
+
 ## Help Flag
 
 `-h`, `--help`, `/?`, or no arguments at all prints the help text defined in `specs/help.md` (embedded at build time) and exits 0.
