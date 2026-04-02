@@ -26,9 +26,9 @@ Fallback URLs (multiple paths to the same data):
   -[url1,url2,...]                Subordinate peer with fallbacks
 
 Per-URL settings (query string, inside quotes):
-  "sftp://host/path?mc=5"         Max connections for this URL
-  "sftp://host/path?ct=60"        Connection timeout for this URL
-  "sftp://host/path?mc=5&ct=60"   Both
+  "sftp://user@host/path?mc=5"         Max connections for this URL
+  "sftp://user@host/path?ct=60"        Connection timeout for this URL
+  "sftp://user@host/path?mc=5&ct=60"   Both
 
 Options:
   -h, --help, /?     Show this help
@@ -45,8 +45,8 @@ Options:
 Quick start:
   kitchensync /mnt/usb/photos                         Snapshot only (no sync)
   kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)
-  kitchensync c:/photos sftp://host/photos            Bidirectional
-  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
+  kitchensync c:/photos sftp://user@host/photos            Bidirectional
+  kitchensync c:/photos sftp://user@host/photos -/mnt/usb  Add USB as subordinate
   kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password
 
 Canon (+) is required on first sync when no peer has snapshot history.

@@ -71,9 +71,9 @@ URLs are normalized before any comparison, lookup, or connection attempt:
 Examples:
 - `c:/photos/` -> `file:///c:/photos`
 - `./data` -> `file:///home/user/data` (resolved from cwd)
-- `SFTP://Host:22/path/` -> `sftp://host/path`
-- `sftp://host//docs/` -> `sftp://host/docs`
-- `sftp://host/path?mc=5` -> `sftp://host/path`
+- `SFTP://User@Host:22/path/` -> `sftp://user@host/path`
+- `sftp://user@host//docs/` -> `sftp://user@host/docs`
+- `sftp://user@host/path?mc=5` -> `sftp://user@host/path`
 
 Normalization is applied before any connection attempt — not just before storage.
 

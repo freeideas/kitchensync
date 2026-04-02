@@ -38,12 +38,14 @@ Tests should be independent and not rely on execution order.
 
 ## Stopping Child Processes
 
-Use `process.terminate()` to stop child processes -- never send signals directly via `os.kill()` or the `signal` module. Platform-specific signal handling is full of gotchas:
+Use `POST /shutdown` to the instance's lock port (read from `.kitchensync/lock`) to stop a running KitchenSync process. This triggers a clean shutdown (wait for in-progress copies, upload final snapshots, delete lock files) and is identical on every platform. See `specs/instance-lock.md` for details.
+
+Never send signals directly via `os.kill()` or the `signal` module:
 
 - **Windows:** `CTRL_C_EVENT` broadcasts to the entire console process group, killing the test runner along with the target process. `SIGTERM` does not exist.
 - **Unix:** `os.kill(pid, signal.SIGTERM)` works but does not clean up process groups or child processes the way `subprocess` does.
 
-`Popen.terminate()` handles all of this correctly on every platform (SIGTERM on Unix, `TerminateProcess` on Windows). Use `Popen.kill()` only as a last resort if `terminate()` doesn't work within a reasonable timeout.
+If `POST /shutdown` is not possible (e.g. the lock file hasn't been written yet), use `process.terminate()` as a fallback -- it handles platform differences correctly (SIGTERM on Unix, `TerminateProcess` on Windows). Use `Popen.kill()` only as a last resort.
 
 ## Watch Mode Tests
 

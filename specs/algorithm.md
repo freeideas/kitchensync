@@ -45,6 +45,13 @@ def startup(args):
         log(warn, "only one peer reachable — running in snapshot-only mode")
         # Proceed: the single reachable peer gets a snapshot update, no sync decisions
 
+    # Instance lock check (see instance-lock.md)
+    # 1. Read .kitchensync/lock from each reachable peer (via established connections)
+    # 2. Check for overlapping instances (POST to lock port, compare peer lists)
+    # 3. Bind lock listener on 127.0.0.1:0
+    # 4. Write lock port to each reachable peer's .kitchensync/lock
+    # 5. Re-read and verify (race condition mitigation)
+
     # Download snapshots
     for peer in reachable_peers:
         download peer's .kitchensync/snapshot.db to local temp dir
@@ -77,8 +84,9 @@ def startup(args):
     # Run the walk
     sync_directory(reachable_peers, root_path)
 
-    # Wait for all enqueued file copies to complete
-    wait(copy_queue)
+    # Wait for all enqueued file copies to complete (up to 60 seconds;
+    # abort remaining after timeout)
+    wait(copy_queue, timeout=60s)
 
     # Upload final snapshots (via TMP staging + atomic rename)
     for peer in reachable_peers:
@@ -462,7 +470,7 @@ Every file copy and every deletion is logged at `info` level:
 
 Logged once per decision, not per peer. Example: `C photos/vacation/img001.jpg`
 
-Connection pool changes logged at `trace` level: `url=sftp://host/path connections=2/10`
+Connection pool changes logged at `trace` level: `url=sftp://user@host/path connections=2/10`
 
 ## Snapshot Checkpoints
 
@@ -495,7 +503,7 @@ Any peer without a snapshot is automatically subordinate (unless it's the canon 
 - **Canon peer unreachable** -> exit 1
 - **Only one reachable** (multi-peer mode) -> log warning, run in snapshot-only mode for that peer
 - **Transfer failure** -> log, skip file (re-discovered next run)
-- **Displacement failure** -> log error, skip (file remains). If part of a copy sequence, skip the copy too (clean up TMP). For directories: exclude the peer from recursion and do not cascade tombstones — the snapshot is left unchanged so the next run re-attempts deletion
+- **Displacement failure** -> log error, skip (file remains). If part of a copy sequence, skip the copy too (clean up TMP). For directories: exclude the peer from recursion and do not cascade tombstones — the snapshot is left unchanged so the next run re-attempts deletion. Copies already enqueued to the failed peer for entries within the failed subtree will fail individually and are handled by normal transfer failure logic (clean up TMP, log, skip)
 - **TMP staging failure** -> treat as transfer failure
 - **Snapshot upload failure** -> log error, leave TMP for `--xd` cleanup
 

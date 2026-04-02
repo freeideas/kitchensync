@@ -28,25 +28,27 @@ Peer comparison uses OS-canonicalized paths (resolving symlinks, `.`/`..`, and n
 
 The check must examine **all** peers before deciding. If any single peer reports an overlap, the instance must not start.
 
-### Lock Endpoint
+### Endpoints
+
+The listener is bound to `127.0.0.1` only -- not reachable from the network. It serves two endpoints:
 
 **POST /instance-peers** -- returns a JSON array of canonical peer identifiers, sorted. Example:
 
 ```json
 [
   "file:///c:/photos",
-  "sftp://bilbo@cloud:22/volume1/photos"
+  "sftp://bilbo@cloud/volume1/photos"
 ]
 ```
 
-The listener is bound to `127.0.0.1` only -- not reachable from the network.
+**POST /shutdown** -- initiates a clean shutdown. The instance performs the normal shutdown sequence (wait for in-progress copies, upload final snapshots, delete lock files, close listener) and exits 0. Returns 200 immediately; the process exits after cleanup completes. This is the preferred way for tests to stop a running instance -- it is cross-platform and avoids signal-handling differences between Windows and Unix.
 
 ### On Shutdown
 
 1. Delete `.kitchensync/lock` from every peer (best-effort -- connection failures are logged but do not prevent exit)
 2. Close the TCP listener
 
-Lock cleanup happens regardless of whether shutdown is clean (normal exit, SIGTERM) or unclean (crash, SIGKILL). If cleanup is missed, the next instance detects connection-refused and cleans up the stale file.
+Lock cleanup runs on clean shutdown (normal exit, SIGINT, SIGTERM, or `POST /shutdown`). On unclean shutdown (crash, SIGKILL), cleanup is missed -- the next instance detects connection-refused and cleans up the stale file.
 
 ## Watch Mode
 

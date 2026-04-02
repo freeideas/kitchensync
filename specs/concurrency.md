@@ -9,7 +9,7 @@ Connection pools are keyed by URL, not by peer. Each URL that successfully conne
 | Max connections    | 10      | `--mc`      | `mc`                |
 | Connection timeout | 30s     | `--ct`      | `ct`                |
 
-Per-URL settings (query string) override global settings. Example: `"sftp://host/path?mc=20&ct=60"`
+Per-URL settings (query string) override global settings. Example: `"sftp://user@host/path?mc=20&ct=60"`
 
 A file transfer acquires one connection from the source pool and one from the destination pool for the duration. To prevent deadlock, always acquire the two pools in lexicographic order by URL (the normalized URL that keys the pool). If source and destination are the same pool (local-to-local copy), acquire two connections from that pool. On completion or failure, both are returned.
 
@@ -22,7 +22,7 @@ Pool acquisition blocks until a connection is available; there is no acquisition
 A peer can have multiple URLs in square brackets — fallback network paths to the same data. Tried in order; first that connects wins.
 
 ```
-kitchensync [sftp://192.168.1.50/photos,sftp://nas.vpn/photos] /local/photos
+kitchensync [sftp://user@192.168.1.50/photos,sftp://user@nas.vpn/photos] /local/photos
 ```
 
 The `+`/`-` prefix goes on the bracket, not on individual URLs.
@@ -54,7 +54,7 @@ Recommended chunk size: 64KB. Channel buffer: 16 chunks. These are implementatio
 At verbosity `trace` (`-vl trace`), log every pool change:
 
 ```
-url=sftp://host/path connections=2/10
+url=sftp://user@host/path connections=2/10
 ```
 
 Logged on every acquire and release.
@@ -62,9 +62,9 @@ Logged on every acquire and release.
 Also at `trace`, log pipelined transfer goroutine lifecycle:
 
 ```
-pipe reader-start src=sftp://host/path file=photos/img.jpg
+pipe reader-start src=sftp://user@host/path file=photos/img.jpg
 pipe writer-start dst=/local/photos file=photos/img.jpg
-pipe reader-done  src=sftp://host/path file=photos/img.jpg
+pipe reader-done  src=sftp://user@host/path file=photos/img.jpg
 pipe writer-done  dst=/local/photos file=photos/img.jpg
 ```
 

@@ -80,7 +80,7 @@ The `--si` checkpoint interval applies during watch mode. Snapshots are uploaded
 
 ## Shutdown
 
-The process runs until interrupted (Ctrl+C / SIGINT / SIGTERM). On shutdown:
+The process runs until interrupted (Ctrl+C / SIGINT / SIGTERM / `POST /shutdown`). On shutdown:
 
 1. Stop accepting new watcher events
 2. Wait for in-progress copies to complete (up to 30 seconds; abort remaining after timeout)
