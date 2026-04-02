@@ -16,6 +16,8 @@ import subprocess
 
 
 def main():
+    build_all = "--all" in sys.argv[1:]
+
     # Determine paths
     code_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(code_dir)
@@ -47,18 +49,30 @@ def main():
     # Ensure released directory exists
     os.makedirs(released_dir, exist_ok=True)
 
-    # Step 1: Delete only current platform binary (preserve others)
+    # Step 1: Delete current platform binary (and others if --all)
     current_binary_path = os.path.join(released_dir, current_binary)
     if os.path.exists(current_binary_path):
         os.remove(current_binary_path)
         print(f"✓ Removed old {current_binary}")
 
-    # Step 2: Build all platform binaries
-    targets = [
+    all_targets = [
         ("linux", "amd64", "kitchensync.linux"),
         ("windows", "amd64", "kitchensync.exe"),
         ("darwin", "amd64", "kitchensync.mac"),
     ]
+
+    if build_all:
+        # Delete other platform binaries too
+        for _, _, binary_name in all_targets:
+            if binary_name == current_binary:
+                continue
+            path = os.path.join(released_dir, binary_name)
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"✓ Removed old {binary_name}")
+
+    # Step 2: Build binaries
+    targets = all_targets if build_all else [(goos, goarch, name) for goos, goarch, name in all_targets if name == current_binary]
 
     env = os.environ.copy()
     env["GOROOT"] = go_root
@@ -68,11 +82,6 @@ def main():
 
     for goos, goarch, binary_name in targets:
         output_path = os.path.join(released_dir, binary_name)
-
-        # Skip if binary already exists from another platform's build
-        if os.path.exists(output_path) and binary_name != current_binary:
-            print(f"• Skipping {binary_name} (already exists)")
-            continue
 
         print(f"• Building {binary_name} (GOOS={goos} GOARCH={goarch})...")
 
