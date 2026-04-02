@@ -8,10 +8,11 @@ This is the complete sync algorithm. It covers startup, the combined-tree walk, 
 def startup(args):
     options, peers = parse_args(args)
     # Validation: at least 1 peer, at most 1 canon (+), all option values valid
-    # Option values --mc, --ct are positive integers (>= 1)
+    # Option values --mc, --ct, --si are positive integers (>= 1)
     # Option values --xd, --bd, --td are non-negative integers (>= 0); 0 means never
     # -vl is one of: error, warn, info, debug, trace
     # --dry-run / -n is a boolean flag (no value)
+    # --watch is a boolean flag (no value)
     # On any validation error: print error + help text to stdout, exit 1
     # No args / -h / --help / /? : print help to stdout, exit 0
 
@@ -36,10 +37,13 @@ def startup(args):
     # no-ops (zero targets), but snapshot updates fire correctly (present files
     # get last_seen=now, absent files get tombstoned). No special case needed.
 
-    if len(reachable) < 2 and len(peers) >= 2:
-        exit(1, "fewer than two peers reachable")
-    if len(reachable) < 1:
-        exit(1, "peer unreachable")
+    if len(reachable) == 0:
+        exit(1, "no peers reachable")
+    if canon_peer and not canon_peer.reachable:
+        exit(1, "canon peer unreachable")
+    if len(reachable) == 1 and len(peers) >= 2:
+        log(warn, "only one peer reachable — running in snapshot-only mode")
+        # Proceed: the single reachable peer gets a snapshot update, no sync decisions
 
     # Download snapshots
     for peer in reachable_peers:
@@ -48,6 +52,11 @@ def startup(args):
             create empty snapshot locally
             if not peer.is_canon:
                 peer.auto_subordinate = True   # no snapshot = auto subordinate (canon is exempt)
+        if snapshot download fails (corrupt, permission denied, I/O error):
+            log(warn, "snapshot download failed for {peer}, treating as new peer")
+            create empty snapshot locally
+            if not peer.is_canon:
+                peer.auto_subordinate = True
 
     # A peer is_subordinate if it has the `-` prefix OR has auto_subordinate=True.
     # is_subordinate = peer.explicit_subordinate or peer.auto_subordinate
@@ -71,7 +80,7 @@ def startup(args):
     # Wait for all enqueued file copies to complete
     wait(copy_queue)
 
-    # Upload updated snapshots back (via TMP staging + atomic rename)
+    # Upload final snapshots (via TMP staging + atomic rename)
     for peer in reachable_peers:
         upload snapshot to .kitchensync/TMP/<timestamp>/<uuid>/snapshot.db
         rename to .kitchensync/snapshot.db
@@ -164,6 +173,8 @@ def sync_directory(peers, path, parent_ignore_rules=None):
             for peer in subordinates:
                 if peer has entry at entry_path:
                     displace(peer, entry_path)
+                    if peer has directory at entry_path:
+                        cascade_tombstones(peer, entry_path)  # mark children deleted in snapshot
                     # Update subordinate's snapshot with tombstone
             # Do not modify contributing peer snapshots
 
@@ -214,13 +225,16 @@ Canon wins unconditionally:
 
 Only contributing (non-subordinate) peers vote. After the decision, subordinate peers are brought into conformance.
 
-Entry type is determined from the listings: `states` includes `is_dir` from each peer's listing. If any contributing peer reports the entry as a directory, it is treated as a directory; otherwise it is a file. The decision returns `Decision(type=DIRECTORY, ...)` or `Decision(type=FILE, ...)` accordingly.
+Entry type is determined from the listings. If all contributing peers that have the entry agree on its type (all files or all directories), the decision uses that type. If there is a type conflict (some peers have a file, others have a directory at the same path), apply the Type Conflicts rules below to choose the winning type before proceeding to the decision.
 
 ```python
 def decide(states, snap):
-    # states: {peer: (classification, mod_time, byte_size, is_dir)} for contributing peers only
+    # states: {peer: State} for contributing peers only
+    # State fields: classification, mod_time, byte_size, is_dir, last_seen, deleted_time
+    # Derived: deletion_estimate (= deleted_time for DELETED; = last_seen for absent-unconfirmed promoted to DELETED)
     # Peers with no row and absent state have no opinion — skip them
-    # entry_type = DIRECTORY if any(s.is_dir for s in states.values()) else FILE
+    # entry_type: DIRECTORY if all agreeing peers say dir, FILE if all say file.
+    # If mixed (type conflict): canon's type wins, or file wins if no canon (see Type Conflicts).
 
     voters = {p: s for p, s in states.items() if s.classification != NO_OPINION}
 
@@ -270,7 +284,8 @@ def decide(states, snap):
             winner = max(tied.items(), key=lambda ps: ps[1].byte_size)
         else:
             winner = max(live.items(), key=lambda ps: ps[1].mod_time)
-        return Decision(action=PUSH, src=winner, targets=peers_that_differ)
+        targets = peers_needing_update(live, winner)
+        return Decision(action=PUSH, src=winner, targets=targets)
 
     if deleted and not live:
         # Everything deleted -> delete on all peers
@@ -287,7 +302,12 @@ def decide(states, snap):
             # Rule 6: ties favor existence (mod_time >= deletion estimate)
             # Existing file wins -> push to peers that lack it
             winner = pick_winner_from_live(live)  # by mod_time, then size
-            return Decision(action=PUSH, src=winner, targets=peers_that_lack_it)
+            targets = peers_needing_update(voters, winner)
+            return Decision(action=PUSH, src=winner, targets=targets)
+
+    # peers_needing_update: all contributing peers (from the input set) except
+    # those whose entry already matches the winner — same mod_time (within 5s
+    # tolerance) AND same byte_size. This includes absent and deleted peers.
 ```
 
 **Deletion estimates**: For `DELETED` entries (absent, snapshot row has `deleted_time IS NOT NULL`), `deletion_estimate = deleted_time` from the snapshot row. For absent-unconfirmed entries promoted to DELETED by rule 4b, `deletion_estimate = last_seen`.
@@ -434,6 +454,16 @@ Every file copy and every deletion is logged at `info` level:
 Logged once per decision, not per peer. Example: `C photos/vacation/img001.jpg`
 
 Connection pool changes logged at `trace` level: `url=sftp://host/path connections=2/10`
+
+## Snapshot Checkpoints
+
+During long syncs, snapshots are periodically uploaded to peers so that progress is preserved if the connection drops. The interval is controlled by `--si` (default: 30 minutes).
+
+A process-global timer tracks elapsed time since the last snapshot upload (or since sync start). After each completed file copy, if the timer has exceeded `--si` minutes, upload all peers' snapshots using the same TMP staging + atomic rename as the final upload. The upload uses each peer's listing connection (not the transfer pool). Reset the timer after each checkpoint.
+
+This is safe because the snapshot always reflects decided state. Pending copies have `last_seen=NULL`, so rule 4b (absent-unconfirmed) re-enqueues them on the next run. A checkpoint snapshot is always in a valid recovery state.
+
+Checkpoints are skipped in dry-run mode (no mutations).
 
 ## Offline Peers
 

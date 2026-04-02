@@ -35,3 +35,12 @@ Tests are Python scripts in `./tests/`. Each test:
 5. Cleans up
 
 Tests should be independent and not rely on execution order.
+
+## Stopping Child Processes
+
+Use `process.terminate()` to stop child processes -- never send signals directly via `os.kill()` or the `signal` module. Platform-specific signal handling is full of gotchas:
+
+- **Windows:** `CTRL_C_EVENT` broadcasts to the entire console process group, killing the test runner along with the target process. `SIGTERM` does not exist.
+- **Unix:** `os.kill(pid, signal.SIGTERM)` works but does not clean up process groups or child processes the way `subprocess` does.
+
+`Popen.terminate()` handles all of this correctly on every platform (SIGTERM on Unix, `TerminateProcess` on Windows). Use `Popen.kill()` only as a last resort if `terminate()` doesn't work within a reasonable timeout.

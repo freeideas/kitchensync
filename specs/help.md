@@ -33,12 +33,14 @@ Per-URL settings (query string, inside quotes):
 Options:
   -h, --help, /?     Show this help
   -n, --dry-run      Show what would happen without making changes
+  --watch            After initial sync, watch local peers for changes
   --mc N             Max concurrent connections per URL (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
   -vl LEVEL          Verbosity: error, warn, info, debug, trace (def: info)
   --xd N             Delete stale TMP staging after N days; 0=never (def: 2)
   --bd N             Delete BAK/ files after N days; 0=never (default: 90)
   --td N             Forget deletion records after N days; 0=never (def: 180)
+  --si N             Snapshot checkpoint interval in minutes (default: 30)
 
 Quick start:
   kitchensync /mnt/usb/photos                         Snapshot only (no sync)
