@@ -44,3 +44,11 @@ Use `process.terminate()` to stop child processes -- never send signals directly
 - **Unix:** `os.kill(pid, signal.SIGTERM)` works but does not clean up process groups or child processes the way `subprocess` does.
 
 `Popen.terminate()` handles all of this correctly on every platform (SIGTERM on Unix, `TerminateProcess` on Windows). Use `Popen.kill()` only as a last resort if `terminate()` doesn't work within a reasonable timeout.
+
+## Watch Mode Tests
+
+Watch mode tests start a long-running `--watch` process, create/modify files, and verify that changes propagate. These tests are timing-sensitive:
+
+- **Windows filesystem notification latency** is higher than Linux/macOS. After creating or modifying a file, allow at least 5 seconds for the watcher to detect the change and for the sync to complete. Shorter waits cause flaky failures on Windows even when the code is correct.
+- Use the `WatchProcess.wait_for(pattern, timeout)` helper to wait for specific output (e.g., `watching`) before proceeding with file modifications. This avoids races where files are created before the watcher is ready.
+- After modifying files, wait long enough for the event to be queued, processed, and the sync to complete before stopping the process and checking results.

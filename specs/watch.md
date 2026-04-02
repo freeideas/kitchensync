@@ -14,24 +14,18 @@ With a single peer, `--watch` keeps the snapshot continuously up to date but per
 
 ## Event Processing
 
-Events are drained from the watcher queue one at a time. For each event:
+OS events are queued immediately (after filtering `.kitchensync/` paths and in-flight self-writes). A worker drains the queue and processes each event:
 
 ```python
 def handle_watch_event(event_path):
-    # Suppress self-triggered events
-    if event_path in inflight_paths:
-        return
-
-    # Debounce: wait briefly for rapid-fire events on the same path to settle
-    # (editors often write multiple times on save)
-    debounce(event_path, delay=500ms)
-
-    # Check current state against snapshot
     rel_path = relative_to_peer_root(event_path)
+
+    # Check current state against snapshot -- this is the debounce
     current_stat = stat(event_path)  # may be absent (deletion)
     snap_row = snapshot_lookup(watching_peer, rel_path)
 
-    # If mod_time matches snapshot within tolerance, this is our own write — skip
+    # If the file matches its snapshot, nothing to do (handles rapid-fire
+    # events naturally: the first event syncs, the rest are no-ops)
     if current_stat and snap_row and times_match(current_stat.mod_time, snap_row.mod_time):
         return
 
@@ -51,7 +45,7 @@ KitchenSync modifies local peer filesystems during copies and displacements. The
 
 Maintain a process-global set of in-flight paths. Before any write to a watched peer (file copy arrival, displacement, directory creation/deletion), add the path to the set. Remove it after the operation completes.
 
-Watcher events for paths in the in-flight set are silently dropped. After removal from the set, subsequent events for that path are processed normally -- if the file's mod_time matches the snapshot, the self-write check catches it.
+Watcher events for paths in the in-flight set are dropped before queuing. After removal from the set, subsequent events for that path are queued normally -- if the file's mod_time matches the snapshot, the snapshot comparison catches it.
 
 ## Gathering State for Watched Events
 
@@ -64,9 +58,11 @@ This avoids listing remote directories on every local change. The tradeoff: chan
 
 ## Debouncing
 
-File change events often arrive in bursts (editor save, build tools). Group rapid events on the same path using a short delay (500ms). Each new event on the same path resets the 500ms timer. Processing begins only after 500ms of quiet on that path (trailing-edge debounce). Only the final state after the delay matters -- intermediate states are irrelevant.
+File change events often arrive in bursts (editor save, build tools). Debouncing is handled implicitly by the snapshot comparison: when rapid events fire for the same path, the first event to be processed syncs the file and updates the snapshot. Subsequent queued events for that path find the file already matches its snapshot and are skipped as no-ops.
 
-Events on different paths are independent and may be processed concurrently.
+No per-path timers are needed. The snapshot is the source of truth.
+
+Events on different paths are independent and may be processed concurrently. Concurrent event processing may produce redundant decisions (e.g., two events both decide to push the same file). This is safe -- copies are idempotent, and snapshot writes are serialized by SQLite. No application-level locking is needed beyond what SQLite provides.
 
 ## Ignore Rules
 

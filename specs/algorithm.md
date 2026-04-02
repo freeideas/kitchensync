@@ -162,10 +162,18 @@ def sync_directory(peers, path, parent_ignore_rules=None):
                 if peer has directory at entry_path:
                     displace(peer, entry_path)           # type conflict, inline
             update_snapshot(entry_path, decision)
-            for dst_peer that needs the file:
+            for dst_peer in decision.targets:            # contributing peers needing update
                 enqueue_copy(decision.src_peer, entry_path, dst_peer)
             for peer where file should be deleted:
                 displace(peer, entry_path)               # inline
+            # Subordinate peers: bring into conformance
+            for peer in subordinates:
+                if peer has directory at entry_path:
+                    displace(peer, entry_path)           # type conflict, inline
+                if decision.action == PUSH and peer lacks file (or doesn't match winner):
+                    enqueue_copy(decision.src_peer, entry_path, peer)
+                elif decision.action == DELETE and peer has file:
+                    displace(peer, entry_path)
 
         # DELETE_SUBORDINATES_ONLY: no contributing peer has this entry.
         # Do not modify contributing peers. Displace from subordinates only.
@@ -173,9 +181,9 @@ def sync_directory(peers, path, parent_ignore_rules=None):
             for peer in subordinates:
                 if peer has entry at entry_path:
                     displace(peer, entry_path)
+                    # Update subordinate's snapshot: set deleted_time = last_seen
                     if peer has directory at entry_path:
-                        cascade_tombstones(peer, entry_path)  # mark children deleted in snapshot
-                    # Update subordinate's snapshot with tombstone
+                        cascade_tombstones(peer, entry_path)
             # Do not modify contributing peer snapshots
 
     # Phase 4: BAK/TMP cleanup at this level
@@ -284,7 +292,7 @@ def decide(states, snap):
             winner = max(tied.items(), key=lambda ps: ps[1].byte_size)
         else:
             winner = max(live.items(), key=lambda ps: ps[1].mod_time)
-        targets = peers_needing_update(live, winner)
+        targets = peers_needing_update(states, winner)
         return Decision(action=PUSH, src=winner, targets=targets)
 
     if deleted and not live:
@@ -302,12 +310,13 @@ def decide(states, snap):
             # Rule 6: ties favor existence (mod_time >= deletion estimate)
             # Existing file wins -> push to peers that lack it
             winner = pick_winner_from_live(live)  # by mod_time, then size
-            targets = peers_needing_update(voters, winner)
+            targets = peers_needing_update(states, winner)
             return Decision(action=PUSH, src=winner, targets=targets)
 
-    # peers_needing_update: all contributing peers (from the input set) except
+    # peers_needing_update: all contributing peers (from the states dict) except
     # those whose entry already matches the winner — same mod_time (within 5s
-    # tolerance) AND same byte_size. This includes absent and deleted peers.
+    # tolerance) AND same byte_size. This includes absent, deleted, and
+    # no-opinion peers (they lack the file entirely, so they need it).
 ```
 
 **Deletion estimates**: For `DELETED` entries (absent, snapshot row has `deleted_time IS NOT NULL`), `deletion_estimate = deleted_time` from the snapshot row. For absent-unconfirmed entries promoted to DELETED by rule 4b, `deletion_estimate = last_seen`.
@@ -484,7 +493,7 @@ Any peer without a snapshot is automatically subordinate (unless it's the canon 
 - **No snapshots and no canon** (multi-peer mode) -> print suggestion (`+`), exit 1
 - **Unreachable peer** -> skip, log warning, continue with others
 - **Canon peer unreachable** -> exit 1
-- **Fewer than two reachable** -> exit 1
+- **Only one reachable** (multi-peer mode) -> log warning, run in snapshot-only mode for that peer
 - **Transfer failure** -> log, skip file (re-discovered next run)
 - **Displacement failure** -> log error, skip (file remains). If part of a copy sequence, skip the copy too (clean up TMP). For directories: exclude the peer from recursion and do not cascade tombstones — the snapshot is left unchanged so the next run re-attempts deletion
 - **TMP staging failure** -> treat as transfer failure

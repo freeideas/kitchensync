@@ -64,7 +64,7 @@ URLs are normalized before any comparison, lookup, or connection attempt:
 - Collapse consecutive slashes in the path
 - Remove trailing slash from the path
 - Bare paths (no scheme) are converted to `file://` URLs
-- `file://` URLs: resolve to absolute path using the working directory at program startup
+- `file://` URLs: resolve to absolute path using the working directory at program startup, then resolve symlinks (OS-canonicalize)
 - Percent-decode unreserved characters
 - Strip query-string parameters (`?mc=5` etc. are not part of identity)
 

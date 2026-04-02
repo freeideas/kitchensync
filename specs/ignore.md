@@ -43,7 +43,7 @@ Always excluded regardless of ignore files (cannot be overridden):
 - Symbolic links (files and directories) — following symlinks could escape the sync root or create loops
 - Special files (devices, FIFOs, sockets) — can block reads indefinitely
 
-`.git/` directories are excluded by default. A `.syncignore` file may negate this exclusion (`!.git/`) to force syncing it.
+`.git/` is treated as an implicit pattern prepended to the root-level rule list (before any `.syncignore` patterns). Because it appears first, a `.syncignore` entry of `!.git/` at any level negates it via standard gitignore precedence.
 
 ## Symlinks
 
