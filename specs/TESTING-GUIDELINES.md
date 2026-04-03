@@ -2,7 +2,7 @@
 
 ## Strategy
 
-Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to `sftp://ace@contabix/tmp/kstest/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
+Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to `sftp://192.168.0.252/Volumes/Movx/tmp/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
 
 ## What Tests Should Cover
 
