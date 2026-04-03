@@ -4,6 +4,8 @@ Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQL
 
 At the start of a run, each peer's `snapshot.db` is downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). All reads and writes happen against this local copy. After sync completes, the updated database is written back using TMP staging (see algorithm.md). If a peer has no existing `snapshot.db`, a new one is created locally.
 
+**WAL checkpoint before upload:** In WAL mode, committed writes live in the `-wal` file, not the main `.db` file. Before uploading or copying `snapshot.db` by reading the file from disk (e.g., with `os.ReadFile`), you MUST checkpoint first: `PRAGMA wal_checkpoint(TRUNCATE)`. Without this, the uploaded file is an empty stub containing only the SQLite page header. Close the database connection (or at minimum checkpoint) before reading the `.db` file for upload.
+
 Concurrent runs are not coordinated. If two runs overlap, the last snapshot upload wins. Decisions from the losing run are re-discovered on the next run — correctness is preserved, but some work is repeated.
 
 ## Schema
@@ -84,3 +86,5 @@ On Windows, the normalized URL path has a leading slash (`/c:/photos`), but OS f
 ## Tombstones
 
 When an entry is confirmed absent on a peer where a snapshot row exists with `deleted_time = NULL`, the row is retained and `deleted_time` is set to the current value of `last_seen`. A row with `deleted_time IS NOT NULL` is a tombstone. Tombstones are purged when `deleted_time` is older than `--td` days (default: 180).
+
+Non-tombstone rows (`deleted_time IS NULL`) with `last_seen` older than `--td` days are also purged. These represent entries that were seen at some point but have not appeared in listings for longer than the retention window. Rows with `last_seen = NULL` (pending copies) are exempt.

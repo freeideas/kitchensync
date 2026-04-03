@@ -36,8 +36,11 @@ def handle_watch_event(event_path):
     decision = decide(states, snapshots)
 
     # Execute the decision (copies, displacements, snapshot updates)
+    # Log with "W" prefix: "W C <path>" for copies, "W X <path>" for deletions
     execute_decision(decision, rel_path)
 ```
+
+**Important: watch event handling must NOT call the full-tree `SyncDirectory` function.** The initial sync uses `SyncDirectory` with its own copy queue (a channel that is closed after the initial sync completes). If watch events reuse that function, they will send to the closed channel and panic. Instead, watch events must use their own per-entry decision and execution path. This may share the decision logic, but the copy execution must use a separate mechanism (e.g., a long-lived copy queue for the watch session, or synchronous per-event copies).
 
 ## Self-Triggered Event Suppression
 
@@ -89,7 +92,7 @@ The process runs until interrupted (Ctrl+C / SIGINT / SIGTERM / `POST /shutdown`
 
 ## Logging
 
-Watch-triggered syncs are logged at `info` level with a `W` prefix to distinguish from initial-sync operations:
+Watch-triggered syncs are logged at `info` level with a `W` prefix to distinguish from initial-sync operations. The action letter (`C` for copy, `X` for deletion/displacement) comes from the sync decision -- not from the filesystem event type. Log after the decision is made, not before:
 
 ```
 W C photos/vacation/img001.jpg

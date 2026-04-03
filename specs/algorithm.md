@@ -30,9 +30,6 @@ def startup(args):
     # Auto-create peer root dirs (both file:// and sftp://) on connect
     # If root creation fails for a file:// URL without fallbacks, log error and mark peer unreachable
 
-    if canon_peer and not canon_peer.reachable:
-        exit(1, "canon peer unreachable")
-
     # Single-peer mode: the normal algorithm works — decisions are trivially
     # no-ops (zero targets), but snapshot updates fire correctly (present files
     # get last_seen=now, absent files get tombstoned). No special case needed.
@@ -89,6 +86,8 @@ def startup(args):
     wait(copy_queue, timeout=60s)
 
     # Upload final snapshots (via TMP staging + atomic rename)
+    # WAL checkpoint before reading the .db file (see database.md):
+    # PRAGMA wal_checkpoint(TRUNCATE)
     for peer in reachable_peers:
         upload snapshot to .kitchensync/TMP/<timestamp>/<uuid>/snapshot.db
         rename to .kitchensync/snapshot.db
@@ -120,6 +119,9 @@ def sync_directory(peers, path, parent_ignore_rules=None):
 
     # Phase 2: Union entry names
     contributing = [p for p in active if not p.is_subordinate]
+    if not contributing:
+        log(warn, f"no contributing peer available at {path}, skipping subtree")
+        return
     subordinates = [p for p in active if p.is_subordinate]
     all_names = union(listings[p].keys() for p in contributing)
     all_names |= union(listings[p].keys() for p in subordinates)
@@ -130,6 +132,8 @@ def sync_directory(peers, path, parent_ignore_rules=None):
         # Decide winning .syncignore using normal decision rules
         decide_and_act(".syncignore", ...)
         # Read winning version, merge with parent rules
+        # If the read fails (I/O error, connection lost), log at warn and
+        # proceed with parent-level rules only — do not skip the directory.
         content = read_file(winning_peer, path / ".syncignore")
         if content:
             ignore_rules = merge(parent_ignore_rules, parse_gitignore(content))
@@ -392,6 +396,8 @@ WHERE deleted_time IS NULL
 AND id IN (SELECT id FROM subtree);
 ```
 
+`?deleted_time` is the displaced entry's own `last_seen` value (the same value used for the parent row). Using a uniform timestamp is intentional -- it conservatively dates the deletion to the last time the parent was confirmed present.
+
 **Crash recovery**: If the app exits before copies finish, destination rows have `deleted_time = NULL` and `last_seen` unchanged (NULL for first-time targets). Next run sees absent-unconfirmed, applies rule 4b: `last_seen` is NULL or old, so the copy is re-enqueued.
 
 ## Operation Queue
@@ -476,7 +482,7 @@ Connection pool changes logged at `trace` level: `url=sftp://user@host/path conn
 
 During long syncs, snapshots are periodically uploaded to peers so that progress is preserved if the connection drops. The interval is controlled by `--si` (default: 30 minutes).
 
-A process-global timer tracks elapsed time since the last snapshot upload (or since sync start). After each completed file copy, if the timer has exceeded `--si` minutes, upload all peers' snapshots using the same TMP staging + atomic rename as the final upload. The upload uses each peer's listing connection (not the transfer pool). Reset the timer after each checkpoint.
+A process-global timer tracks elapsed time since the last snapshot upload (or since sync start). After each completed file copy, if the timer has exceeded `--si` minutes, upload all peers' snapshots using the same TMP staging + atomic rename as the final upload (including WAL checkpoint before reading the `.db` file -- see database.md). The upload uses each peer's listing connection (not the transfer pool). Reset the timer after each checkpoint.
 
 This is safe because the snapshot always reflects decided state. Pending copies have `last_seen=NULL`, so rule 4b (absent-unconfirmed) re-enqueues them on the next run. A checkpoint snapshot is always in a valid recovery state.
 
