@@ -9,6 +9,12 @@ sandboxes/
 tools/
 creds/
 
+# =============================================================================
+# Released binaries (always track — overrides *.exe etc. below)
+# =============================================================================
+!released/
+!released/*
+
 # AI agent instructions (local only)
 CLAUDE.md
 CODEX.md
