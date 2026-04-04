@@ -17,11 +17,12 @@ import (
 )
 
 type Watcher struct {
-	eng      *engine.Engine
-	peers    []*engine.SyncPeer
-	watcher  *fsnotify.Watcher
-	inflight sync.Map
-	stopCh   chan struct{}
+	eng          *engine.Engine
+	peers        []*engine.SyncPeer
+	watcher      *fsnotify.Watcher
+	inflight     sync.Map
+	stopCh       chan struct{}
+	watchSession *engine.WatchSession
 }
 
 func New(eng *engine.Engine, peers []*engine.SyncPeer) *Watcher {
@@ -58,6 +59,7 @@ func (w *Watcher) Start() error {
 		return errors.New("no local peers could be watched")
 	}
 
+	w.watchSession = w.eng.NewWatchSession()
 	go w.eventLoop()
 	return nil
 }
@@ -66,6 +68,9 @@ func (w *Watcher) Stop() {
 	close(w.stopCh)
 	if w.watcher != nil {
 		w.watcher.Close()
+	}
+	if w.watchSession != nil {
+		w.watchSession.Close()
 	}
 }
 
@@ -141,11 +146,8 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		}
 	}
 
-	if currentStat != nil {
-		logx.Info("W C %s", relPath)
-	} else {
-		logx.Info("W X %s", relPath)
-	}
+	// Run per-entry decision and execution
+	w.watchSession.SyncEntry(relPath)
 }
 
 func init() {

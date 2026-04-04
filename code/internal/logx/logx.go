@@ -3,6 +3,7 @@ package logx
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 type Level int
@@ -35,11 +36,17 @@ func SetLevel(s string) error {
 	return nil
 }
 
+func timestamp() string {
+	now := time.Now().UTC()
+	return now.Format("2006-01-02_15-04-05") + fmt.Sprintf("_%06dZ", now.Nanosecond()/1000)
+}
+
 func log(level Level, format string, args ...any) {
 	if level > CurrentLevel {
 		return
 	}
-	fmt.Fprintf(os.Stdout, format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(os.Stdout, "%s %s\n", timestamp(), msg)
 }
 
 func Error(format string, args ...any) { log(LevelError, format, args...) }

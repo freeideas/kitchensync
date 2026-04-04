@@ -30,7 +30,7 @@ When there is a type conflict and a canon peer is present, the canon peer's type
 ## $REQ_DIR_006: Cascade Tombstones on Directory Displacement
 **Source:** ./specs/algorithm.md (Section: "Combined-Tree Walk")
 
-When a directory is displaced (deleted), all descendant snapshot rows are updated with `deleted_time` set. The `deleted_time` is the displaced entry's own `last_seen` value.
+When a directory is displaced (deleted), all descendant snapshot rows are updated with `deleted_time` set. The `deleted_time` is the displaced entry's own `last_seen` value. The cascade MUST traverse through descendant rows that already have `deleted_time` set (do not filter on `deleted_time IS NULL` during traversal).
 
 ## $REQ_DIR_007: Directory Creation is Inline
 **Source:** ./specs/algorithm.md (Section: "Combined-Tree Walk")

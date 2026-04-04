@@ -56,3 +56,5 @@ A peer without an existing snapshot is automatically treated as subordinate (rec
 **Source:** ./specs/algorithm.md (Section: "Startup")
 
 If a peer's snapshot download fails (corrupt, permission denied, I/O error), a warning is logged, an empty snapshot is created locally, and the peer is treated as a new peer (auto-subordinate unless it is the canon peer).
+
+**Testability:** This requirement describes internal error recovery. Testing it requires sabotaging the snapshot file, which violates testing philosophy. Do not write a test for this requirement.

@@ -7,7 +7,8 @@ import (
 )
 
 type Rules struct {
-	matchers []*gitignore.GitIgnore
+	lines   []string
+	matcher *gitignore.GitIgnore
 }
 
 // BuiltinExcludes are always excluded and cannot be overridden.
@@ -16,27 +17,28 @@ var builtinExcludes = []string{".kitchensync"}
 // NewRules creates an empty rule set with the implicit .git/ pattern.
 func NewRules() *Rules {
 	// .git/ is implicitly excluded but can be negated by .syncignore
-	m := gitignore.CompileIgnoreLines(".git/")
-	return &Rules{matchers: []*gitignore.GitIgnore{m}}
+	lines := []string{".git/"}
+	m := gitignore.CompileIgnoreLines(lines...)
+	return &Rules{lines: lines, matcher: m}
 }
 
 // Merge creates a new Rules that includes parent rules plus new patterns from a .syncignore file.
 func (r *Rules) Merge(content string) *Rules {
-	lines := strings.Split(content, "\n")
+	rawLines := strings.Split(content, "\n")
 	var cleaned []string
-	for _, line := range lines {
+	for _, line := range rawLines {
 		line = strings.TrimRight(line, "\r")
 		cleaned = append(cleaned, line)
 	}
-	m := gitignore.CompileIgnoreLines(cleaned...)
-	newMatchers := make([]*gitignore.GitIgnore, len(r.matchers)+1)
-	copy(newMatchers, r.matchers)
-	newMatchers[len(r.matchers)] = m
-	return &Rules{matchers: newMatchers}
+	allLines := make([]string, len(r.lines)+len(cleaned))
+	copy(allLines, r.lines)
+	copy(allLines[len(r.lines):], cleaned)
+	m := gitignore.CompileIgnoreLines(allLines...)
+	return &Rules{lines: allLines, matcher: m}
 }
 
 // Matches returns true if the given name should be excluded.
-// name is the entry basename; relPath is the path relative to the sync root.
+// name is the entry basename; isDir indicates whether it's a directory.
 func (r *Rules) Matches(name string, isDir bool) bool {
 	// Built-in excludes cannot be overridden
 	for _, excl := range builtinExcludes {
@@ -45,19 +47,11 @@ func (r *Rules) Matches(name string, isDir bool) bool {
 		}
 	}
 
-	// Check matchers in order (last match wins per gitignore semantics)
-	// We check each matcher and use the last definitive result
-	matched := false
-	for _, m := range r.matchers {
-		pathToCheck := name
-		if isDir {
-			pathToCheck = name + "/"
-		}
-		if m.MatchesPath(pathToCheck) {
-			matched = true
-		}
+	pathToCheck := name
+	if isDir {
+		pathToCheck = name + "/"
 	}
-	return matched
+	return r.matcher.MatchesPath(pathToCheck)
 }
 
 // MatchesPath checks a relative path against the rules.
@@ -72,15 +66,9 @@ func (r *Rules) MatchesPath(relPath string, isDir bool) bool {
 		}
 	}
 
-	matched := false
-	for _, m := range r.matchers {
-		pathToCheck := relPath
-		if isDir {
-			pathToCheck = relPath + "/"
-		}
-		if m.MatchesPath(pathToCheck) {
-			matched = true
-		}
+	pathToCheck := relPath
+	if isDir {
+		pathToCheck = relPath + "/"
 	}
-	return matched
+	return r.matcher.MatchesPath(pathToCheck)
 }

@@ -37,7 +37,12 @@ func Open(dbPath string) (*SnapshotDB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -178,12 +183,10 @@ func (s *SnapshotDB) CascadeTombstones(relPath string, deletedTime string) error
 			UNION ALL
 			SELECT s.id FROM snapshot s
 			JOIN subtree st ON s.parent_id = st.id
-			WHERE s.deleted_time IS NULL
 		)
 		UPDATE snapshot
 		SET deleted_time = ?
-		WHERE deleted_time IS NULL
-		AND id IN (SELECT id FROM subtree)`,
+		WHERE id IN (SELECT id FROM subtree)`,
 		id, deletedTime)
 	return err
 }

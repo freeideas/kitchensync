@@ -14,8 +14,8 @@ Peers:
   sftp://user:password@host/path  Inline password (prefer SSH keys)
 
 Prefix modifiers:
-  +<peer>                         Canon -- this peer's state wins all conflicts
-  -<peer>                         Subordinate -- overwritten to match the group
+  +<peer>                         Canon — this peer's state wins all conflicts
+  -<peer>                         Subordinate — overwritten to match the group
 
 Fallback URLs (multiple paths to the same data):
   [url1,url2,...]                 Try in order, first that connects wins

@@ -2,20 +2,15 @@
 
 Requirements for the contents of the `./released/` directory after a build.
 
-## $REQ_BUILD_002: Linux Binary
-**Source:** ./README.md (Section: "Building")
+## $REQ_BUILD_002: Current-Platform Binary
+**Source:** ./specs/build.md (Section: "Output")
 
-A build for Linux produces the file `./released/kitchensync.linux`.
+A default build (no flags) produces a single binary in `./released/` for the current platform:
+- Linux: `kitchensync.linux`
+- Windows: `kitchensync.exe`
+- macOS: `kitchensync.mac`
 
-## $REQ_BUILD_003: Windows Binary
-**Source:** ./README.md (Section: "Building")
-
-A build for Windows produces the file `./released/kitchensync.exe`.
-
-## $REQ_BUILD_004: macOS Binary
-**Source:** ./README.md (Section: "Building")
-
-A build for macOS produces the file `./released/kitchensync.mac`.
+Only the current platform's binary is guaranteed to exist after a default build. Binaries for other platforms may or may not be present.
 
 ## $REQ_BUILD_005: Single Binary No Dependencies
 **Source:** ./README.md (Section: "Why KitchenSync?")

@@ -55,4 +55,4 @@ When an entry is confirmed absent on a peer and the snapshot row has `deleted_ti
 ## $REQ_SNAP_012: Cascade Tombstones on Directory Displacement
 **Source:** ./specs/algorithm.md (Section: "Snapshot Updates")
 
-When a directory is displaced from a peer, `deleted_time` is set on the directory's snapshot row and recursively on all descendant rows that have `deleted_time = NULL`. The `deleted_time` value used for all rows is the displaced directory's own `last_seen`.
+When a directory is displaced from a peer, `deleted_time` is set on the directory's snapshot row and recursively on all descendant rows. The cascade MUST traverse through descendant rows that already have `deleted_time` set (do not filter on `deleted_time IS NULL` during the recursive traversal — only the final UPDATE filters on `deleted_time IS NULL`). The `deleted_time` value used for all updated rows is the displaced directory's own `last_seen`.

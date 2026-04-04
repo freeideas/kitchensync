@@ -194,6 +194,7 @@ func main() {
 		snapDB, err := db.Open(localDBPath)
 		if err != nil {
 			logx.Warn("snapshot open failed for %s: %v", sp.ActiveURL, err)
+			os.Remove(localDBPath)
 			snapDB, _ = db.Open(localDBPath)
 			snapDB.Init()
 			if !sp.IsCanon() {

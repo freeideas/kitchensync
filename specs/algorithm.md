@@ -388,7 +388,8 @@ WITH RECURSIVE subtree(id) AS (
     UNION ALL
     SELECT s.id FROM snapshot s
     JOIN subtree st ON s.parent_id = st.id
-    WHERE s.deleted_time IS NULL
+    -- NOTE: No deleted_time filter here — the traversal MUST walk through
+    -- already-tombstoned intermediate nodes to reach all descendants.
 )
 UPDATE snapshot
 SET deleted_time = ?deleted_time
@@ -397,6 +398,8 @@ AND id IN (SELECT id FROM subtree);
 ```
 
 `?deleted_time` is the displaced entry's own `last_seen` value (the same value used for the parent row). Using a uniform timestamp is intentional -- it conservatively dates the deletion to the last time the parent was confirmed present.
+
+**Important**: The recursive CTE must NOT filter on `deleted_time IS NULL` during traversal. Intermediate nodes may already be tombstoned (e.g., from a prior partial cascade or an earlier sync), but their children still need to be reached. Only the final `UPDATE` filters on `deleted_time IS NULL` to avoid overwriting existing tombstone timestamps.
 
 **Crash recovery**: If the app exits before copies finish, destination rows have `deleted_time = NULL` and `last_seen` unchanged (NULL for first-time targets). Next run sees absent-unconfirmed, applies rule 4b: `last_seen` is NULL or old, so the copy is re-enqueued.
 

@@ -150,8 +150,11 @@ def main():
         print("✗ Go verification failed")
         sys.exit(1)
 
-    # Step 2: Ensure released/ exists
-    os.makedirs(RELEASED_DIR, exist_ok=True)
+    # Step 2: Delete and recreate released/
+    import shutil
+    if os.path.exists(RELEASED_DIR):
+        shutil.rmtree(RELEASED_DIR)
+    os.makedirs(RELEASED_DIR)
 
     # Step 3: go mod tidy
     print("Running go mod tidy...")
@@ -164,11 +167,6 @@ def main():
     # Step 4: Build
     cur = current_platform()
     cur_info = PLATFORMS[cur]
-
-    # Delete current platform binary only
-    cur_binary = os.path.join(RELEASED_DIR, cur_info["binary"])
-    if os.path.exists(cur_binary):
-        os.remove(cur_binary)
 
     success = True
 

@@ -123,12 +123,18 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 	}
 	wg.Wait()
 
-	// Drop peers with errors
+	// Drop peers with errors (in dry-run, treat errors as empty listings since
+	// directories may not have been created on disk)
 	var active []*SyncPeer
 	listings := make(map[*SyncPeer]map[string]fsys.Entry)
 	for _, r := range results {
 		if r.err != nil {
-			logx.Error("listing failed for %s at %s: %v", r.peer.ActiveURL, dirPath, r.err)
+			if e.DryRun {
+				active = append(active, r.peer)
+				listings[r.peer] = make(map[string]fsys.Entry)
+			} else {
+				logx.Error("listing failed for %s at %s: %v", r.peer.ActiveURL, dirPath, r.err)
+			}
 		} else {
 			active = append(active, r.peer)
 			listings[r.peer] = r.entries
@@ -156,15 +162,14 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 		}
 	}
 
-	// Phase 2b: Resolve .syncignore first
+	// Phase 2b: Resolve .syncignore first (but keep it in nameSet for normal sync)
 	rules := parentRules
 	if nameSet[".syncignore"] {
-		// Read winning .syncignore (newest among contributing peers)
-		content := e.readWinningSyncIgnore(contributing, listings, dirPath)
+		// Read winning .syncignore (canon wins, or newest among contributing peers)
+		content := e.readWinningSyncIgnore(contributing, listings, dirPath, e.canonPeer(active))
 		if content != "" {
 			rules = parentRules.Merge(content)
 		}
-		delete(nameSet, ".syncignore")
 	}
 
 	// Sort names for deterministic order
@@ -270,6 +275,8 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 		if *entryIsDir {
 			decision := decideDir(canon, contributing, states)
 
+			displacedPeers := make(map[*SyncPeer]bool)
+			pushedPeers := make(map[*SyncPeer]bool)
 			recursionPeers := []*SyncPeer{}
 			for _, peer := range active {
 				listing := listings[peer]
@@ -290,9 +297,14 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 						logx.Error("displace dir failed %s on %s: %v", entryPath, peer.ActiveURL, err)
 						continue
 					}
-					// Cascade tombstones
-					now := ts.Now()
-					peer.Snapshot.CascadeTombstones(entryPath, now)
+					// Cascade tombstones — use the directory's own last_seen (REQ_SNAP_012)
+					cascadeTime := ts.Now()
+					dirRow, _ := peer.Snapshot.Lookup(entryPath)
+					if dirRow != nil && dirRow.LastSeen.Valid {
+						cascadeTime = dirRow.LastSeen.String
+					}
+					peer.Snapshot.CascadeTombstones(entryPath, cascadeTime)
+					displacedPeers[peer] = true
 					continue
 				}
 
@@ -302,6 +314,7 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 					}
 					now := ts.Now()
 					peer.Snapshot.Upsert(entryPath, parentRelPath, name, ts.Format(time.Now().UTC()), -1, &now, nil)
+					pushedPeers[peer] = true
 					recursionPeers = append(recursionPeers, peer)
 				} else if exists && entry.IsDir {
 					recursionPeers = append(recursionPeers, peer)
@@ -311,6 +324,9 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 			// Update snapshot for present dirs
 			now := ts.Now()
 			for _, p := range active {
+				if displacedPeers[p] || pushedPeers[p] {
+					continue
+				}
 				entry, exists := listings[p][name]
 				if exists && entry.IsDir {
 					p.Snapshot.Upsert(entryPath, parentRelPath, name,
@@ -359,9 +375,13 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 			switch decision.Action {
 			case ActionPush:
 				if decision.SrcPeer != nil {
-					logx.Info("C %s", entryPath)
+					logged := false
 					// Enqueue copies to contributing targets
 					for _, dst := range decision.Targets {
+						if !logged {
+							logx.Info("C %s", entryPath)
+							logged = true
+						}
 						// Displace if dst has directory
 						if entry, ok := listings[dst][name]; ok && entry.IsDir {
 							displaceEntry(dst, entryPath, e.DryRun)
@@ -398,6 +418,10 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 							}
 						}
 						if needsCopy {
+							if !logged {
+								logx.Info("C %s", entryPath)
+								logged = true
+							}
 							sub.Snapshot.Upsert(entryPath, parentRelPath, name,
 								ts.Format(decision.SrcMod), decision.SrcSize, nil, nil)
 							if !e.DryRun && e.CopyQueue != nil {
@@ -453,6 +477,32 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 		}
 	}
 
+	// Phase 3b: Tombstone snapshot entries not found in any listing
+	snapshotParent := dirPath
+	if snapshotParent == "" {
+		snapshotParent = db.SentinelPath
+	}
+	for _, p := range active {
+		children, err := p.Snapshot.ChildrenOf(snapshotParent)
+		if err != nil {
+			continue
+		}
+		for _, child := range children {
+			if nameSet[child.Basename] {
+				continue
+			}
+			if child.DeletedTime.Valid {
+				continue
+			}
+			childPath := db.RelPath(dirPath, child.Basename)
+			ls := ts.Now()
+			if child.LastSeen.Valid {
+				ls = child.LastSeen.String
+			}
+			p.Snapshot.SetDeletedTime(childPath, ls)
+		}
+	}
+
 	// Phase 4: BAK/TMP cleanup at this level
 	if !e.DryRun {
 		for _, peer := range active {
@@ -480,15 +530,28 @@ func (e *Engine) syncDirectory(peers []*SyncPeer, dirPath string, parentRules *i
 	}
 }
 
-func (e *Engine) readWinningSyncIgnore(contributing []*SyncPeer, listings map[*SyncPeer]map[string]fsys.Entry, dirPath string) string {
-	// Find the winning peer for .syncignore (newest mod_time among contributing)
+func (e *Engine) readWinningSyncIgnore(contributing []*SyncPeer, listings map[*SyncPeer]map[string]fsys.Entry, dirPath string, canon *SyncPeer) string {
+	// Find the winning peer for .syncignore (canon wins, or newest mod_time among contributing)
 	var bestPeer *SyncPeer
 	var bestMod time.Time
-	for _, p := range contributing {
-		entry, ok := listings[p][".syncignore"]
-		if ok && !entry.IsDir && entry.ModTime.After(bestMod) {
+
+	// If canon has a .syncignore file, it wins unconditionally
+	if canon != nil {
+		entry, ok := listings[canon][".syncignore"]
+		if ok && !entry.IsDir {
+			bestPeer = canon
 			bestMod = entry.ModTime
-			bestPeer = p
+		}
+	}
+
+	// Otherwise pick newest mod_time among contributing peers
+	if bestPeer == nil {
+		for _, p := range contributing {
+			entry, ok := listings[p][".syncignore"]
+			if ok && !entry.IsDir && entry.ModTime.After(bestMod) {
+				bestMod = entry.ModTime
+				bestPeer = p
+			}
 		}
 	}
 	if bestPeer == nil {
