@@ -1,14 +1,30 @@
 # =============================================================================
-# ai-coder managed directories (do not track)
+# aitc framework (lives in its own repo — push-aitc.py / pull-aitc.py)
 # =============================================================================
-ai-coder/
+aitc/
+
+# =============================================================================
+# aitc-managed / generated artifacts (do not track)
+# =============================================================================
 tmp/
 reports/
-tests/
+state/
+build/
+subpjx/
 sandboxes/
 tools/
 creds/
 
+# aitc on-disk state markers and locks
+.orchestrator.lock
+orchestrator.log
+orchestrator.log.*
+*_DIR.hash
+*_REQFIX.hash
+*_BUILD_*.hash
+_*.hash
+LAST_FAILURE.md
+retries.json
 
 # AI agent instructions (local only)
 CLAUDE.md
@@ -30,7 +46,6 @@ env/
 .egg-info/
 *.egg
 dist/
-build/
 *.whl
 
 # =============================================================================
@@ -73,6 +88,14 @@ yarn-debug.log*
 yarn-error.log*
 package-lock.json
 yarn.lock
+
+# =============================================================================
+# Java / JVM
+# =============================================================================
+*.class
+*.jar
+*.war
+*.ear
 
 # =============================================================================
 # IDE and editors
@@ -120,7 +143,7 @@ secrets.json
 credentials.json
 
 # =============================================================================
-# Released binaries (must come LAST to override *.exe, *.bak, etc.)
+# Released binaries (must come LAST to override *.exe, *.jar, *.bak, etc.)
 # =============================================================================
 !released/
 !released/*
