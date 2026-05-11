@@ -20,8 +20,12 @@ function sync_directory(peers, path):
         log(error, "listing failed for {p} at {path}, excluding from this subtree")
     active_peers = peers - failed
 
-    // Phase 2: Union entry names across contributing peers only
+    // If all contributing peers failed listing, skip this directory entirely
     contributing = [p for p in active_peers if not p.is_subordinate]
+    if not contributing:
+        return  // no decisions, no subordinate file displacement
+
+    // Phase 2: Union entry names across contributing peers only
     all_names = union(contributing.listings.keys())
     // Also include names from subordinate peers (for cleanup), but they don't add to decisions
     all_names = all_names | union(subordinate.listings.keys() for subordinate in active_peers if subordinate.is_subordinate)
@@ -71,7 +75,7 @@ function sync_directory(peers, path):
 
 **Directory deletion:** Do not recurse into a directory that is being displaced on a peer. The displacement moves the entire subtree in a single rename, and the snapshot cascade marks all children as deleted. Only peers that are keeping the directory participate in recursion. Because the traversal is pre-order (decide every entry before recursing), a displaced directory is always renamed as a whole before any of its children are visited — never split files and directories into separate passes.
 
-**Listing errors:** If `list_directory` fails for a specific path on a reachable peer, that peer is excluded from decisions for that directory and its entire subtree (equivalent to an offline peer for that path). The error is logged at `error` level. The peer's snapshot rows for that subtree are not modified — `last_seen` is not updated, so no false deletions are inferred.
+**Listing errors:** If `list_directory` fails for a specific path on a reachable peer, that peer is excluded from decisions for that directory and its entire subtree (equivalent to an offline peer for that path). The error is logged at `error` level. The peer's snapshot rows for that subtree are not modified — `last_seen` is not updated, so no false deletions are inferred. If all contributing peers fail listing for a directory (none of the contributing peers remain in `active_peers` for that level), skip decisions for that directory and its entire subtree — no entries are processed and no subordinate peer files are displaced.
 
 ## Subordinate Peers
 
@@ -157,7 +161,7 @@ Directories do not use mod_time for decision-making. Directory mod_times are fil
 
 Directory decisions are existence-based only:
 - If any contributing peer has the directory, it should exist on all peers. Create it on peers that lack it.
-- If all contributing peers have deleted the directory (tombstone in snapshot, absent in listing), delete it on remaining peers (displace to BAK/).
+- If all contributing peers that have a snapshot row for the directory have deleted it (tombstone in snapshot, absent in listing), delete it on all remaining peers (displace to BAK/). A contributing peer with no snapshot row for the directory has no opinion and does not block deletion — consistent with the file decision rules where no-row peers do not vote.
 - Canon peer (`+`) overrides as usual: canon has it → create everywhere; canon lacks it → delete everywhere.
 
 Directories are displaced to BAK/ just like files. The snapshot still tracks directories (with `byte_size = -1`) for deletion detection via tombstones, but `mod_time` for directory rows is informational only — it is recorded but not used in decisions.

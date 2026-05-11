@@ -31,16 +31,17 @@ The `+`/`-` prefix goes on the bracket, not on individual URLs inside.
 
 ### Per-URL Settings
 
-Query-string parameters on a URL override global settings for that URL's connection:
+Query-string parameters on a URL override global settings (see concurrency.md for which settings apply per-connection vs per-pool):
 
 ```
 "sftp://host/path?mc=5&ct=60"
 ```
 
-| Param | Meaning            | Global flag |
-| ----- | ------------------ | ----------- |
-| `mc`  | Max connections    | `--mc`      |
-| `ct`  | Connection timeout | `--ct`      |
+| Param | Meaning             | Global flag |
+| ----- | ------------------- | ----------- |
+| `mc`  | Max connections     | `--mc`      |
+| `ct`  | Connection timeout  | `--ct`      |
+| `ka`  | Idle keep-alive TTL | `--ka`      |
 
 Query-string parameters are stripped during URL normalization — they are not part of the URL's identity.
 
@@ -50,6 +51,7 @@ Query-string parameters are stripped during URL normalization — they are not p
 | ------ | ------- | ----------------------------------- |
 | `--mc` | 10      | Max concurrent connections per URL  |
 | `--ct` | 30      | Seconds for SSH handshake timeout   |
+| `--ka` | 30      | SFTP idle keep-alive TTL (seconds)  |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
 | `--xd` | 2       | Delete stale TMP staging after N days |
 | `--bd` | 90      | Delete displaced files (BAK/) after N days |
@@ -95,12 +97,12 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 
 ## Startup
 
-1. Parse command line. Validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--xd`, `--bd`, and `--td` are positive integers; `-vl` is one of `error`/`info`/`debug`/`trace`). On any validation error, print the error message followed by the help text and exit 1.
+1. Parse command line. Validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--ka`, `--xd`, `--bd`, and `--td` are positive integers; `-vl` is one of `error`/`info`/`debug`/`trace`). On any validation error, print the error message followed by the help text and exit 1.
 2. Connect to all peers in parallel. Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. Skip unreachable peers with a warning. If directory creation fails, treat the peer as unreachable (try next fallback URL).
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
-5. Download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). If a peer has no `snapshot.db`, create a new empty one locally.
-6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new empty database was created in step 5) are automatically treated as subordinate. If no peer has any snapshot data and no canon peer (`+`) is designated, exit with error: there must be at least one contributing peer (suggest `+`).
+5. Download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). If a peer has no `snapshot.db` (transport returns 'not found'), create a new empty one locally. If the download fails with any other error (I/O error, permission denied), treat the peer as unreachable: warn and exclude it from the reachable set, then re-evaluate steps 3–4 against the updated set and exit with the corresponding error if either check now fails.
+6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new empty database was created in step 5) are automatically treated as subordinate. If no peer has any snapshot data and no canon peer (`+`) is designated, print `First sync? Mark the authoritative peer with a leading +` and exit 1.
 7. If no contributing (non-subordinate) peer is reachable after auto-subordination, exit with error: `No contributing peer reachable — cannot make sync decisions`
 
 ## Run
@@ -122,7 +124,7 @@ File copies are enqueued during the combined-tree walk and executed concurrently
 
 ### File Copy
 
-Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's active URL pool and one from the destination peer's active URL pool before starting (see concurrency.md).
+Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting (see concurrency.md for pool semantics — SFTP pools are keyed by user+host, so two SFTP peers that share user+host share a pool; `file://` peers have no pool).
 
 1. **Transfer** to TMP staging on destination: `<target-parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>`
 2. **If** the destination already has a file at the target path, **displace** it to `<file-parent>/.kitchensync/BAK/<timestamp>/<basename>`
@@ -134,7 +136,7 @@ Content is streamed, not buffered entirely in memory. Each transfer spawns two c
 
 ### Displace to BAK
 
-Each displacement is a `(peer, path)` pair executed inline during the combined-tree walk. The entry at `path` is renamed to `<parent>/.kitchensync/BAK/<timestamp>/<basename>`. A displaced directory is moved as a single rename, preserving its entire subtree.
+Each displacement is a `(peer, path)` pair executed inline during the combined-tree walk. Before performing the rename, create the destination directory (`<parent>/.kitchensync/BAK/<timestamp>/`) and any missing parents if it does not already exist. The entry at `path` is renamed to `<parent>/.kitchensync/BAK/<timestamp>/<basename>`. A displaced directory is moved as a single rename, preserving its entire subtree.
 
 ## Logging
 
@@ -157,33 +159,41 @@ Staged near the target for same-filesystem atomic rename. Inside `.kitchensync/`
 
 Displaced entries are recoverable from BAK/ until cleaned. BAK/ is created at the parent directory of each displacement (co-located in `.kitchensync/` at every directory level), not aggregated at the sync root. The `<timestamp>` in the path uses the format defined in database.md (`YYYY-MM-DD_HH-mm-ss_ffffffZ`). Cleaned after `--bd` days (default: 90).
 
-## Peer Filesystem Abstraction
+## Peer Transports
 
-All sync logic — traversal, copy workers, TMP staging, BAK displacement, cleanup — operates through a single Java interface that both `file://` and `sftp://` implement. No protocol-specific code exists outside the interface implementations.
+Each peer is reached via a transport. For `sftp://` URLs the transport is the `sftp-protocol` component (see `decomposition.md`); for `file://` URLs it is the host language's standard library, used directly. Both expose the same set of operations against the peer's filesystem; the kitchensync entry point dispatches to the right transport per peer based on the URL scheme.
 
 ### Required Operations
 
-| Operation                  | Description                                                       |
-| -------------------------- | ----------------------------------------------------------------- |
-| `list_dir(path)`           | List immediate children (name, is_dir, mod_time, byte_size). byte_size is file size in bytes for files, or −1 for directories |
-| `stat(path)`               | Return mod_time, byte_size, is_dir; or "not found"                |
-| `read_file(path)` → stream | Open file for streaming read                                      |
-| `write_file(path, stream)` | Create/overwrite file from stream, creating parent dirs as needed |
-| `rename(src, dst)`         | Same-filesystem rename (for TMP → final swap)                    |
-| `delete_file(path)`        | Remove a file                                                     |
-| `create_dir(path)`         | Create directory (and parents as needed)                          |
-| `delete_dir(path)`         | Remove empty directory                                            |
-| `set_mod_time(path, time)` | Set file/directory modification time                              |
+Every transport must support:
+
+| Operation                      | Description                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------- |
+| `list_dir(path)`               | List immediate children (name, is_dir, mod_time, byte_size). byte_size is file size in bytes for files, or −1 for directories |
+| `stat(path)`                   | Return mod_time, byte_size, is_dir; or "not found"                              |
+| `open_read(path)` → handle     | Open a file for streaming read                                                  |
+| `read(handle, max_bytes)`      | Pull the next chunk; returns bytes or EOF                                       |
+| `close_read(handle)`           | Close a read handle                                                             |
+| `open_write(path)` → handle    | Open a file for streaming write (creates the file and parent dirs as needed)    |
+| `write(handle, bytes)`         | Push the next chunk                                                             |
+| `close_write(handle)`          | Finalize the write (flush + close)                                              |
+| `rename(src, dst)`             | Same-filesystem rename (for TMP → final swap)                                  |
+| `delete_file(path)`            | Remove a file                                                                   |
+| `create_dir(path)`             | Create directory (and parents as needed)                                        |
+| `delete_dir(path)`             | Remove empty directory                                                          |
+| `set_mod_time(path, time)`     | Set file/directory modification time                                            |
 
 `list_dir` returns only regular files and directories. Symbolic links, special files (devices, FIFOs, sockets), and any other non-regular entry types are silently omitted by the implementation. The same applies to `stat`: if the path is a symlink or special file, return "not found."
 
+The streaming pipeline (two concurrent tasks connected by a bounded channel — see §"File Copy") is implemented above the transports, not inside either one. The pipeline's reader task loops `source.read(handle, ...)` → channel; the writer task loops channel → `dest.write(handle, ...)`. Each transport just provides the chunk-level primitives.
+
 ### Error Semantics
 
-All operations return the same error types regardless of transport: not found, permission denied, I/O error. The sync logic never matches on transport-specific errors. Network failures (connection drop, timeout) surface as I/O errors — the sync logic doesn't distinguish "disk read failed" from "SFTP channel died."
+All operations return the same error categories regardless of transport: not found, permission denied, I/O error. Sync logic never matches on transport-specific errors. Network failures (connection drop, timeout) surface as I/O errors — sync logic doesn't distinguish "disk read failed" from "SFTP channel died."
 
-### Why This Matters
+### Testability
 
-This is the sole mechanism that lets us test with `file://` and trust the result for `sftp://`. If any sync logic reaches around the interface to do something protocol-specific, that code is untested. The rule is absolute: if it touches a peer's filesystem, it goes through the interface.
+Each transport is independently testable via its own component-level interface (the `sftp-protocol` component exposes its surface for direct testing; the file-stdlib path is exercised by end-to-end tests with `file://` peers). The full sync is tested end-to-end via the CLI with mixed transports — typical end-to-end tests use `file://` peers under a temporary directory; additional tests exercise `sftp://` peers against localhost. See `TESTING-GUIDELINES.md`.
 
 ## Errors
 
@@ -195,6 +205,7 @@ This is the sole mechanism that lets us test with `file://` and trust the result
 - **Transfer failure** → log, skip file (re-discovered next run)
 - **Displacement failure** (cannot rename to BAK/) → log error, skip the displacement (file remains in place). If the displacement was part of a file copy sequence, the copy is also skipped (TMP staging file is cleaned up)
 - **TMP staging failure** (cannot create staging directory or write staging file) → treat as transfer failure
+- **`set_mod_time` failure** (after a completed copy — file is already in place) → log warning; the copy is not undone. The destination snapshot row already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
 - **Snapshot upload failure** → log error, leave TMP staging file for `--xd` cleanup (peer's snapshot will be stale on next run, leading to redundant but correct copies)
 
 ## Case Sensitivity

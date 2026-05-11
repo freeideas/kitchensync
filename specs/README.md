@@ -98,6 +98,7 @@ java -jar kitchensync.jar --mc 5 --ct 60 c:/photos sftp://host/photos
 | ------ | ------- | ------------------------------------------- |
 | `--mc` | 10      | Max concurrent connections per URL          |
 | `--ct` | 30      | SSH handshake timeout (seconds)             |
+| `--ka` | 30      | SFTP idle keep-alive TTL (seconds)          |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
 | `--xd` | 2       | Delete stale staging after N days           |
 | `--bd` | 90      | Delete displaced files after N days         |

@@ -6,7 +6,7 @@ How KitchenSync excludes files from synchronization.
 
 Any directory may contain a `.syncignore` file listing patterns of files and directories to exclude from sync. Patterns apply to the directory containing the `.syncignore` and its subdirectories.
 
-`.syncignore` files are themselves synced like any other file — they participate in normal decision rules (canon wins, or newest mod_time wins). This keeps ignore rules consistent across all peers.
+`.syncignore` files participate in normal decision rules (canon wins, or newest mod_time wins), keeping ignore rules consistent across all peers. Unlike other files, `.syncignore` is not subject to exclusion by ignore patterns accumulated from parent directories — it is always resolved before any filtering is applied at its directory level.
 
 ## Resolution During the Multi-Tree Walk
 

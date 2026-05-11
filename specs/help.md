@@ -27,12 +27,14 @@ Fallback URLs (multiple paths to the same data):
 Per-URL settings (query string, inside quotes):
   "sftp://host/path?mc=5"          Max connections for this URL
   "sftp://host/path?ct=60"         Connection timeout for this URL
-  "sftp://host/path?mc=5&ct=60"    Both
+  "sftp://host/path?ka=10"         SFTP idle keep-alive TTL for this URL
+  "sftp://host/path?mc=5&ct=60"    Combine multiple
 
 Options:
   -h, --help, /?                      Show this help
   --mc N             Max concurrent connections per URL (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
+  --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
   --xd N             Delete stale TMP staging after N days (default: 2)
   --bd N             Delete displaced files (BAK/) after N days (default: 90)

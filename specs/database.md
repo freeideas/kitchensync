@@ -35,6 +35,7 @@ URLs are normalized before any comparison or lookup:
 - `file://` URLs: resolve to absolute path (from cwd)
 - Percent-decode unreserved characters
 - Strip query-string parameters (per-URL settings like `?mc=5` are not part of the identity)
+- SFTP URLs with no username: insert the current OS user
 
 Examples:
 - `c:/photos/` → `file:///c:/photos`
@@ -42,6 +43,7 @@ Examples:
 - `SFTP://Host:22/path/` → `sftp://host/path`
 - `sftp://host//docs/` → `sftp://host/docs`
 - `sftp://host/path?mc=5` → `sftp://host/path`
+- `sftp://host/path` (running as `ace`) → `sftp://ace@host/path`
 
 ## Tombstones
 

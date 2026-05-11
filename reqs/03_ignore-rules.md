@@ -2,17 +2,16 @@
 
 ## Behavior
 
-Each directory may contain a `.syncignore` listing patterns to exclude from sync, with the same syntax as `.gitignore`. `.syncignore` itself participates in normal decision rules and is resolved before other entries at each level. Some entries are built-in excluded regardless of `.syncignore`. Derived from `./specs/ignore.md` and `./specs/multi-tree-sync.md` (`Built-in Excludes`, `.syncignore` resolution paragraph).
+KitchenSync excludes files from sync via two mechanisms: per-directory `.syncignore` files (gitignore-style patterns, synced as normal entries) and a hard-coded set of built-in excludes (`.kitchensync/` metadata, symbolic links, special files). `.git/` is excluded by default but can be re-enabled per-directory via `.syncignore`. Derived from `specs/ignore.md` and `specs/multi-tree-sync.md` §"Algorithm" Phase 2b and §"Built-in Excludes".
 
 ## $REQ_IDs
-- `03.61` — A pattern in a directory's `.syncignore` (e.g., `*.log`) excludes matching entries in that directory from being synced (no copy, no displacement, no snapshot row).
-- `03.62` — A directory pattern (e.g., `build/`) in `.syncignore` excludes that directory and all its descendants from sync at and below the directory containing the `.syncignore`.
-- `03.63` — `.syncignore` patterns at deeper levels add to (and may override) parent-level patterns; `**/temp` matches in any subdirectory.
-- `03.64` — A `!pattern` line negates a previous match (the entry is included again).
-- `03.65` — A `.syncignore` file itself is synced like any other file (newest wins, canon wins).
-- `03.66` — At each directory level, `.syncignore` is decided and, when changed, propagated before other entries are evaluated, so the just-synced rules apply to the rest of that level's entries.
-- `03.67` — `.kitchensync/` directories are never listed for sync, never copied between peers, and cannot be re-included by a `.syncignore` rule.
-- `03.68` — Symbolic links (file or directory) are never synced and cannot be re-included by any `.syncignore` rule.
-- `03.69` — Special files (devices, FIFOs, sockets) are never synced and cannot be re-included by any `.syncignore` rule.
-- `03.70` — `.git/` directories are excluded by default but a `.syncignore` line `!.git/` re-includes them.
-- `03.71` — If the winning `.syncignore` at a directory level cannot be read, a warning is logged and that directory is processed using only the accumulated parent-level ignore rules (the rest of the run continues normally).
+- `03.43` — A `.syncignore` file in the union at a directory level is decided and synced first, using the normal decision rules, before other entries are filtered.
+- `03.44` — The winning `.syncignore`'s patterns are combined with accumulated parent-directory ignore rules and applied to the remaining union entries; matching entries are skipped (no decisions, no copies, no snapshot updates).
+- `03.45` — `.syncignore` itself is never filtered out by parent ignore rules — it is always resolved before filtering applies at its level.
+- `03.46` — `.syncignore` accepts gitignore pattern syntax: extension globs (`*.log`), directory patterns (`build/`), negation (`!important.log`), and `**` for any-subdirectory matches.
+- `03.47` — Ignore rules accumulate down the tree: patterns at deeper levels add to and can override patterns from parent directories.
+- `03.48` — If reading the winning `.syncignore` fails at a directory level, a warning is logged and only the accumulated parent ignore rules are used for that directory.
+- `03.49` — `.kitchensync/` directories are always excluded from sync and cannot be overridden by any `.syncignore` pattern.
+- `03.50` — `.git/` directories are excluded by default but can be synced by adding a negating entry such as `!.git/` to `.syncignore`.
+- `03.51` — Symbolic links (both file and directory targets) are always excluded from sync and cannot be overridden by any `.syncignore` pattern.
+- `03.52` — Special files (devices, FIFOs, sockets) are always excluded from sync and cannot be overridden by any `.syncignore` pattern.
