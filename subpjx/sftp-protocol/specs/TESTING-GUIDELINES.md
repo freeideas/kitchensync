@@ -2,11 +2,11 @@
 
 ## Strategy
 
-Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current user, using `sftp://ace@localhost/home/ace/Desktop/prjx/kitchensync/tmp/testks/` and subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
+Tests use `file://` URLs and `sftp://` URLs. SFTP tests connect to localhost as the current OS user. Tests resolve the absolute path to `./tmp/testks/` in the project root at startup and use subdirectories beneath it as peer roots. This directory is reserved for test use and may be created, populated, and cleaned up by tests freely.
 
 ## What Tests Should Cover
 
-Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdirectories under `/home/ace/Desktop/prjx/kitchensync/tmp/testks/`):
+Using `file://` URLs (with temporary directories) and `sftp://` URLs (with subdirectories under `./tmp/testks/` in the project root):
 
 - **Multi-tree traversal** — parallel listing, union, correct decisions across N peers
 - **Decision rules** — timestamp-based (newer wins, ties keep data), canon peer (`+`) override
@@ -30,7 +30,7 @@ Tests are Python scripts in `./tests/`. Each test:
 
 1. Creates temporary directories for simulated peers
 2. Sets up initial file states (and optionally pre-populates `.kitchensync/snapshot.db` for peers with history)
-3. Runs `kitchensync <peer> <peer> [options]` with appropriate `+`/`-` prefixes
+3. Runs `java -jar kitchensync.jar <peer> <peer> [options]` with appropriate `+`/`-` prefixes
 4. Verifies outcomes (files synced, snapshot correct, BAK/ contents)
 5. Cleans up
 

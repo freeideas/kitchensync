@@ -1,56 +1,71 @@
-# Per-peer snapshot database — schema, path hashing, timestamp formatting, and tombstone cascade.
+# Path observation record store
 
 ## Purpose
-Every peer carries a local SQLite snapshot at `.kitchensync/snapshot.db` that records what that peer had, or has had, at every path. The snapshot database component owns the schema, the path-hash identity scheme, the timestamp string format, and the tombstone/cascade mechanics for a single such file. It is a pure local-storage component: open a database file, read and write rows, hash paths, format timestamps. It does no networking, no listing, no copying, no decision-making — those are the orchestrator's concerns. It is consulted before traversal acts and updated as decisions are made.
+
+A per-tree database that records observation history for each path in a directory tree. For each path observed, the store remembers the path's most recently observed modification time and byte size, when it was last confirmed present, and (if currently absent) when its disappearance was first noted. Storage is a single SQLite database file containing exactly one table. The store also exposes a deterministic path-identity function over UTF-8 path strings and a process-monotonic UTC timestamp generator in a canonical filesystem-safe format. Pure data-layer library — no networking, no concurrency primitives beyond what SQLite itself provides.
 
 ## API surface
 
-The component exposes four groups of operations, all scoped to a single open snapshot database handle.
+### Store lifecycle
 
-### Lifecycle
+- `open(file)` → handle — open the database at the given filesystem path. If the file does not exist, create it and initialize its schema. Subsequent opens reuse the existing file.
+- `close(handle)` — close the database.
 
-- **Open** a snapshot database at a given local filesystem path. If the file does not exist, create it with the schema below. If it exists, verify the schema and open it for reading and writing. Returns a handle. The file is opened with WAL journal mode and foreign keys enabled.
-- **Close** a handle, flushing any pending writes.
+### Record shape
 
-### Identity and timestamp helpers
+A record represents one path's observation history:
 
-- **Hash a path** — given a relative path string (forward slashes, no leading or trailing slash), return an 11-character base62 identifier: xxHash64 with seed 0, encoded with digits `0-9`, uppercase `A-Z`, lowercase `a-z`, zero-padded to 11 characters. Files and directories hash identically — the `byte_size` field distinguishes them.
-- **Root parent sentinel** — the parent-id value used for entries directly under the sync root, defined as the hash of the literal string `/`.
-- **Current timestamp** — return the current UTC time formatted as `YYYY-MM-DD_HH-mm-ss_ffffffZ` (microsecond precision, filesystem-safe, lexicographically sortable). Within a single open handle, the returned value is strictly monotonic: if a caller requests two timestamps and the clock has not advanced, the second value is one microsecond after the first.
+| Field          | Type                       | Notes                                                                                                                                              |
+| -------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`           | 11-char string             | Path identity for this path (see §"Path identity")                                                                                                  |
+| `parent_id`    | 11-char string             | Path identity of this path's parent directory; for top-level entries, the identity of the sentinel root `/`                                         |
+| `basename`     | string                     | The path's final component                                                                                                                          |
+| `mod_time`     | timestamp string           | Last observed modification time (see §"Timestamps")                                                                                                 |
+| `byte_size`    | integer                    | File size in bytes for files; `-1` for directories                                                                                                  |
+| `last_seen`    | timestamp string or null   | The most recent time the path was confirmed present. Null when a decision has been recorded for the path but its presence has not yet been confirmed |
+| `deleted_time` | timestamp string or null   | Null while the path is considered present. Non-null timestamp string when the path is tombstoned                                                    |
 
-### Row operations
+The on-disk table is named `snapshot` (singular, lowercase). It is the only table the library creates or queries. Indexes exist on `parent_id`, `last_seen`, and `deleted_time`.
 
-A snapshot row carries: `id`, `parent_id`, `basename`, `mod_time`, `byte_size`, `last_seen`, `deleted_time`. `byte_size` is bytes for files and `-1` for directories. `last_seen` and `deleted_time` may be NULL. Timestamps in stored rows use the format above. A row with `deleted_time IS NOT NULL` is a tombstone.
+### Record operations
 
-- **Lookup row by id** — return the row for a given id, or nothing if no row exists.
-- **List child rows** — return all rows whose `parent_id` matches a given id. The caller uses this to learn which paths the snapshot has under a directory.
-- **Upsert a confirmed-present row** — given relative path, basename, mod_time, byte_size, and a confirmation timestamp, write or replace the row so that the recorded mod_time and byte_size match the supplied values, `last_seen` is set to the supplied confirmation timestamp, and `deleted_time` is cleared. Used when traversal observes an entry on the peer, or when a copy completes on the peer.
-- **Upsert a decided-but-unconfirmed row** — given relative path, basename, mod_time, byte_size, write or replace the row with the supplied mod_time and byte_size and `deleted_time` cleared, **without** modifying `last_seen` (preserve any existing value; leave NULL if no prior row). Used when the peer is decided as a copy destination, before the copy has completed.
-- **Mark a copy completed** — set `last_seen` on the row for a given path to the supplied confirmation timestamp.
-- **Mark an entry absent** — given the path of an entry confirmed absent on the peer: if a row exists with `deleted_time IS NULL`, set `deleted_time` to that row's current `last_seen` value and leave `last_seen` unchanged. If `deleted_time` is already set, do nothing (idempotent). If no row exists, do nothing.
-- **Cascade-tombstone a subtree** — given the id of a displaced directory and a tombstone timestamp, set `deleted_time` to the supplied timestamp for every descendant row reachable through `parent_id` links from that id whose `deleted_time IS NULL`. The implementation uses a recursive walk down the `parent_id` graph so that only true descendants of the displaced entry are affected — unrelated rows whose ancestor happens to be tombstoned are not touched.
+- `upsert_observed(handle, path, mod_time, byte_size, is_dir, now)` — record that `path` was directly observed present. Insert or update the row with `mod_time`, `byte_size` (`-1` if `is_dir`, the file size otherwise), `last_seen = now`, and `deleted_time = null`. `basename` and `parent_id` are derived from `path` by the library; the caller does not supply them.
+- `record_decided(handle, path, mod_time, byte_size, is_dir)` — record that a decision has been made about `path` but its presence is not yet confirmed (e.g., a transfer has been chosen but has not yet completed). Insert or update the row with `mod_time`, `byte_size`, and `deleted_time = null`. **Do not** modify `last_seen` — leave it null on insert and unchanged on update.
+- `confirm_present(handle, path, now)` — set `last_seen = now` on the existing row at `path`; other fields unchanged. No-op if no row exists.
+- `mark_subtree_deleted(handle, path, deleted_time)` — atomically set `deleted_time` on the row at `path` and on every transitive descendant whose current `deleted_time` is null. The descendant chain is followed through the `parent_id → id` relationship rooted at `path`'s identity. Rows whose `deleted_time` is already non-null are left untouched. If no row exists at `path`, no-op.
+- `lookup(handle, path)` → record or none
+- `list_children(handle, parent_path)` → list of records — every row whose `parent_id` equals the identity of `parent_path`. The caller may pass `/` (or the empty string) to list the root's immediate children.
 
 ### Purge
 
-- **Purge stale rows** — given a cutoff timestamp, delete rows that satisfy either of:
-  - `deleted_time IS NOT NULL AND deleted_time < cutoff` (expired tombstones), or
-  - `deleted_time IS NULL AND (last_seen IS NULL OR last_seen < cutoff)` (orphaned rows from entries that disappeared without being visited).
+- `purge_older_than(handle, retention_days, now)` — delete every row in either of these classes:
+  - tombstone rows (`deleted_time` non-null) whose `deleted_time` is older than `retention_days` calendar days before `now`;
+  - non-tombstone rows whose `last_seen` is older than `retention_days` calendar days before `now`, or whose `last_seen` is null.
 
-  Used at the start of a run; the orchestrator chooses the cutoff from its retention setting.
+### Path identity
 
-### Schema (informational)
+- `identify(relative_path)` → 11-character string
+  - Input is forward-slash-delimited, no leading or trailing slash, no `.` or `..` components. UTF-8 encoded.
+  - Files and directories at the same path produce the same identity; the record's `byte_size = -1` is what marks a directory.
+  - The empty string and `/` both denote the **root sentinel** identity (used as `parent_id` for top-level entries).
+  - Hash the UTF-8 bytes of the input with xxHash64 (seed 0). Encode the resulting 64-bit value as base62 using the alphabet `0-9`, `A-Z`, `a-z` in that order. Zero-pad to exactly 11 characters.
 
-The single table is named `snapshot`, with columns and types matching the table in `database.md` §"Schema". Indexes exist on `parent_id`, `last_seen`, and `deleted_time`. The schema is created on first open and is not user-configurable.
+The identity is stable across processes, machines, and runs — callers may rely on it being portable.
+
+### Timestamps
+
+- `now()` → timestamp string. Returns the current UTC wall-clock time formatted as `YYYY-MM-DD_HH-mm-ss_ffffffZ` — four-digit year, two-digit month, two-digit day, underscore, two-digit hour, two-digit minute, two-digit second, underscore, six-digit microseconds, literal `Z`. All numeric fields are zero-padded. The resulting string is lexicographically sortable and uses only characters that are valid in path components on common operating systems.
+- The generator is **process-monotonic**: every call returns a value strictly greater than every value previously returned by `now()` in the same process. If the wall clock has not advanced past the most recently returned value, the generator returns the most recent value plus one microsecond.
+
+A caller that needs multiple distinct "current time" values within one logical operation must call `now()` afresh for each one — the library will return distinct, monotonically increasing values.
 
 ## Anchoring
 
-- **SQLite** (external standard) — file format, WAL journal mode, foreign-key enforcement, recursive CTE for the cascade walk.
-- **xxHash64** (external standard, seed 0) — path hashing function.
-- **Base62 with digits `0-9`, uppercase `A-Z`, lowercase `a-z`** — well-known alphanumeric encoding for the 11-character path identifiers, defined fully in `database.md` §"Path Hashing".
-- **UTC, microsecond precision** — the timestamp format `YYYY-MM-DD_HH-mm-ss_ffffffZ` is defined in `database.md` §"Timestamps".
-- **`database.md` §"Schema"** — column list, types, NULL rules, index list.
-- **`database.md` §"Path Hashing"** — hash function, encoding, root sentinel, leading/trailing slash rules.
-- **`database.md` §"Timestamps"** — format and monotonic-within-process rule.
-- **`database.md` §"Tombstones"** — when a row becomes a tombstone and idempotency on repeated absence.
-- **`multi-tree-sync.md` §"Snapshot Updates"** — the row-update operations the orchestrator invokes during traversal, including the cascade SQL.
-- **`multi-tree-sync.md` §"Orphaned Snapshot Rows"** — the purge rules for stale and tombstoned rows.
+- **Database storage**: SQLite — file-based, embedded, ACID. One database file per store; one table named `snapshot`.
+- **Recursive descendant traversal**: a recursive Common Table Expression — a standard SQL feature supported by SQLite.
+- **Path hashing**: xxHash64 with seed `0` over the UTF-8 byte representation of the input string. The xxHash family is a well-documented external standard.
+- **Numeric encoding**: base62 with the alphabet `0-9`, then `A-Z`, then `a-z` — a standard positional numeral system.
+- **Timestamp format**: a UTC ISO-8601-derived format using only path-safe punctuation (`-`, `_`, `Z`). Microsecond precision; lexicographic sort order matches chronological order.
+- **Monotonic clock**: a standard concurrency primitive — every value returned strictly greater than the previous one returned in the same process.
+- "Path", "directory", "parent directory", "basename", "relative path": host-language string and filesystem-path primitives. Forward-slash-delimited; no `.` or `..`; no leading or trailing slash.
+- "Record", "row", "table", "transaction": SQL primitives.

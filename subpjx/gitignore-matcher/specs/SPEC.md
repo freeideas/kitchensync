@@ -1,57 +1,41 @@
-# Compile gitignore-style patterns into a path matcher
+# Gitignore-syntax path matcher
 
 ## Purpose
-Turn the text content of zero or more `.syncignore` files (and the kitchensync built-in exclude set) into a reusable path matcher that decides, for any candidate path within a directory tree, whether it is ignored. The kitchensync multi-tree walk calls this component at every directory level: it accumulates ignore patterns from each ancestor directory and from the current directory's winning `.syncignore`, and asks the matcher to filter the union of entry names before per-entry decisions are made. This implements `ignore.md` §"Pattern Format", §"Hierarchy", §"Built-in Excludes", and the filtering step described in `multi-tree-sync.md` §"Resolution During the Multi-Tree Walk".
-
-This component is pure — it does no filesystem I/O. The caller is responsible for reading `.syncignore` files; this component only operates on already-loaded pattern text.
+Compile gitignore-syntax pattern text into a reusable matcher that decides whether a relative path is ignored. Pure functions over text and paths; no filesystem access, no I/O, no concurrency. Supports hierarchical composition: patterns declared at a deeper directory level add to, and may override via negation, patterns declared at shallower levels — exactly as gitignore specifies.
 
 ## API surface
 
-### Compiling pattern text
+### Compile
+- `compile(text)` → `Patterns` — parse a chunk of gitignore-syntax pattern text (the verbatim contents of one ignore file) into an opaque pattern set. Blank lines and lines beginning with `#` are skipped. Every other line is a single pattern. Order within `text` is preserved: within a single compiled set, later patterns override earlier ones for any path that both would match.
 
-`compile_patterns(text: string) -> PatternSet`
+### Match
+- `match(stack, relative_path, is_directory)` → `Ignored` | `NotIgnored`
+  - `stack` is an ordered sequence of `(scope, Patterns)` pairs, shallowest first. Each `scope` is the directory at which the corresponding `Patterns` was declared, expressed as a forward-slash-delimited relative path from a caller-chosen root (the empty string denotes the root itself).
+  - `relative_path` is the candidate path, expressed relative to the same root, forward-slash-delimited, no leading or trailing slash, no `.` or `..` components. The caller is responsible for normalization.
+  - `is_directory` is true when the candidate is a directory and false when it is a file. Patterns whose textual form ends with `/` match directories only.
+  - A pattern declared at scope `D` applies only to candidates strictly inside `D` — that is, candidates whose path components begin with the components of `D`. Before matching such a pattern, the components of `D` are stripped from the candidate's path.
+  - Patterns from later stack entries are evaluated after those from earlier stack entries. Within one stack entry, later patterns override earlier ones. The result is `Ignored` iff the most-recently-applied matching pattern is positive; if no pattern matches, or the most-recently-applied matching pattern is a negation, the result is `NotIgnored`.
+  - Negation cannot re-include a path whose parent directory is itself excluded by an unnegated pattern. When evaluating a path, if any strict ancestor directory of the path would be classified `Ignored` (treating it as a directory and considering only patterns whose scope is an ancestor of, or equal to, the ancestor being tested), the candidate is `Ignored` regardless of any negation that would otherwise apply.
 
-Takes the raw text of a single `.syncignore` file and returns a structured `PatternSet`. The text is parsed line-by-line according to the gitignore grammar:
+### Empty input
+- `compile("")` returns a `Patterns` value that matches nothing.
+- `match` invoked with an empty `stack` returns `NotIgnored` for every input.
 
-- Blank lines and lines beginning with `#` are ignored.
-- Trailing whitespace is stripped unless escaped with backslash.
-- A leading `!` makes the pattern a negation (re-includes a previously-excluded path).
-- A leading `/` anchors the pattern to the directory where the `.syncignore` lives (not deeper).
-- A trailing `/` restricts the pattern to directories only.
-- `*` matches any run of characters except `/`. `?` matches one non-`/` character. `[abc]` is a character class.
-- `**` is recognised as a directory-spanning wildcard in the documented gitignore positions: leading `**/` (match at any depth), trailing `/**` (match anything inside), and `/**/` (zero or more intermediate directories).
-- All other characters match literally.
+## Pattern syntax
 
-Malformed patterns (for example, an unclosed character class) cause the offending line to be skipped; the rest of the file still compiles. A `PatternSet` therefore always compiles successfully — diagnostics, if any, are returned as a separate list alongside it for the caller to log.
+Patterns follow the gitignore pattern format documented at https://git-scm.com/docs/gitignore. Summary:
 
-### Stacking ignore scopes
-
-`Matcher` represents the ignore rules in effect at a particular directory during the walk. The kitchensync glue builds one Matcher per directory by stacking pattern sets from each ancestor along with the current level's set.
-
-- `empty_matcher() -> Matcher` — the matcher in effect at the sync root with no ancestor rules.
-- `push_scope(parent: Matcher, scope_dir: relative-path, set: PatternSet) -> Matcher` — produces a new Matcher that adds `set` at `scope_dir`. The scope directory is the path (relative to the sync root) of the directory whose `.syncignore` produced `set`. Anchored patterns (leading `/`) and directory-only patterns are interpreted relative to `scope_dir`. The parent matcher is not mutated.
-
-The stacking order matters: deeper-scope patterns are evaluated after shallower ones, so a deeper `!pattern` can re-include something a shallower scope excluded, exactly as gitignore specifies.
-
-### Querying the matcher
-
-`is_ignored(m: Matcher, path: relative-path, is_dir: bool) -> bool`
-
-Returns true if the given relative path (interpreted relative to the sync root, forward-slash-separated, no leading slash) is ignored by the rules in `m`. The `is_dir` flag distinguishes directories from files so that directory-only patterns (trailing `/`) match correctly. Negations are honoured in the normal gitignore manner: the last matching pattern across the entire stack wins.
-
-### Built-in excludes
-
-The matcher always treats the following as ignored, regardless of `.syncignore` contents:
-
-- The path component `.kitchensync` at any depth (and everything inside it).
-- Symbolic links and special files (devices, FIFOs, sockets). These do not appear in path text, so the caller must convey them through `is_ignored_entry`:
-
-`is_ignored_entry(m: Matcher, path: relative-path, kind: EntryKind) -> bool` — like `is_ignored`, but takes an `EntryKind` of `file`, `dir`, `symlink`, or `special`. Symlinks and special files always return true. Files and directories defer to `is_ignored`.
-
-The default exclude for `.git/` is treated as an implicit deepest-priority pattern at the sync root that any user pattern can negate; in particular, a `!.git/` line in a `.syncignore` re-includes it as gitignore semantics demand. The built-in `.kitchensync` exclude cannot be negated.
+- Blank lines match nothing. A line beginning with `#` is a comment; to use a literal `#` or `!` at the start of a pattern, escape it with `\`.
+- Trailing whitespace is stripped unless escaped with `\`.
+- A leading `!` negates the pattern; a matching path previously classified as ignored becomes not-ignored (subject to the parent-directory restriction above).
+- A trailing `/` restricts the pattern to directories.
+- A pattern containing no `/`, or only a trailing one, matches at any depth below the scope at which it was declared.
+- A pattern containing a `/` anywhere other than at the very end is anchored at the scope at which it was declared.
+- Glob tokens: `*` matches any run of non-`/` characters; `?` matches one non-`/` character; `[abc]`, `[a-z]`, `[!abc]` match a character class; `**` matches zero or more path components (with the usual gitignore restrictions: a leading `**/` matches any depth, a trailing `/**` matches everything inside, and `a/**/b` matches `b` zero or more directories below `a`).
+- A leading `/` anchors at the declaring scope's root.
 
 ## Anchoring
-- Pattern grammar (blank/comment lines, `*`, `?`, `[…]`, `**`, leading `/` anchoring, trailing `/` directory-only, leading `!` negation, "last match wins" precedence): the gitignore pattern syntax documented at git-scm.com, referenced by `ignore.md` §"Pattern Format".
-- Hierarchical accumulation across nested directories with deeper patterns overriding shallower ones: gitignore's hierarchical semantics, referenced by `ignore.md` §"Hierarchy".
-- Always-ignored `.kitchensync/`, symlinks, special files; default-but-overridable `.git/`: `ignore.md` §"Symlinks" and §"Built-in Excludes".
-- `relative-path` (forward-slash, no leading slash) and `EntryKind` (file / dir / symlink / special): host-language primitives and the standard filesystem entry taxonomy.
+
+- Pattern syntax (`*`, `?`, `[...]`, `**`, `/`, `!`, `#`, trailing `/`, leading `/`, negation semantics, parent-directory restriction): the gitignore pattern format at https://git-scm.com/docs/gitignore.
+- "Relative path", "directory", "path component": host-language string and filesystem-path primitives. Forward-slash-delimited; no `.` or `..`; no leading or trailing slash.
+- "Pattern set", "match", "compile": pure functions; no external dependency beyond the host language's standard library.

@@ -8,6 +8,8 @@ At the start of a run, each peer's `snapshot.db` is downloaded to a local tempor
 
 ### Snapshot
 
+The schema contains exactly one table. Its SQL name is `snapshot` (singular, lowercase) — every reference in this spec, every query in the implementation, and every assertion in the tests uses that name verbatim. Do not introduce a pluralized synonym, a view, or any alternate spelling.
+
 Tracks what this peer had (or has had) — one row per path.
 
 | Column       | Type    | Notes                                                                                                  |
@@ -65,4 +67,4 @@ Paths are hashed with xxHash64 (seed 0) and encoded as base62 (digits `0-9`, upp
 
 Format: `YYYY-MM-DD_HH-mm-ss_ffffffZ` — UTC, microsecond precision, lexicographic sort, filesystem-safe. This format is used everywhere timestamps appear: database columns, BAK/ directory names, TMP/ directory names, and log output.
 
-Monotonic within a process: add 1μs on collision.
+Monotonic within a process: add 1μs on collision. Every distinct call site that needs "now" — every `last_seen` write, every `deleted_time` write, every BAK/ or TMP/ directory name — calls the timestamp generator afresh and gets a value strictly greater than every value it has previously returned in this process. Do not capture a single "run timestamp" at startup and reuse it across snapshot rows: every row's `last_seen` (and every row's `deleted_time` when set) must be unique within a single sync run.

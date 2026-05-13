@@ -162,6 +162,7 @@ Directories do not use mod_time for decision-making. Directory mod_times are fil
 Directory decisions are existence-based only:
 - If any contributing peer has the directory, it should exist on all peers. Create it on peers that lack it.
 - If all contributing peers that have a snapshot row for the directory have deleted it (tombstone in snapshot, absent in listing), delete it on all remaining peers (displace to BAK/). A contributing peer with no snapshot row for the directory has no opinion and does not block deletion — consistent with the file decision rules where no-row peers do not vote.
+- If no contributing peer has the directory — neither live in its listing nor as a snapshot row (with or without tombstone) — the directory does not exist in the group's view. Subordinate peers that have it are displaced to BAK/.
 - Canon peer (`+`) overrides as usual: canon has it → create everywhere; canon lacks it → delete everywhere.
 
 Directories are displaced to BAK/ just like files. The snapshot still tracks directories (with `byte_size = -1`) for deletion detection via tombstones, but `mod_time` for directory rows is informational only — it is recorded but not used in decisions.
@@ -180,7 +181,7 @@ Per-peer snapshot rows are updated during traversal, as soon as a decision is ma
 - **Decision: push to a peer**: upsert row for the destination peer with the winning entry's mod_time, byte_size, and `deleted_time = NULL`. Do **not** update `last_seen` — it is only set when the entry is confirmed present (in a listing or after a completed copy). If no row exists yet, `last_seen` is NULL.
 - **Copy completed**: after a file copy finishes successfully, set `last_seen` to the current sync timestamp on the destination peer's snapshot row. This is the only post-traversal snapshot update.
 - **Inline directory creation completed**: after `create_dir` succeeds on a destination peer, set `last_seen` to the current sync timestamp on that peer's snapshot row. Directory creation is both decided and confirmed in one step (unlike file copies, which are enqueued).
-- **Decision: delete from a peer**: set `deleted_time` to the row's current `last_seen` on the row for that peer (the entry is being displaced to BAK/). Then cascade to descendants using a single recursive CTE scoped to the displaced entry's subtree:
+- **Decision: delete from a peer**: set `deleted_time` to the row's current `last_seen` on the row for that peer (the entry is being displaced to BAK/). Then cascade to descendants using a single recursive CTE scoped to the displaced entry's subtree. The cascade runs against **that same peer's** snapshot.db (each peer has its own); if multiple peers are losing the same subtree in the same decision, the cascade runs once per peer, each against its own snapshot.db, and never against another peer's database. The CTE:
   ```sql
   WITH RECURSIVE subtree(id) AS (
       VALUES(?displaced_id)

@@ -1,17 +1,19 @@
-# 03_sftp-pool: SFTP connection pool and per-URL tuning
+# 03_sftp-pool: SFTP connection pool
 
 ## Behavior
 
-SFTP connections are pooled per user+host (the path component is not part of the pool key). `--mc` caps concurrent connections in a pool, `--ka` keeps idle connections alive, `--ct` bounds SSH handshakes. Per-URL query-string settings override the corresponding global flag for that URL. `file://` peers have no pool. Derived from `specs/concurrency.md` §"Connection Pool (SFTP)" and `specs/sync.md` §"Per-URL Settings".
+SFTP connections are pooled per user+host. Each pool obeys a max-connection cap (`mc`), an SSH handshake timeout (`ct`), and an idle keep-alive TTL (`ka`); per-URL query parameters override the global flags. Local `file://` peers do not use a pool. Derived from `concurrency.md` §"Connection Pool (SFTP)" / §"Connection Establishment" and `sync.md` §"Per-URL Settings".
 
 ## $REQ_IDs
-- `03.21` — Two SFTP URLs that share the same user+host use a single shared connection pool; the path component is not part of the pool key.
-- `03.22` — A pool's max-open-connections cap defaults to 10 (overridable by `--mc`).
-- `03.23` — A returned idle SFTP connection remains reusable from the pool for up to `--ka` seconds (default 30).
-- `03.24` — When `--ka` seconds elapse with no reuse, the next acquire from the pool opens a new SSH+SFTP session rather than reusing the previous idle one.
-- `03.25` — A file transfer acquires one connection from the source peer's pool and one from the destination peer's pool before the transfer begins.
-- `03.26` — Per-URL query-string settings (`mc`, `ct`, `ka`) override the corresponding global flag for that URL.
-- `03.27` — When a pool's max-open cap is reached, a caller requesting another connection from that pool waits until one is returned.
-- `03.28` — `file://` peers use no connection pool; no pool acquire/release events are emitted for them at any verbosity level.
-- `03.29` — Reusing a returned idle connection within the keep-alive window resets that connection's keep-alive timer.
-- `03.30` — Both pool connections used by a transfer are returned to their pools when the transfer completes or fails.
+
+- `03.58` — Pool identity is the SFTP URL's user+host pair: two SFTP URLs that share the same user+host share a single pool, even if their path components differ.
+- `03.59` — Per-URL `mc`, `ct`, and `ka` query parameters override the corresponding global flags (`--mc`, `--ct`, `--ka`) for that URL.
+- `03.60` — A pool will not hold more than `mc` open connections at once; when all are busy, additional callers wait until a connection is returned.
+- `03.61` — A returned connection stays alive in the pool for up to `ka` seconds and is reused if requested within that window.
+- `03.62` — An SSH handshake that does not complete within `ct` seconds for an SFTP URL is treated as a failed connection (and the next fallback URL, if any, is tried).
+- `03.63` — `file://` peers do not allocate a connection pool, and the `--mc`/`--ct`/`--ka` flags have no effect on them.
+- `03.64` — A file transfer borrows one connection from the source peer's pool and one from the destination peer's pool for the transfer's duration; both connections are returned to their pools when the transfer completes or fails.
+
+## Notes
+
+Trace-level pool acquire/release logging is in `03_logging.md`.

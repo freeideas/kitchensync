@@ -3,11 +3,11 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Tests timestamp format, UTC bounds, lexicographic monotonicity, and microsecond increment (reqs 02.6–02.9)."""
+"""Exercises 02_timestamps requirements: now() format, UTC correctness, monotonicity."""
 
 from __future__ import annotations
 
-import json, os, re, socket, subprocess, sys, tempfile, threading, time
+import json, os, re, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,7 +15,7 @@ BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"
 UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
 PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TIMESTAMP_PAT = re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z$')
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z$")
 
 
 def _drain(stream):
@@ -47,7 +47,7 @@ def _launch():
     return proc, port
 
 
-def _rpc(sock, method, params=None, rpc_id=1):
+def _rpc(sock, method, params, rpc_id):
     msg = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
     if params is not None:
         msg["params"] = params
@@ -65,12 +65,56 @@ def _rpc(sock, method, params=None, rpc_id=1):
     return json.loads(line.decode("utf-8"))
 
 
-def _call(sock, tool, args, rpc_id=1):
-    return _rpc(sock, "tools/call", {"name": tool, "arguments": args}, rpc_id=rpc_id)
-
-
 def _parse_ts(ts: str) -> datetime:
-    return datetime.strptime(ts, "%Y-%m-%d_%H-%M-%S_%fZ").replace(tzinfo=timezone.utc)
+    return datetime.strptime(ts[:-1], "%Y-%m-%d_%H-%M-%S_%f").replace(tzinfo=timezone.utc)
+
+
+def _parse_ts_or_none(ts: str):
+    try:
+        return _parse_ts(ts)
+    except ValueError:
+        return None
+
+
+def _unwrap(resp):
+    result = resp.get("result", {})
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content", [])
+    if content and content[0].get("type") == "text":
+        text = content[0]["text"]
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return text
+    return result
+
+
+def _timestamp(resp):
+    value = _unwrap(resp)
+    return value if isinstance(value, str) else ""
+
+
+def _timestamps(resp):
+    value = _unwrap(resp)
+    return value if isinstance(value, list) else []
+
+
+def _micros(ts: str) -> int:
+    dt = _parse_ts_or_none(ts)
+    if dt is None:
+        raise ValueError(f"invalid timestamp fields: {ts!r}")
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = dt - epoch
+    return ((delta.days * 86400 + delta.seconds) * 1_000_000
+            + delta.microseconds)
+
+
+def _micros_or_none(ts: str):
+    try:
+        return _micros(ts)
+    except ValueError:
+        return None
 
 
 def main() -> int:
@@ -78,123 +122,65 @@ def main() -> int:
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
             failures = []
-            rid = 1
+            _id = [0]
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                db_path = str(Path(tmpdir) / "timestamps_test.db")
+            def rpc(method, params=None):
+                _id[0] += 1
+                return _rpc(s, method, params, _id[0])
 
-                open_resp = _call(s, "open-snapshot", {"path": db_path}, rpc_id=rid)
-                rid += 1
-                if "error" in open_resp:
-                    print(f"[setup] open-snapshot failed: {open_resp['error']}")
-                    failures.append(f"setup: open-snapshot failed: {open_resp['error']}")
-                    print("\nFAILURES:")
-                    for f in failures:
-                        print(f"  - {f}")
-                    return 1
+            before = datetime.now(timezone.utc)
+            resp = rpc("tools/call", {"name": "now", "arguments": {}})
+            after = datetime.now(timezone.utc)
+            ts = _timestamp(resp)
 
-                handle = (open_resp.get("result") or {}).get("handle")
-                if handle is None:
-                    print("[setup] open-snapshot returned no handle")
-                    failures.append("setup: open-snapshot returned no handle")
-                    print("\nFAILURES:")
-                    for f in failures:
-                        print(f"  - {f}")
-                    return 1
+            # 02.1 — now() matches YYYY-MM-DD_HH-mm-ss_ffffffZ, all fields zero-padded
+            print(f"[02.1] now() = {ts!r}")
+            if not TS_RE.match(ts):
+                failures.append(f"02.1: {ts!r} does not match YYYY-MM-DD_HH-mm-ss_ffffffZ")
 
-                # --- 02.6: format matches YYYY-MM-DD_HH-mm-ss_ffffffZ ---
-                r = _call(s, "current-timestamp", {"handle": handle}, rpc_id=rid)
-                rid += 1
-                if "error" in r:
-                    print(f"[02.6] current-timestamp error: {r['error']}")
-                    failures.append(f"02.6: current-timestamp error: {r['error']}")
-                else:
-                    ts = (r.get("result") or {}).get("timestamp", "")
-                    if TIMESTAMP_PAT.match(ts):
-                        print(f"[02.6] timestamp matches YYYY-MM-DD_HH-mm-ss_ffffffZ: {ts}")
-                    else:
-                        print(f"[02.6] FAIL — timestamp does not match pattern: {ts!r}")
-                        failures.append(f"02.6: {ts!r} does not match YYYY-MM-DD_HH-mm-ss_ffffffZ")
+            # 02.2 — fields correspond to current UTC wall-clock time (not local time)
+            print(f"[02.2] UTC window = [{before.isoformat()}, {after.isoformat()}]")
+            if TS_RE.match(ts):
+                ts_dt = _parse_ts_or_none(ts)
+                if ts_dt is None:
+                    failures.append(f"02.2: invalid calendar fields in {ts!r}")
+                elif not (before <= ts_dt <= after):
+                    failures.append(
+                        f"02.2: {ts_dt.isoformat()} outside UTC window "
+                        f"[{before.isoformat()}, {after.isoformat()}]"
+                    )
+            else:
+                failures.append(f"02.2: bad format {ts!r}, cannot check UTC")
 
-                # --- 02.7: parsed UTC value falls between system clock before and after the call ---
-                before_utc = datetime.now(timezone.utc)
-                r = _call(s, "current-timestamp", {"handle": handle}, rpc_id=rid)
-                rid += 1
-                after_utc = datetime.now(timezone.utc)
-                if "error" in r:
-                    print(f"[02.7] current-timestamp error: {r['error']}")
-                    failures.append(f"02.7: current-timestamp error: {r['error']}")
-                else:
-                    ts = (r.get("result") or {}).get("timestamp", "")
-                    try:
-                        ts_dt = _parse_ts(ts)
-                        if before_utc <= ts_dt <= after_utc:
-                            print(f"[02.7] timestamp {ts} within UTC bounds [{before_utc.isoformat()}, {after_utc.isoformat()}]")
-                        else:
-                            print(f"[02.7] FAIL — timestamp {ts} outside UTC bounds")
-                            failures.append(
-                                f"02.7: {ts} not in [{before_utc.isoformat()}, {after_utc.isoformat()}]"
-                            )
-                    except ValueError as e:
-                        print(f"[02.7] FAIL — could not parse timestamp {ts!r}: {e}")
-                        failures.append(f"02.7: parse error on {ts!r}: {e}")
+            # 02.3 — successive calls return strictly increasing values
+            stamps = _timestamps(rpc("tools/call", {"name": "now-n", "arguments": {"count": 20}}))
+            print(f"[02.3] successive now() = {stamps}")
+            bad_formats = [stamp for stamp in stamps if not isinstance(stamp, str) or not TS_RE.match(stamp)]
+            if bad_formats:
+                failures.append(f"02.3: now-n returned badly formatted timestamps: {bad_formats}")
+            elif len(stamps) != 20:
+                failures.append(f"02.3: now-n returned {len(stamps)} timestamps, want 20")
+            else:
+                all_stamps = [ts] + stamps
+                micros = [_micros_or_none(stamp) for stamp in all_stamps]
+                if any(micros_value is None for micros_value in micros):
+                    failures.append(f"02.3: invalid calendar fields in timestamps: {all_stamps}")
+                elif not all(micros[i] < micros[i + 1] for i in range(len(micros) - 1)):
+                    failures.append(f"02.3: not strictly increasing: {all_stamps}")
+                if sorted(all_stamps) != all_stamps:
+                    failures.append(f"02.3: timestamp strings are not lexicographically increasing: {all_stamps}")
 
-                # --- 02.8: two timestamps A then B satisfy A < B under lexicographic comparison ---
-                r_a = _call(s, "current-timestamp", {"handle": handle}, rpc_id=rid)
-                rid += 1
-                r_b = _call(s, "current-timestamp", {"handle": handle}, rpc_id=rid)
-                rid += 1
-                if "error" in r_a or "error" in r_b:
-                    print(f"[02.8] FAIL — current-timestamp error fetching A or B")
-                    failures.append("02.8: current-timestamp error during A/B fetch")
-                else:
-                    ts_a = (r_a.get("result") or {}).get("timestamp", "")
-                    ts_b = (r_b.get("result") or {}).get("timestamp", "")
-                    if ts_a < ts_b:
-                        print(f"[02.8] A={ts_a} < B={ts_b} (lexicographic)")
-                    else:
-                        print(f"[02.8] FAIL — A={ts_a!r} is not < B={ts_b!r}")
-                        failures.append(f"02.8: A={ts_a!r} not < B={ts_b!r}")
-
-                # --- 02.9: consecutive timestamps always differ by at least 1μs ---
-                # The spec guarantees that if the wall clock hasn't advanced between two
-                # requests, the second is exactly +1μs after the first.  That makes 1μs
-                # the minimum observable difference for any consecutive pair.
-                seq = []
-                seq_error = False
-                for _ in range(10):
-                    r = _call(s, "current-timestamp", {"handle": handle}, rpc_id=rid)
-                    rid += 1
-                    if "error" in r:
-                        print(f"[02.9] FAIL — current-timestamp error in sequence: {r['error']}")
-                        failures.append(f"02.9: current-timestamp error in sequence: {r['error']}")
-                        seq_error = True
-                        break
-                    seq.append((r.get("result") or {}).get("timestamp", ""))
-
-                if not seq_error and len(seq) >= 2:
-                    pair_failures = []
-                    for i in range(len(seq) - 1):
-                        ta, tb = seq[i], seq[i + 1]
-                        try:
-                            diff_us = int(
-                                (_parse_ts(tb) - _parse_ts(ta)).total_seconds() * 1_000_000
-                            )
-                            if diff_us < 1:
-                                pair_failures.append(
-                                    f"pair [{i},{i+1}] diff={diff_us}μs (< 1μs): {ta!r} → {tb!r}"
-                                )
-                        except ValueError as e:
-                            pair_failures.append(f"pair [{i},{i+1}] parse error: {e}")
-                    if pair_failures:
-                        for pf in pair_failures:
-                            print(f"[02.9] FAIL — {pf}")
-                            failures.append(f"02.9: {pf}")
-                    else:
-                        print(f"[02.9] {len(seq)} consecutive timestamps each differ by >= 1μs")
-
-                _call(s, "close-snapshot", {"handle": handle}, rpc_id=rid)
-                rid += 1
+            # 02.4 — not reasonably testable through this MCP wrapper. The exact
+            # +1 microsecond fallback only occurs when the wall clock has not
+            # advanced past the last returned value, but the wrapper exposes no
+            # way to freeze or inject the wall clock. Rapid now()/now-n calls only
+            # observe host timing, so requiring a 1us delta would be flaky.
+            deltas = []
+            if len(stamps) == 20 and not bad_formats:
+                parsed = [_micros_or_none(stamp) for stamp in stamps]
+                if not any(value is None for value in parsed):
+                    deltas = [parsed[i + 1] - parsed[i] for i in range(len(parsed) - 1)]
+            print(f"[02.4] exact 1us fallback not directly controllable; observed deltas={deltas}")
 
             if failures:
                 print("\nFAILURES:")

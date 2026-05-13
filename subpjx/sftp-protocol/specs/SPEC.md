@@ -1,68 +1,84 @@
-# SFTP transport over SSH with per-endpoint connection pool
+# sftp-protocol
+
+A pooled SFTP client library: file operations over SSH, with connection reuse keyed by user+host.
 
 ## Purpose
-Provide kitchensync's `sftp://` transport: the SSH+SFTP wire protocol plus the connection pool keyed by user+host. Other peers (via the host language's standard `file://` stdlib) and the SFTP transport implemented here expose the same operation surface so the caller's sync logic does not branch on transport. This component implements `sync.md` §"Peer Transports" (operation surface), `sync.md` §"Authentication" (key search chain and known_hosts verification), and `concurrency.md` §"Connection Pool (SFTP)" (per-endpoint pool semantics, `mc`/`ct`/`ka` settings, lazy pool creation, trace logging of acquire/release).
 
-The component has no knowledge of the rest of kitchensync — it is told an endpoint and the per-pool settings, and it returns a transport object that performs operations against the remote filesystem.
+Implement the client side of the SSH File Transfer Protocol over SSH transport, exposing a uniform set of file operations against a remote filesystem. Multiple operations against the same (user, host) destination are multiplexed across a bounded pool of reused SSH+SFTP sessions with configurable maximum concurrency, handshake timeout, and idle keep-alive. A caller acquires a connection handle, issues file operations through it, and releases the handle when done; the pool reuses sessions across acquisitions.
 
 ## API surface
 
-### Endpoints and pools
+### Pool
 
-`Endpoint` is the pool key: an SFTP user and host (with optional non-default port). Two endpoints with the same user and host (ignoring port 22 vs default) refer to the same remote account and share a pool.
+The component is instantiated as a pool. Each pool is keyed by an `(sftp-user, host)` pair: every URL that resolves to the same user and host shares the same pool, regardless of path. Distinct ports are distinct pool keys (port is part of the host identity for pool keying).
 
-`open_endpoint(user: string, host: string, port: int | default, password: string | none, settings: PoolSettings) -> Endpoint`
+Pool configuration:
 
-Returns an endpoint handle. The first call for a given (user, host) creates its pool lazily; subsequent calls for the same (user, host) return a handle backed by the same pool. `PoolSettings` carries `mc` (max concurrent connections, positive int), `ct` (connection timeout seconds, positive int), and `ka` (idle keep-alive TTL seconds, positive int). Per-URL `PoolSettings` from the caller override the per-pool defaults at acquire time as documented in `concurrency.md`.
+- `max_connections` (default 10) — maximum number of concurrent live SSH+SFTP sessions to this `(user, host)` pair.
+- `connect_timeout_seconds` (default 30) — bounds the SSH handshake on a single connection attempt; expiry is a connection failure.
+- `idle_keepalive_seconds` (default 30) — released-but-idle sessions remain warm for this many seconds before the underlying SSH+SFTP session is torn down; reuse before the timer expires resets it.
 
-If two distinct calls for the same (user, host) supply conflicting `mc` or `ka` values, the resolution is implementation-defined (this is a misuse, per `concurrency.md`).
+Pool operations:
 
-### Acquiring and releasing pooled connections
+- `acquire(url)` → connection handle. Returns an idle session if one is cached for the URL's user+host; otherwise opens a new SSH+SFTP session up to `max_connections`. If `max_connections` are already open and all are busy, blocks until one is released. If the URL specifies a username, that user is used; if the URL has no username, the current OS user is used.
+- `release(handle)` — return the handle to the pool. The session is held alive for up to `idle_keepalive_seconds`; if not reused within that window, the underlying SSH+SFTP session is closed.
+- `shutdown()` — close every cached and in-use session and tear the pool down.
 
-`acquire(endpoint: Endpoint) -> Connection`
-
-Returns an open SSH+SFTP `Connection` to the endpoint, blocking if `mc` connections are already in use and all are busy. If a previously released connection is still within its `ka` window, it is reused; otherwise a new connection is established. Establishing a new connection performs SSH handshake (bounded by `ct` seconds), authenticates (see Authentication below), and verifies the host key against `~/.ssh/known_hosts` — an unknown host causes connection failure. If the handshake or authentication fails, surface the failure as an I/O error.
-
-`release(connection: Connection)` returns the connection to its pool. It remains idle for up to `ka` seconds; if reused within that window, the keep-alive timer resets, otherwise the underlying SSH+SFTP session is closed when the timer expires.
-
-When verbosity is set to `trace`, each `acquire` and `release` emits one log line: `endpoint=<user@host> connections=<in_use>/<mc>`.
-
-### Operations on a `Connection`
-
-A `Connection` exposes the standard transport operations described in `sync.md` §"Peer Transports", performed against the remote filesystem reachable via this SSH+SFTP session. Every operation returns one of the categorized error outcomes from `sync.md` §"Error Semantics" — `not found`, `permission denied`, `I/O error` — never a transport-specific error. Path arguments are absolute remote paths.
-
-- `list_dir(path)` — list immediate children. Each entry reports name, `is_dir`, `mod_time`, and `byte_size` (bytes for regular files, `-1` for directories). Symbolic links, devices, FIFOs, sockets, and any non-regular entry are silently omitted.
-- `stat(path)` — return `mod_time`, `byte_size`, `is_dir`, or `not found` (also returned for symlinks and special files).
-- `open_read(path) -> handle`, `read(handle, max_bytes) -> bytes | EOF`, `close_read(handle)` — chunked streaming read.
-- `open_write(path) -> handle`, `write(handle, bytes)`, `close_write(handle)` — chunked streaming write. `open_write` creates the file and any missing parent directories.
-- `rename(src, dst)` — same-filesystem rename (used by the caller for TMP-to-final swap).
-- `delete_file(path)` and `delete_dir(path)` — remove a regular file or empty directory.
-- `create_dir(path)` — create a directory and any missing parents.
-- `set_mod_time(path, time)` — set a file or directory's modification time.
-
-The reader/writer task pairing that streams content from one transport to another (with the bounded channel) lives above this component; this component only provides the chunk-level primitives.
+A consumer that needs two connections simultaneously (e.g., a streaming copy from one remote to another) acquires once per destination; if both destinations resolve to the same `(user, host)`, both handles come from the same pool and both count against its `max_connections`.
 
 ### Authentication
 
-When opening a fresh SSH connection to an endpoint, authentication is attempted in this order, stopping at the first that succeeds:
-1. Inline password supplied at `open_endpoint`, if any.
-2. SSH agent at `$SSH_AUTH_SOCK`.
-3. `~/.ssh/id_ed25519`.
-4. `~/.ssh/id_ecdsa`.
-5. `~/.ssh/id_rsa`.
+When opening a new SSH+SFTP session, authentication is attempted in this order; the first method that succeeds wins:
 
-Host-key verification is performed against `~/.ssh/known_hosts`. An unknown host is rejected (the connection attempt fails as an I/O error).
+1. Inline password from the URL (if present)
+2. SSH agent (via the `SSH_AUTH_SOCK` environment variable)
+3. `~/.ssh/id_ed25519`
+4. `~/.ssh/id_ecdsa`
+5. `~/.ssh/id_rsa`
 
-### Shutdown
+### Host key verification
 
-`close_endpoint(endpoint: Endpoint)` — close every idle connection in the pool and refuse subsequent `acquire` calls. The caller invokes this once per endpoint at the end of a run. In-flight operations on a `Connection` that has not yet been released complete and the connection is then closed instead of returning to the pool.
+Server host keys are verified against the user's `~/.ssh/known_hosts` file (OpenSSH format). Connections to hosts whose key is not present, or whose key does not match the recorded entry, are rejected as connection failures.
+
+### File operations
+
+A connection handle exposes the following operations against the remote filesystem. Paths are absolute, rooted at the remote's filesystem root, and use forward-slash separators.
+
+| Operation | Description |
+| --- | --- |
+| `list_dir(path)` | List the immediate children of a directory. Each entry has: `name`, `is_dir` (bool), `mod_time` (UTC timestamp), `byte_size` (file size in bytes; `-1` for directories). |
+| `stat(path)` | Return `(mod_time, byte_size, is_dir)` for the entry at `path`, or report "not found". |
+| `open_read(path)` → read handle | Open a regular file for streaming reads. |
+| `read(handle, max_bytes)` | Pull the next chunk; return the bytes read, or EOF. |
+| `close_read(handle)` | Close a read handle. |
+| `open_write(path)` → write handle | Open a regular file for streaming writes. Create the file if absent; create any missing parent directories. |
+| `write(handle, bytes)` | Push the next chunk. |
+| `close_write(handle)` | Flush and close a write handle. |
+| `rename(src, dst)` | Same-filesystem rename of a file or directory on the remote. |
+| `delete_file(path)` | Remove a regular file. |
+| `create_dir(path)` | Create a directory and any missing parents (idempotent if the directory already exists). |
+| `delete_dir(path)` | Remove an empty directory. |
+| `set_mod_time(path, time)` | Set the modification time of a file or directory. |
+
+`list_dir` and `stat` only report regular files and directories. Symbolic links, devices, FIFOs, sockets, and any other non-regular entry types are silently omitted from `list_dir`; `stat` reports "not found" for them.
+
+### Error categories
+
+Every operation surfaces failures in exactly three categories, regardless of the underlying SSH/SFTP status code:
+
+- **not found** — the named path does not exist.
+- **permission denied** — the remote refused the operation for authorization reasons.
+- **I/O error** — anything else: network drop, handshake timeout, session collapse, protocol error, remote write failure, server-side error, etc.
+
+Network failures (connection reset, handshake timeout, SFTP channel death) surface as I/O errors; callers do not need to distinguish transport-level failures from on-disk failures.
 
 ## Anchoring
-- SSH transport, authentication, and channel multiplexing: RFC 4251, RFC 4252, RFC 4253, RFC 4254.
-- SFTP wire protocol: `draft-ietf-secsh-filexfer` (commonly version 3 as widely deployed).
-- `known_hosts` format and `~/.ssh/id_*` key file conventions: the OpenSSH specification (man pages `ssh_config(5)`, `sshd_config(5)`, `ssh-agent(1)`).
-- Pool semantics (`mc`, `ct`, `ka`, lazy creation, acquire/release, trace events): `concurrency.md` §"Connection Pool (SFTP)" and §"Trace Logging".
-- Authentication fallback chain and host-key verification: `sync.md` §"Authentication".
-- Transport operation surface and error category set: `sync.md` §"Peer Transports", §"Required Operations", §"Error Semantics".
-- `Endpoint` key (user, host, port) and SFTP URL semantics: RFC 3986 plus the SFTP scheme conventions; the `Endpoint` constructor takes already-parsed components, so URL parsing itself is not part of this component.
-- Path strings, byte chunks, modification timestamps: host-language primitives.
+
+- **SFTP wire protocol**: `draft-ietf-secsh-filexfer` — the IETF SSH File Transfer Protocol draft.
+- **SSH transport and connection**: RFC 4253 (SSH Transport Layer Protocol) and RFC 4254 (SSH Connection Protocol).
+- **SSH authentication methods**: RFC 4252 (SSH Authentication Protocol); RFC 8709 (Ed25519 public keys), RFC 5656 (ECDSA public keys), RFC 4253 §6.6 (RSA public keys).
+- **SSH agent**: SSH Agent Protocol (draft-miller-ssh-agent), located via the `SSH_AUTH_SOCK` environment variable.
+- **`known_hosts` file format**: the OpenSSH known_hosts convention (publicly documented).
+- **URL form for endpoints**: RFC 3986 (URI Generic Syntax) — the `sftp://[user[:password]@]host[:port]/path` form.
+- **Connection pool semantics**: a standard bounded resource pool with idle keep-alive — a well-known concurrency abstraction.
+- **Filesystem operation surface**: the operations mirror POSIX filesystem primitives (`open`, `read`, `write`, `close`, `stat`, `readdir`, `rename`, `unlink`, `mkdir`, `rmdir`, `utime`) — the standard surface every UNIX-style filesystem exposes.

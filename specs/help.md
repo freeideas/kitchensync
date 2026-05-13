@@ -13,6 +13,7 @@ Peers:
   /path or c:\path                 Local path (same as file://)
   sftp://user@host/path            Remote over SSH
   sftp://user@host:port/path       Non-standard SSH port
+  sftp://host/path                 Remote over SSH, current OS user
   sftp://user:password@host/path   Inline password (prefer SSH keys)
 
 Prefix modifiers:

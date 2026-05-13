@@ -1,18 +1,19 @@
-# 03_subordinate-peer: Subordinate peer (`-`) and auto-subordination
+# 03_subordinate-peer: Subordinate peer behavior
 
 ## Behavior
 
-A subordinate peer is excluded from decisions but receives the outcome — extras are displaced, missing entries are copied in, directories are reshaped to match. Subordinate status is declared via the `-` prefix, and any peer without an existing `snapshot.db` is automatically treated as subordinate (unless it carries `+`). Derived from `specs/sync.md` §"Subordinate Peer" and `specs/multi-tree-sync.md` §"Subordinate Peers".
+A subordinate peer (prefixed with `-`, or any peer without an existing snapshot file) is listed and receives outcomes but does not contribute to decisions. After decisions are made the subordinate peer is brought into conformance with the group: files it has that shouldn't exist are displaced to BAK/, files it lacks are copied to it, and its snapshot is still downloaded, updated, and uploaded. Derived from `sync.md` §"Subordinate Peer (-)" and `multi-tree-sync.md` §"Subordinate Peers".
 
 ## $REQ_IDs
-- `03.4` — A `-` prefix on a peer argument marks that peer as subordinate.
-- `03.5` — Multiple `-`-prefixed peers are permitted in a single run.
-- `03.6` — A subordinate peer's entries are excluded from decisions.
-- `03.7` — Files that a subordinate peer has but the group's decision does not retain are displaced to BAK/ on that peer.
-- `03.8` — Files the group has but a subordinate peer lacks are copied to the subordinate peer.
-- `03.9` — Directories on a subordinate peer that the group's decision does not retain are displaced to BAK/ on that peer.
-- `03.10` — Any peer with no existing `snapshot.db` is automatically treated as subordinate (unless it has the `+` prefix).
-- `03.11` — A subordinate peer's snapshot is still downloaded, updated during traversal, and uploaded back; on a subsequent run without `-` the peer participates normally using its snapshot history.
+
+- `03.21` — A subordinate peer's file states do not influence decisions made by other peers.
+- `03.22` — Files present on a subordinate peer but not in the group's decided state are displaced to BAK/ on the subordinate peer.
+- `03.23` — Files in the group's decided state but missing from a subordinate peer are copied to that peer.
+- `03.24` — A peer with no existing `.kitchensync/snapshot.db` is treated as subordinate even without the `-` prefix, unless it is the `+` canon peer.
+- `03.25` — A subordinate peer's `.kitchensync/snapshot.db` is still updated and uploaded back at the end of the run.
+- `03.26` — Re-running the same peer without `-` on a later run lets it participate as a normal bidirectional peer using its snapshot history.
+- `03.27` — More than one subordinate peer per run is allowed.
 
 ## Notes
-The `+`/`-` prefix on a bracketed fallback group is covered in `03_fallback-urls.md`. Directory creation/displacement on subordinate peers also follows `03_directory-decisions.md`.
+
+The error case where every reachable peer turns out to be subordinate after auto-subordination is in `04_error-handling.md`.

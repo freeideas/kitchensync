@@ -1,12 +1,16 @@
-# 03_canon-peer: Canon peer (`+`) behavior
+# 03_canon-peer: Canon peer is authoritative
 
 ## Behavior
 
-A `+`-prefixed canon peer is authoritative — its state wins all conflicts unconditionally, overriding mod_time and snapshot history. Applies to both files and directories. Derived from `specs/sync.md` §"Canon Peer" and `specs/multi-tree-sync.md` §"Decision Rules — With a canon peer".
+A peer marked with the `+` prefix is the canon peer: its state wins all conflicts unconditionally for the run. Derived from `sync.md` §"Canon Peer (+)" and `multi-tree-sync.md` §"Decision Rules" and §"Directory Decisions".
 
 ## $REQ_IDs
-- `03.2` — When the canon peer has an entry at a path, the entry is propagated to all other peers (including subordinate peers) regardless of their snapshot rows or mod_times.
-- `03.3` — When the canon peer lacks an entry at a path that some other peer has, the entry is displaced to BAK/ on every peer that has it.
+
+- `03.15` — When a canon peer has a file, that file is copied to every other peer regardless of mod_time, size, or snapshot history.
+- `03.16` — When a canon peer lacks a file, the file is displaced to BAK/ on every other peer that has it.
+- `03.17` — When a canon peer has a directory, the directory is created on every other peer that lacks it.
+- `03.40` — When a canon peer lacks a directory, the directory is displaced to BAK/ on every other peer that has it.
 
 ## Notes
-Startup canon checks (canon unreachable, first-sync-no-canon) are in `02_startup-connect.md`; the "at most one `+`" argument check is in `01_arg-validation.md`; canon's role in type conflicts is in `03_directory-decisions.md`.
+
+Canon overriding a file-vs-directory type conflict is in `03_type-conflicts.md` (03.38). The canon-unreachable abort is in `04_error-handling.md` (04.9). The "at most one canon peer per run" argument check is in `01_cli-validation.md` (01.11). The first-sync requirement that canon is needed when no snapshots exist lives in `02_first-sync.md`.

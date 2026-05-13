@@ -24,6 +24,8 @@ Parses kitchensync's URL grammar (peer prefixes, fallback brackets, per-URL quer
 
 **Anchored in:** RFC 3986 (URI Generic Syntax), `sync.md` §"Peers" / §"Fallback URLs" / §"Per-URL Settings" / §"URL Schemes", `database.md` §"URL Normalization".
 
+**Implement url-parser as a single unit. Do not carve inside it.** RFC 3986 parsing, RFC 8089 file URI handling, percent-encoding, normalization, and the kitchensync-specific URL grammar are all internal helpers of url-parser — not separate carve-outs. They are the substance of url-parser itself.
+
 ### decision-engine
 
 The entry-classification and per-entry decision logic — pure function over peer states and snapshot rows, no filesystem, no networking, no SQL.

@@ -1,46 +1,109 @@
-# Parse and normalize kitchensync peer URLs
+# Tagged URL Group Parser
 
 ## Purpose
-Turn raw command-line peer arguments — strings like `+c:/photos`, `-/mnt/usb`, or `+[sftp://host/path?mc=5,sftp://nas.vpn/path]` — into structured peer descriptions, and reduce any URL to the canonical identity string used everywhere else for comparison and lookup. The kitchensync glue calls this component once at startup to interpret argv; the snapshot layer and the transport dispatcher call its normalization function to key peers by identity. This implements `sync.md` §"Peers" / §"Fallback URLs" / §"Per-URL Settings" / §"URL Schemes" and `database.md` §"URL Normalization".
+
+Parse a string conforming to a defined "tagged URL group" grammar into a structured description, and normalize URLs to a canonical identity. The library is a pure function over text — no filesystem access, no network access, no system calls. The grammar is defined entirely within this document; the parser's only external dependencies are URI standards.
+
+## Grammar
+
+A **tagged URL group** is one of:
+
+- A single URL or local path, optionally preceded by a single-character **role tag**.
+- A bracket group of comma-separated URLs — `[url1,url2,...]` — optionally preceded by a single-character role tag.
+
+The role tag appears at most once, at the start of the expression. It is never attached to individual URLs inside a bracket group. Three role tags exist:
+
+| Tag    | Label         |
+|--------|---------------|
+| `+`    | `Canon`       |
+| `-`    | `Subordinate` |
+| (none) | `Normal`      |
+
+The labels are opaque outputs of parsing; the seed does not assign behavioural meaning to them beyond "three distinguishable tag values driven by this grammar."
+
+Each URL inside the group is one of:
+
+- A **bare path**: forward-slash- or backslash-delimited, optionally with a Windows drive letter (`c:/foo`, `c:\foo`, `./relative`, `/abs`). Backslashes are accepted on input and treated equivalently to forward slashes.
+- A `file://` URI per RFC 8089.
+- An `sftp://` URI per RFC 3986, with optional userinfo (`user` or `user:password`), optional port, and an absolute path.
+
+Each URL inside the group may carry a query string with these parameters; unrecognized parameter names are rejected:
+
+| Param | Required value form |
+|-------|---------------------|
+| `mc`  | Positive integer    |
+| `ct`  | Positive integer    |
+| `ka`  | Positive integer    |
+
+The meaning of these parameters is opaque to the parser — it only validates syntax and exposes the parsed values to the caller.
+
+## Output structure
+
+`parse` yields a value with this shape (host-language records / sum types — no specific serialization):
+
+```
+TaggedGroup {
+  role:  Canon | Subordinate | Normal
+  urls:  List<ParsedUrl>    // at least one entry
+}
+
+ParsedUrl {
+  scheme:    "file" | "sftp"
+  user:      String?        // sftp only; null when no userinfo
+  password:  String?        // sftp only; null when no password
+  host:      String?        // sftp only
+  port:      Integer?       // sftp only; null means "default" (22)
+  path:      String         // absolute path, forward-slash-delimited
+  query:     Map<String,String>   // recognised parameters from the original query
+  identity:  String         // canonical identity (see Normalization)
+}
+```
+
+Bare paths are converted into `file://` URIs before population. Relative bare paths are resolved against a caller-supplied current working directory (provided as an argument — the parser performs no system calls).
+
+## Normalization
+
+The `identity` field is computed for every URL using this procedure:
+
+1. Lowercase the scheme.
+2. For `sftp://` URLs, lowercase the host.
+3. For `sftp://` URLs with no userinfo, insert a caller-supplied default username.
+4. Remove the default port for the scheme (22 for `sftp`).
+5. Collapse consecutive slashes in the path.
+6. Remove any trailing slash from the path; do not reduce the path below `/`.
+7. Percent-decode unreserved characters per RFC 3986 §2.3.
+8. Drop the query string from `identity` (it is preserved separately on `ParsedUrl.query`).
+9. For `file://` URIs, resolve relative paths to absolute paths against the caller-supplied current working directory.
+
+Two URLs whose `identity` strings are equal name the same target.
 
 ## API surface
 
-### Peer-argument parsing
-`parse_peer_arg(s: string) -> Peer` — accepts one positional command-line argument and returns a structured peer description.
+- `parse(text, cwd, default_user)` → `TaggedGroup` — parse one tagged URL group expression. `cwd` is a forward-slash-delimited absolute directory; relative bare paths are resolved against it. `default_user` is inserted for `sftp://` URLs that omit userinfo.
+- `normalize(url, cwd, default_user)` → `String` — convenience: given a single URL with no role tag and no bracket group, return its canonical `identity`. Equivalent to `parse(url, cwd, default_user).urls[0].identity`.
 
-The returned `Peer` has:
-- A `prefix` of one of three kinds: `canon` (the argument started with `+`), `subordinate` (`-`), or `normal` (no prefix). At most one `+` is the caller's invariant, not this component's.
-- A non-empty ordered list of `Url` records, in fallback-priority order. A bare URL argument yields a single-element list; a bracketed `[u1,u2,...]` argument yields one entry per comma-separated URL. The `+`/`-` prefix attaches to the bracket as a whole, not to URLs inside.
-- Each `Url` record carries: the canonical identity string (see normalization below), the scheme (`file` or `sftp`), the user / host / port / password components for `sftp` URLs, the absolute path component, and any per-URL settings parsed from the query string. Recognized settings are `mc` (positive integer), `ct` (positive integer), `ka` (positive integer); each is optional and unset settings are reported as absent (so callers can apply globals).
+Errors are reported through the host language's idiomatic mechanism. The parser rejects:
 
-Rules the parser enforces:
-- Bare paths with no scheme — including drive-letter paths like `c:\foo` and `./relative` — are treated as `file://` URLs. Relative paths are resolved against the process's current working directory at parse time.
-- The bracket syntax `[u1,u2,...]` may appear only at the top level of the argument and contains at least one URL. Commas inside the brackets separate URLs; whitespace is not significant.
-- For `sftp://` URLs, an empty userinfo component is filled in with the current OS user. Percent-encoded characters in userinfo and path are decoded for the structured components but the identity string preserves the canonical encoding (see normalization).
-- Unsupported schemes, malformed bracket syntax, unrecognized query parameters, non-positive integer settings, and other parse errors are reported as a structured `ParseError` value containing a short human-readable message identifying which argument and which sub-piece failed. The component does not write to stdout/stderr — error reporting is the caller's job.
+- Empty input.
+- Multiple role tags.
+- A bracket group that is not closed, that contains an empty URL, or that contains a role tag on an inner URL.
+- Any URL with an unrecognized scheme.
+- Any query parameter outside the allowed set, or any value that fails the parameter's required form.
+- `sftp://` URLs without a host.
+- `sftp://` URLs with a port outside `1..=65535`.
 
-### URL normalization
-`normalize_url(u: Url | string) -> string` — returns the canonical identity string for a URL. Accepts either a `Url` produced by `parse_peer_arg` or a raw string (the raw form is parsed first). The normalization rules, applied in order:
-- Lowercase the scheme and hostname.
-- Remove the default SFTP port (22) if present.
-- Collapse consecutive slashes in the path.
-- Remove a trailing slash from the path (except when the path is exactly `/`).
-- Bare paths (no scheme) become `file://` URLs.
-- For `file://` URLs, resolve the path to an absolute filesystem path.
-- Percent-decode unreserved characters per RFC 3986.
-- Strip the query string entirely (per-URL settings are not part of the identity).
-- For `sftp://` URLs with no userinfo, insert the current OS user.
+## Examples
 
-Two URLs that normalize to the same string are the same peer.
-
-### Convenience
-`is_file_url(u: Url) -> bool` and `is_sftp_url(u: Url) -> bool` — scheme-dispatch predicates for the caller's transport selection. No transport logic lives in this component.
+- `+c:/photos` with `cwd=/home/u, default_user=ace` → role=`Canon`; one `ParsedUrl` with `scheme="file"`, `path="/c:/photos"`, `identity="file:///c:/photos"`.
+- `./data` with `cwd=/home/u` → role=`Normal`; `scheme="file"`, `path="/home/u/data"`, `identity="file:///home/u/data"`.
+- `[sftp://192.168.1.50/photos,sftp://nas.vpn/photos]` with `default_user=ace` → role=`Normal`; two `ParsedUrl`s with `scheme="sftp"`, `user="ace"`, host as given, identities `sftp://ace@192.168.1.50/photos` and `sftp://ace@nas.vpn/photos`.
+- `"SFTP://Host:22/path/?mc=5"` with `default_user=ace` → role=`Normal`; identity `sftp://ace@host/path`; `query={"mc":"5"}`.
+- `sftp://host//docs/` with `default_user=ace` → identity `sftp://ace@host/docs`.
 
 ## Anchoring
-- `Url` / scheme / userinfo / host / port / path / query / percent-encoding / unreserved characters: RFC 3986.
-- `sftp` scheme, default port 22, host-and-user-based identity: the SFTP scheme commonly understood and the `sync.md` §"URL Schemes" table.
-- `file` scheme, bare-path-to-`file://` coercion: the `file` URI scheme (RFC 8089) and `sync.md` §"URL Schemes".
-- Bracket fallback grammar, `+`/`-` prefixes, query-string settings `mc`/`ct`/`ka`: `sync.md` §"Peers", §"Fallback URLs", §"Per-URL Settings".
-- Normalization rules and examples: `database.md` §"URL Normalization".
-- "Current OS user": the host-language facility for the effective process user (e.g., POSIX `getlogin` / `pwd`, Windows `GetUserName`).
-- "Current working directory": the host-language facility for the process cwd at parse time.
+
+- URL/URI generic syntax: **RFC 3986** — scheme, authority (userinfo, host, port), path, query, percent-encoding rules, and unreserved-character set (§2.3).
+- `file://` URI form: **RFC 8089**.
+- `sftp://` URI: RFC 3986 generic-URI grammar applied to the conventional `sftp` scheme; userinfo (`user[:password]`) and host/port follow RFC 3986 §3.2.
+- Bare paths, Windows drive letters, forward-slash-delimited path components: host-language string and filesystem-path primitives.
+- Records, sum types, ordered lists, maps: host-language collection types.
