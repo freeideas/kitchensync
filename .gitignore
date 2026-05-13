@@ -11,19 +11,32 @@ aitc.old/
 # Regenerable per-device infrastructure and build products
 # =============================================================================
 /tools/
+/tools
 **/tools/
+**/tools
 /build/
+/build
 **/build/
+**/build
 /lib/
+/lib
 **/lib/
+**/lib
 **/released/
+**/released
 
 /tmp/
+/tmp
 **/tmp/
+**/tmp
 /reports/
+/reports
 **/reports/
+**/reports
 /sandboxes/
+/sandboxes
 **/sandboxes/
+**/sandboxes
 
 # Local credentials. `push-project.py` can encrypt ./creds/ to docs/creds.zip.
 /creds/
