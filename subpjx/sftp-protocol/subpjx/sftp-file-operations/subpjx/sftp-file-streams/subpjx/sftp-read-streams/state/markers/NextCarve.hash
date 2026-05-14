@@ -1,0 +1,8 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "NextCarve",
+  "taken_at_utc": "2026-05-14T22:32:24Z",
+  "hashes": {
+    "semantic_source": "e62f9712a4d59a5b75c00ca78ea69d87911163016c5d31e1aaa67b4ead99a46b"
+  }
+}

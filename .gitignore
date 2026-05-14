@@ -38,6 +38,9 @@ aitc.old/
 **/sandboxes/
 **/sandboxes
 
+# Local PowerShell cache sometimes created when running from this workspace.
+/Microsoft/
+
 # Local credentials. `push-project.py` can encrypt ./creds/ to docs/creds.zip.
 /creds/
 

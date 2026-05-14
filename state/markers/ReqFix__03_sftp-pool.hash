@@ -1,0 +1,8 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "ReqFix",
+  "taken_at_utc": "2026-05-14T21:14:42Z",
+  "hashes": {
+    "req": "e3bc3958f910d5c5668df393f395f61c02b1ef52a930b6a582cc6fd33d50e710"
+  }
+}
