@@ -29,6 +29,10 @@ aitc.old/
 /tmp
 **/tmp/
 **/tmp
+# Test scratch directories. Some tests stage scratch under `tests/.tmp_<stem>/`
+# rather than `./tmp/`; treat those as scratch too.
+**/tests/.tmp_*/
+**/tests/.tmp_*
 /reports/
 /reports
 **/reports/
