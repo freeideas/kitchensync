@@ -17,6 +17,10 @@ A single recursive walk visits the combined tree of all reachable peers. At each
 - `02.36` — When an entry is confirmed absent on a peer whose snapshot row already has `deleted_time` set, the row is left unchanged.
 - `02.37` — After `create_dir` succeeds on a destination peer during inline directory creation, that peer's snapshot row for the created directory has its `last_seen` set to the current sync timestamp.
 - `02.39` — When the group decides to delete an entry from a peer that still has it live in its listing (e.g., a deletion vote wins under rule 4/4b, or canon lacks the entry), that peer's existing snapshot row for the entry has its `deleted_time` set to the row's current `last_seen` value.
+- `02.44` — Snapshot rows for paths that are absent from every live peer listing do not create entries in the combined-tree walk.
+- `02.47` — When a file copy is enqueued for a destination peer, that peer's snapshot row records the winning file's `mod_time` and `byte_size` with `deleted_time = NULL`, but its `last_seen` is not changed until the copy completes successfully.
+- `02.48` — A file or directory named with mixed case on a source peer is created on destination peers with exactly the same basename spelling; KitchenSync does not normalize filename case.
+- `02.55` — Confirming an entry absent on a peer never updates that peer's `last_seen` value for the entry.
 
 ## Notes
 

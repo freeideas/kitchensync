@@ -1,403 +1,348 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["xxhash==3.5.0"]
 # ///
-"""Snapshot database: schema, path identity, timestamps, and tombstones."""
 
 from __future__ import annotations
 
-import os, re, shutil, sqlite3, subprocess, sys
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
-
-TMP = Path(PROJECT) / "tmp" / "testks" / "02_snapshot-db"
-PEER_A = TMP / "peer_a"
-PEER_B = TMP / "peer_b"
-
-TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z$")
-B62_RE = re.compile(r"^[0-9A-Za-z]{11}$")
-REQUIRED_COLS = {"basename", "mod_time", "byte_size", "last_seen", "deleted_time"}
-
-EXPECTED_PATHS = [
-    "file1.txt",
-    "subdir",
-    "subdir/file2.txt",
-    "subdir/nested",
-    "subdir/nested/file3.txt",
-] + [f"mono{i}.txt" for i in range(10)]
-EXPECTED_BASENAMES = sorted(path.rsplit("/", 1)[-1] for path in EXPECTED_PATHS)
-EXPECTED_DIRS = {"subdir", "subdir/nested"}
-EXPECTED_SIZES = {
-    "file1.txt": len("hello".encode("utf-8")),
-    "subdir/file2.txt": len("world".encode("utf-8")),
-    "subdir/nested/file3.txt": len("deep".encode("utf-8")),
-    **{f"mono{i}.txt": len(f"x{i}".encode("utf-8")) for i in range(10)},
-}
-
-MASK64 = 0xFFFFFFFFFFFFFFFF
-P1 = 0x9E3779B185EBCA87
-P2 = 0xC2B2AE3D27D4EB4F
-P3 = 0x165667B19E3779F9
-P4 = 0x85EBCA77C2B2AE63
-P5 = 0x27D4EB2F165667C5
-ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+import xxhash
 
 
-def _u64(value: int) -> int:
-    return value & MASK64
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
+BASE = Path(tempfile.gettempdir()) / "kitchensync-test-02-snapshot-db"
+PEER_A = BASE / "peer-a"
+PEER_B = BASE / "peer-b"
+TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z$")
+BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+# Not reasonably testable through the public CLI after a completed run:
+# - 02.24: a same-filesystem TMP-to-final atomic rename is an operation history,
+#   not a durable post-run state.
+# - 02.42: whether each product connection enabled SQLite foreign-key enforcement
+#   is per-connection state that is not recorded in the database file.
+# - 02.49: use of a local temporary working copy is an internal transfer choice;
+#   the public result is the uploaded peer snapshot.
+# Timestamp monotonicity in 02.40/02.45 is only partly observable because the
+# call order is internal. This test checks the durable consequences available
+# through the public surface: timestamp format and no reused generated values
+# among visible last_seen and BAK/TMP timestamp names from a run.
 
 
-def _rotl(value: int, bits: int) -> int:
-    value &= MASK64
-    return ((value << bits) | (value >> (64 - bits))) & MASK64
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["LC_ALL"] = "C.UTF-8"
+    return subprocess.run(
+        [str(JAVA), "-jar", str(JAR), *args],
+        cwd=str(PROJECT_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+        env=env,
+    )
 
 
-def _read_u64_le(data: bytes, pos: int) -> int:
-    return int.from_bytes(data[pos:pos + 8], "little")
+def check(failures: list[str], condition: bool, message: str) -> None:
+    if not condition:
+        failures.append(message)
 
 
-def _read_u32_le(data: bytes, pos: int) -> int:
-    return int.from_bytes(data[pos:pos + 4], "little")
+def write_file(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
 
 
-def _merge_round(acc: int, value: int) -> int:
-    acc ^= _u64(_rotl(_u64(value * P2), 31) * P1)
-    return _u64(acc * P1 + P4)
-
-
-def _xxhash64_seed0(data: bytes) -> int:
-    length = len(data)
-    pos = 0
-    if length >= 32:
-        v1 = _u64(P1 + P2)
-        v2 = P2
-        v3 = 0
-        v4 = _u64(-P1)
-        limit = length - 32
-        while pos <= limit:
-            v1 = _u64(_rotl(_u64(v1 + _read_u64_le(data, pos) * P2), 31) * P1)
-            pos += 8
-            v2 = _u64(_rotl(_u64(v2 + _read_u64_le(data, pos) * P2), 31) * P1)
-            pos += 8
-            v3 = _u64(_rotl(_u64(v3 + _read_u64_le(data, pos) * P2), 31) * P1)
-            pos += 8
-            v4 = _u64(_rotl(_u64(v4 + _read_u64_le(data, pos) * P2), 31) * P1)
-            pos += 8
-        h64 = _u64(_rotl(v1, 1) + _rotl(v2, 7) + _rotl(v3, 12) + _rotl(v4, 18))
-        h64 = _merge_round(h64, v1)
-        h64 = _merge_round(h64, v2)
-        h64 = _merge_round(h64, v3)
-        h64 = _merge_round(h64, v4)
-    else:
-        h64 = P5
-
-    h64 = _u64(h64 + length)
-    while pos + 8 <= length:
-        h64 ^= _u64(_rotl(_u64(_read_u64_le(data, pos) * P2), 31) * P1)
-        h64 = _u64(_rotl(h64, 27) * P1 + P4)
-        pos += 8
-    if pos + 4 <= length:
-        h64 ^= _u64(_read_u32_le(data, pos) * P1)
-        h64 = _u64(_rotl(h64, 23) * P2 + P3)
-        pos += 4
-    while pos < length:
-        h64 ^= _u64(data[pos] * P5)
-        h64 = _u64(_rotl(h64, 11) * P1)
-        pos += 1
-
-    h64 ^= h64 >> 33
-    h64 = _u64(h64 * P2)
-    h64 ^= h64 >> 29
-    h64 = _u64(h64 * P3)
-    h64 ^= h64 >> 32
-    return h64 & MASK64
-
-
-def _base62_11(value: int) -> str:
-    chars = []
-    value &= MASK64
+def encode_base62(value: int) -> str:
+    chars: list[str] = []
     for _ in range(11):
-        chars.append(ALPHABET[value % 62])
-        value //= 62
+        value, digit = divmod(value, 62)
+        chars.append(BASE62[digit])
     return "".join(reversed(chars))
 
 
-def _identify(path: str) -> str:
-    hash_path = "" if path in ("", "/") else path
-    return _base62_11(_xxhash64_seed0(hash_path.encode("utf-8")))
+def path_id(relative_path: str) -> str:
+    digest = xxhash.xxh64(relative_path.encode("utf-8"), seed=0).intdigest()
+    return encode_base62(digest)
 
 
-def _parent_path(path: str) -> str:
-    slash = path.rfind("/")
-    return "/" if slash < 0 else path[:slash]
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _sync(url_a: str, url_b: str, canon_a: bool = True) -> subprocess.CompletedProcess:
-    a_arg = ("+" if canon_a else "") + url_a
-    return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, a_arg, url_b],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
-        timeout=60,
-    )
-
-
-def _snapshot_rows(peer: Path) -> tuple[list[dict], str | None, str | None]:
-    db = peer / ".kitchensync" / "snapshot.db"
-    if not db.exists():
-        return [], None, "missing"
+def timestamp_from_stat(path: Path) -> str | None:
     try:
-        con = sqlite3.connect(str(db))
-        try:
-            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            for (name,) in cur.fetchall():
-                quoted = _quote_ident(name)
-                cols = {row[1] for row in con.execute(f"PRAGMA table_info({quoted})")}
-                if REQUIRED_COLS.issubset(cols):
-                    col_names = [d[0] for d in con.execute(f"SELECT * FROM {quoted} LIMIT 0").description]
-                    rows = [dict(zip(col_names, r)) for r in con.execute(f"SELECT * FROM {quoted}").fetchall()]
-                    return rows, name, None
-        finally:
-            con.close()
-    except sqlite3.DatabaseError as exc:
-        return [], None, str(exc)
-    return [], None, "no table with required columns"
+        micros_since_epoch = path.stat().st_mtime_ns // 1_000
+    except OSError:
+        return None
+    seconds, micros = divmod(micros_since_epoch, 1_000_000)
+    dt = datetime.fromtimestamp(seconds, tz=UTC)
+    return f"{dt:%Y-%m-%d_%H-%M-%S}_{micros:06d}Z"
 
 
-def _rows_by_basename(rows: list[dict]) -> dict[str, dict]:
-    return {str(row.get("basename")): row for row in rows}
+def db_path(peer: Path) -> Path:
+    return peer / ".kitchensync" / "snapshot.db"
 
 
-def _check_snapshot_content(label: str, rows: list[dict], failures: list[str]) -> None:
-    basenames = sorted(str(row.get("basename")) for row in rows)
-    print(f"[02.20 {label}] one row per tracked descendant: {basenames == EXPECTED_BASENAMES}")
-    if basenames != EXPECTED_BASENAMES:
-        failures.append(f"02.20 {label}: expected basenames {EXPECTED_BASENAMES}, got {basenames}")
+def connect_snapshot(peer: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{db_path(peer).as_posix()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    root_id = _identify("/")
-    root_rows = [
-        row for row in rows
-        if row.get("id") == root_id or row.get("basename") in ("", "/")
-    ]
-    print(f"[02.22 {label}] sync root itself has no row: {not root_rows}")
-    if root_rows:
-        failures.append(f"02.22 {label}: sync root appears in snapshot rows: {root_rows}")
 
-    by_name = _rows_by_basename(rows)
-    for path in sorted(EXPECTED_DIRS):
-        row = by_name.get(path.rsplit("/", 1)[-1])
-        ok = row is not None and row.get("byte_size") == -1
-        print(f"[02.21a {label}] {path} directory row byte_size=-1: {ok}")
-        if not ok:
-            failures.append(
-                f"02.21a {label}: {path} byte_size={row.get('byte_size') if row else 'no row'}"
+def rows_by_id(peer: Path) -> dict[str, sqlite3.Row]:
+    with connect_snapshot(peer) as conn:
+        rows = conn.execute("SELECT * FROM snapshot").fetchall()
+    return {str(row["id"]): row for row in rows}
+
+
+def visible_generated_timestamps(peer: Path) -> list[str]:
+    values: list[str] = []
+    with connect_snapshot(peer) as conn:
+        values.extend(
+            str(row["last_seen"])
+            for row in conn.execute(
+                "SELECT last_seen FROM snapshot WHERE deleted_time IS NULL AND last_seen IS NOT NULL"
             )
-
-    for path, expected_size in EXPECTED_SIZES.items():
-        row = by_name.get(path.rsplit("/", 1)[-1])
-        ok = row is not None and row.get("byte_size") == expected_size
-        print(f"[02.21b {label}] {path} byte_size={expected_size}: {ok}")
-        if not ok:
-            failures.append(
-                f"02.21b {label}: {path} byte_size="
-                f"{row.get('byte_size') if row else 'no row'}, expected {expected_size}"
-            )
-
-    bad_timestamps = []
-    for row in rows:
-        for col in ("mod_time", "last_seen", "deleted_time"):
-            value = row.get(col)
-            if value is not None and not TS_RE.match(str(value)):
-                bad_timestamps.append(f"{row.get('basename')}.{col}={value!r}")
-    print(f"[02.23 {label}] all timestamp values use required UTC format: {not bad_timestamps}")
-    if bad_timestamps:
-        failures.append(f"02.23 {label}: malformed timestamps: {bad_timestamps[:3]}")
-
-    missing_identity_cols = [col for col in ("id", "parent_id") if rows and col not in rows[0]]
-    if missing_identity_cols:
-        print(f"[02.38 {label}] FAIL: missing columns {missing_identity_cols}")
-        failures.append(f"02.38 {label}: missing columns {missing_identity_cols}")
-        return
-
-    for path in EXPECTED_PATHS:
-        basename = path.rsplit("/", 1)[-1]
-        row = by_name.get(basename)
-        expected_id = _identify(path)
-        expected_parent_id = _identify(_parent_path(path))
-        id_ok = row is not None and row.get("id") == expected_id
-        parent_ok = row is not None and row.get("parent_id") == expected_parent_id
-        shape_ok = (
-            row is not None
-            and B62_RE.match(str(row.get("id"))) is not None
-            and B62_RE.match(str(row.get("parent_id"))) is not None
         )
-        print(f"[02.38 {label}] {path} id/parent_id exact: {id_ok and parent_ok and shape_ok}")
-        if row is None:
-            failures.append(f"02.38 {label}: missing row for {path}")
-        else:
-            if not shape_ok:
-                failures.append(f"02.38 {label}: {path} id/parent_id not 11-char base62: {row}")
-            if not id_ok:
-                failures.append(f"02.38 {label}: {path} id={row.get('id')!r}, expected {expected_id!r}")
-            if not parent_ok:
-                failures.append(
-                    f"02.38 {label}: {path} parent_id={row.get('parent_id')!r}, "
-                    f"expected {expected_parent_id!r}"
-                )
+
+    for kitchensync in peer.glob("**/.kitchensync"):
+        for name in ["BAK", "TMP"]:
+            directory = kitchensync / name
+            if directory.exists():
+                values.extend(path.name for path in directory.iterdir() if path.is_dir())
+    return values
 
 
-def _check_subtree_tombstones(label: str, rows: list[dict], failures: list[str]) -> None:
-    by_name = _rows_by_basename(rows)
-    subdir = by_name.get("subdir")
-    nested = by_name.get("nested")
-    file2 = by_name.get("file2.txt")
-    file3 = by_name.get("file3.txt")
-    subdir_deleted = subdir.get("deleted_time") if subdir else None
-    descendant_deleted_times = [
-        row.get("deleted_time") if row else None
-        for row in (file2, nested, file3)
-    ]
-    chain_ok = (
-        subdir is not None
-        and file2 is not None
-        and nested is not None
-        and file3 is not None
-        and file2.get("parent_id") == subdir.get("id")
-        and nested.get("parent_id") == subdir.get("id")
-        and file3.get("parent_id") == nested.get("id")
+def check_process_timestamp_uniqueness(failures: list[str], label: str, peers: list[Path]) -> None:
+    values: list[str] = []
+    for peer in peers:
+        values.extend(visible_generated_timestamps(peer))
+    check(
+        failures,
+        len(values) == len(set(values)),
+        f"{label} visible generated timestamps are unique across all peers in the process",
     )
-    tombstone_ok = (
-        subdir_deleted is not None
-        and all(deleted_time == subdir_deleted for deleted_time in descendant_deleted_times)
-    )
-    outside_ok = True
-    for name in ("file1.txt", "mono0.txt", "mono9.txt"):
-        row = by_name.get(name)
-        if row is None or row.get("deleted_time") is not None:
-            outside_ok = False
-    print(f"[02.25 {label}] directory and descendant tombstoned through parent_id chain: {chain_ok and tombstone_ok}")
-    if not chain_ok:
-        failures.append(f"02.25 {label}: descendants are not linked under subdir by parent_id")
-    if not tombstone_ok:
+
+
+def assert_run_ok(failures: list[str], label: str, result: subprocess.CompletedProcess[str]) -> None:
+    if result.returncode != 0:
         failures.append(
-            f"02.25 {label}: subdir deleted_time={subdir_deleted!r}, "
-            f"descendant deleted_time values={descendant_deleted_times!r}"
+            f"{label} exited {result.returncode}; stdout={result.stdout[-2000:]!r}; "
+            f"stderr={result.stderr[-2000:]!r}"
         )
-    print(f"[02.25 {label}] unrelated rows remain live: {outside_ok}")
-    if not outside_ok:
-        failures.append(f"02.25 {label}: unrelated rows were tombstoned")
+
+
+def collect_schema_checks(failures: list[str], peer: Path, expected_paths: set[str]) -> None:
+    snapshot = db_path(peer)
+    check(failures, snapshot.is_file(), f"{peer.name} has .kitchensync/snapshot.db")
+
+    with connect_snapshot(peer) as conn:
+        tables = [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        check(failures, tables == ["snapshot"], f"{peer.name} schema has exactly one table named snapshot, got {tables}")
+
+        table_info = conn.execute("PRAGMA table_info(snapshot)").fetchall()
+        columns = {row["name"]: row for row in table_info}
+        for column in ["id", "parent_id", "basename", "mod_time", "byte_size", "last_seen", "deleted_time"]:
+            check(failures, column in columns, f"{peer.name} snapshot table includes {column}")
+
+        if "id" in columns:
+            check(failures, columns["id"]["pk"] == 1, f"{peer.name} snapshot.id is the primary key")
+        indexed_columns: set[str] = set()
+        for index in conn.execute("PRAGMA index_list(snapshot)").fetchall():
+            for info in conn.execute(f"PRAGMA index_info({index['name']})").fetchall():
+                indexed_columns.add(str(info["name"]))
+        for column in ["parent_id", "last_seen", "deleted_time"]:
+            check(failures, column in indexed_columns, f"{peer.name} snapshot has an index on {column}")
+
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        check(
+            failures,
+            journal_mode.lower() in {"delete", "truncate", "persist"},
+            f"{peer.name} snapshot uses rollback-journal mode, got {journal_mode!r}",
+        )
+
+        rows = conn.execute("SELECT * FROM snapshot").fetchall()
+
+    expected_ids = {path_id(path) for path in expected_paths}
+    actual_live_ids = {row["id"] for row in rows if row["deleted_time"] is None}
+    check(
+        failures,
+        actual_live_ids == expected_ids,
+        f"{peer.name} live snapshot rows are exactly tracked descendants; "
+        f"missing ids={sorted(expected_ids - actual_live_ids)}, "
+        f"extra ids={sorted(actual_live_ids - expected_ids)}",
+    )
+    check(failures, path_id("/") not in {row["id"] for row in rows}, f"{peer.name} snapshot has no row for sync root")
+
+    for row in rows:
+        rid = row["id"]
+        check(failures, isinstance(rid, str) and len(rid) == 11, f"{peer.name} row id {rid!r} is 11 characters")
+        check(failures, isinstance(rid, str) and set(rid) <= set(BASE62), f"{peer.name} row id {rid!r} uses base62 alphabet")
+        for column in ["basename", "mod_time", "byte_size"]:
+            check(failures, row[column] is not None, f"{peer.name} row {rid} has non-null {column}")
+        check(
+            failures,
+            TIMESTAMP_RE.match(row["mod_time"]) is not None,
+            f"{peer.name} row {rid} mod_time uses required UTC timestamp format: {row['mod_time']!r}",
+        )
+        check(
+            failures,
+            TIMESTAMP_RE.match(row["last_seen"]) is not None,
+            f"{peer.name} row {rid} last_seen uses required UTC timestamp format: {row['last_seen']!r}",
+        )
+        if row["deleted_time"] is not None:
+            check(
+                failures,
+                TIMESTAMP_RE.match(row["deleted_time"]) is not None,
+                f"{peer.name} row {rid} deleted_time uses required UTC timestamp format: {row['deleted_time']!r}",
+            )
+
+    live_last_seen = [row["last_seen"] for row in rows if row["deleted_time"] is None]
+    check(
+        failures,
+        len(live_last_seen) == len(set(live_last_seen)),
+        f"{peer.name} live last_seen timestamps are unique within the run",
+    )
+
+
+def assert_entry(
+    failures: list[str],
+    peer: Path,
+    rows: dict[str, sqlite3.Row],
+    relative_path: str,
+    basename: str,
+    parent_path: str,
+    expected_size: int,
+) -> None:
+    rid = path_id(relative_path)
+    row = rows.get(rid)
+    check(failures, row is not None, f"snapshot contains row for {relative_path} with id {rid}")
+    if row is None:
+        return
+    expected_parent = path_id(parent_path)
+    check(failures, row["parent_id"] == expected_parent, f"{relative_path} parent_id is hash of {parent_path!r}")
+    check(failures, row["basename"] == basename, f"{relative_path} basename stores final path component")
+    check(failures, row["byte_size"] == expected_size, f"{relative_path} byte_size is {expected_size}")
+    entry_path = peer.joinpath(*relative_path.split("/"))
+    current_mod_time = timestamp_from_stat(entry_path)
+    check(failures, current_mod_time is not None, f"{peer.name} {relative_path} exists on disk")
+    if expected_size >= 0:
+        check(
+            failures,
+            row["mod_time"] == current_mod_time,
+            f"{peer.name} {relative_path} mod_time matches the current filesystem entry",
+        )
+    check(failures, row["deleted_time"] is None, f"{relative_path} is live with deleted_time NULL")
 
 
 def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
+    failures: list[str] = []
+    if BASE.exists():
+        shutil.rmtree(BASE)
     PEER_A.mkdir(parents=True)
     PEER_B.mkdir(parents=True)
 
-    (PEER_A / "file1.txt").write_text("hello", encoding="utf-8")
-    (PEER_A / "subdir").mkdir()
-    (PEER_A / "subdir" / "file2.txt").write_text("world", encoding="utf-8")
-    (PEER_A / "subdir" / "nested").mkdir()
-    (PEER_A / "subdir" / "nested" / "file3.txt").write_text("deep", encoding="utf-8")
-    for i in range(10):
-        (PEER_A / f"mono{i}.txt").write_text(f"x{i}", encoding="utf-8")
+    write_file(PEER_A / "top.txt", b"top-level\n")
+    write_file(PEER_A / "alpha" / "beta.txt", b"nested beta\n")
+    write_file(PEER_A / "replace_me" / "nested" / "old.txt", b"old descendant\n")
 
-    url_a = PEER_A.resolve().as_uri()
-    url_b = PEER_B.resolve().as_uri()
-    db_a = PEER_A / ".kitchensync" / "snapshot.db"
-    db_b = PEER_B / ".kitchensync" / "snapshot.db"
+    first = run_cli("+%s" % PEER_A, "-%s" % PEER_B)
+    assert_run_ok(failures, "initial sync", first)
 
-    failures = []
+    expected_first_paths = {
+        "top.txt",
+        "alpha",
+        "alpha/beta.txt",
+        "replace_me",
+        "replace_me/nested",
+        "replace_me/nested/old.txt",
+    }
+    for peer in [PEER_A, PEER_B]:
+        collect_schema_checks(failures, peer, expected_first_paths)
+        rows = rows_by_id(peer)
+        assert_entry(failures, peer, rows, "top.txt", "top.txt", "/", len(b"top-level\n"))
+        assert_entry(failures, peer, rows, "alpha", "alpha", "/", -1)
+        assert_entry(failures, peer, rows, "alpha/beta.txt", "beta.txt", "alpha", len(b"nested beta\n"))
+        assert_entry(failures, peer, rows, "replace_me/nested/old.txt", "old.txt", "replace_me/nested", len(b"old descendant\n"))
+    check_process_timestamp_uniqueness(failures, "initial sync", [PEER_A, PEER_B])
 
-    try:
-        proc1 = _sync(url_a, url_b)
-        first_sync_ok = proc1.returncode == 0
-        if not first_sync_ok:
-            print(
-                f"[setup] sync failed exit {proc1.returncode}\n"
-                f"  stdout: {proc1.stdout!r}\n"
-                f"  stderr: {proc1.stderr!r}"
-            )
-            failures.append("setup: first sync failed")
-        else:
-            print("[setup] first sync completed (exit 0)")
+    peer_b_replace_me_before = rows_by_id(PEER_B).get(path_id("replace_me"))
+    peer_b_replace_me_last_seen_before = peer_b_replace_me_before["last_seen"] if peer_b_replace_me_before is not None else None
 
-        if first_sync_ok:
-            rows_by_peer = {}
-            for label, peer, db in (("peer_a", PEER_A, db_a), ("peer_b", PEER_B, db_b)):
-                exists = db.exists()
-                print(f"[02.18 {label}] .kitchensync/snapshot.db exists: {exists}")
-                if not exists:
-                    failures.append(f"02.18 {label}: missing .kitchensync/snapshot.db")
-                    continue
+    for sidecar in ["snapshot.db-wal", "snapshot.db-shm"]:
+        write_file(PEER_A / ".kitchensync" / sidecar, b"not sync state\n")
 
-                rows, table, error = _snapshot_rows(peer)
-                sqlite_ok = error is None and table is not None
-                print(f"[02.18 {label}] snapshot.db is readable SQLite with snapshot rows: {sqlite_ok}")
-                if not sqlite_ok:
-                    failures.append(f"02.18 {label}: snapshot.db not readable as required SQLite snapshot ({error})")
-                    continue
+    shutil.rmtree(PEER_A / "replace_me")
+    write_file(PEER_A / "replace_me", b"replacement file\n")
 
-                print(f"[02.20 {label}] table has required columns: {table is not None}")
-                rows_by_peer[label] = rows
-                _check_snapshot_content(label, rows, failures)
+    second = run_cli("+%s" % PEER_A, str(PEER_B))
+    assert_run_ok(failures, "directory displacement sync", second)
 
-            # 02.24 — not reasonably testable through the CLI. After a successful
-            # run, file:// exposes only the final filesystem state. Proving that
-            # snapshot.db landed via a same-filesystem rename from
-            # .kitchensync/TMP/ would require instrumenting the transport or OS
-            # rename operations, or interrupting the upload mid-run.
+    for sidecar in ["snapshot.db-wal", "snapshot.db-shm"]:
+        check(failures, not (PEER_B / ".kitchensync" / sidecar).exists(), f"{sidecar} was not synced to peer-b")
 
-            # 02.40 — the exact +1us collision fallback is not reasonably
-            # testable through the CLI because there is no hook to freeze or
-            # inject the process clock. The observable consequence available
-            # here is that program-generated last_seen values are not reused
-            # within the sync run.
-            seen_values = [
-                row["last_seen"]
-                for rows in rows_by_peer.values()
-                for row in rows
-                if row.get("last_seen") is not None
-            ]
-            distinct_seen = len(seen_values) == len(set(seen_values))
-            print(f"[02.40] last_seen values are distinct within one sync process: {distinct_seen}")
-            if not distinct_seen:
-                duplicates = sorted({value for value in seen_values if seen_values.count(value) > 1})
-                failures.append(f"02.40: duplicate last_seen timestamps: {duplicates[:3]}")
+    expected_second_paths = {"top.txt", "alpha", "alpha/beta.txt", "replace_me"}
+    for peer in [PEER_A, PEER_B]:
+        collect_schema_checks(failures, peer, expected_second_paths)
+        rows = rows_by_id(peer)
+        assert_entry(failures, peer, rows, "replace_me", "replace_me", "/", len(b"replacement file\n"))
 
-            shutil.rmtree(PEER_A / "subdir", ignore_errors=True)
-            proc2 = _sync(url_a, url_b)
-            if proc2.returncode != 0:
-                print(f"[02.25 setup] second sync failed exit {proc2.returncode}")
-                failures.append(
-                    f"02.25: second sync failed stdout={proc2.stdout!r} stderr={proc2.stderr!r}"
-                )
-            else:
-                print("[02.25 setup] second sync (after directory deletion) completed")
-                for label, peer in (("peer_a", PEER_A), ("peer_b", PEER_B)):
-                    rows, table, error = _snapshot_rows(peer)
-                    if table is None:
-                        failures.append(f"02.25 {label}: snapshot table not found after second sync ({error})")
-                    else:
-                        _check_subtree_tombstones(label, rows, failures)
+    peer_b_rows = rows_by_id(PEER_B)
+    displaced_ids = [path_id("replace_me/nested"), path_id("replace_me/nested/old.txt")]
+    displaced_rows = [peer_b_rows.get(rid) for rid in displaced_ids]
+    check(failures, all(row is not None for row in displaced_rows), "peer-b kept snapshot rows for displaced subtree")
+    deleted_values = [row["deleted_time"] for row in displaced_rows if row is not None]
+    check(failures, all(value is not None for value in deleted_values), "peer-b displaced directory subtree rows were tombstoned")
+    check(
+        failures,
+        bool(deleted_values) and all(value == peer_b_replace_me_last_seen_before for value in deleted_values),
+        "peer-b displaced descendants received the displaced entry deletion estimate",
+    )
 
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+    for peer in [PEER_A, PEER_B]:
+        bak_timestamps: list[str] = []
+        tmp_timestamps: list[str] = []
+        for kitchensync in peer.glob("**/.kitchensync"):
+            bak = kitchensync / "BAK"
+            if bak.exists():
+                bak_timestamps.extend(path.name for path in bak.iterdir() if path.is_dir())
+            tmp = kitchensync / "TMP"
+            if tmp.exists():
+                tmp_timestamps.extend(path.name for path in tmp.iterdir() if path.is_dir())
+        for stamp in bak_timestamps + tmp_timestamps:
+            check(failures, TIMESTAMP_RE.match(stamp) is not None, f"{peer.name} staging/archive timestamp {stamp!r} has required format")
+        check(
+            failures,
+            len(bak_timestamps + tmp_timestamps) == len(set(bak_timestamps + tmp_timestamps)),
+            f"{peer.name} visible BAK/TMP timestamp directories are unique",
+        )
+    check_process_timestamp_uniqueness(failures, "directory displacement sync", [PEER_A, PEER_B])
 
     if failures:
-        print("\nFAILURES:")
+        print("FAILURES:")
         for failure in failures:
-            print(f"  - {failure}")
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("02_snapshot-db checks passed")
     return 0
 
 

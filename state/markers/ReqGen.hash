@@ -1,8 +1,8 @@
 {
   "schema": "aitc.hash.v1",
   "job": "ReqGen",
-  "taken_at_utc": "2026-05-14T21:14:42Z",
+  "taken_at_utc": "2026-05-16T10:59:13Z",
   "hashes": {
-    "specs": "48d10b3b4554b7f241661f1905200011bd9352b77b97a8fd6cd3b4b88ed56a75"
+    "specs": "6073745182f066f1385a19001da024b4a3d36ba3e62d08e5868d18d54f29741d"
   }
 }

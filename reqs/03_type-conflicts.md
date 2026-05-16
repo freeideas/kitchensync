@@ -9,6 +9,8 @@ When the same path is a file on one peer and a directory on another, the conflic
 - `03.36` — When no canon peer is designated, or the canon peer has no entry at the conflicting path, the file wins over the directory at the same path: the directory is displaced to BAK/ on peers that have it.
 - `03.37` — After the type conflict is resolved (without canon override), the winning file is propagated to all peers, including peers that previously had the directory at that path.
 - `03.38` — When a canon peer is present and has an entry at the conflicting path, the canon peer's type wins: the other type is displaced to BAK/ on every peer that has it.
+<!-- SPEC GAP: The Behavior summary and 03.36 say a file wins when the canon peer has no entry at the conflicting path, but multi-tree-sync.md says the canon peer's absence wins and the path is displaced everywhere else. -->
+- `03.39` — When a canon peer is present and lacks a path that is a file on one peer and a directory on another, the canon peer's absence wins: files and directories at that path are displaced to BAK/ on every other peer that has them.
 
 ## Notes
 

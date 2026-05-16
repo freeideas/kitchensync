@@ -1,203 +1,193 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Subordinate peer behavior (03.21–03.27): non-influencing, receives group outcome, snapshot updated."""
 
 from __future__ import annotations
 
-import os, shutil, subprocess, sys, time
+import shutil
+import subprocess
+import sys
+import os
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = Path(PROJECT) / "tmp" / "testks" / "03_subordinate-peer"
-
-
-def _run(*peer_args, timeout=60):
-    return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, *peer_args],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
-        timeout=timeout,
-    )
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
+WORK = PROJECT_DIR / ".test-work/03_subordinate-peer"
 
 
-def _in_bak(peer_dir: Path, name: str) -> bool:
-    bak_root = peer_dir / ".kitchensync" / "BAK"
+def write_file(path: Path, text: str, mtime: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    touch_tree(path, mtime)
+
+
+def touch_tree(path: Path, mtime: int) -> None:
+    path.touch(exist_ok=True)
+    os.utime(path, (mtime, mtime))
+
+
+def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
+    command = [str(JAVA), "-jar", str(JAR), *peers]
+    try:
+        return subprocess.run(
+            command,
+            cwd=str(PROJECT_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=stdout,
+            stderr=f"{stderr}\nTimed out after {exc.timeout} seconds",
+        )
+
+
+def bak_matches(peer: Path, name: str) -> list[Path]:
+    bak_root = peer / ".kitchensync/BAK"
     if not bak_root.exists():
-        return False
-    for ts_dir in bak_root.iterdir():
-        if (ts_dir / name).exists():
-            return True
-    return False
+        return []
+    return sorted(p for p in bak_root.rglob(name) if p.is_file())
+
+
+def check(condition: bool, message: str, failures: list[str]) -> None:
+    if not condition:
+        failures.append(message)
+
+
+def check_file(path: Path, expected: str, message: str, failures: list[str]) -> None:
+    if not path.exists():
+        failures.append(f"{message}: missing {path}")
+        return
+    actual = path.read_text(encoding="utf-8")
+    if actual != expected:
+        failures.append(f"{message}: expected {expected!r}, got {actual!r} at {path}")
+
+
+def check_run(name: str, result: subprocess.CompletedProcess[str], failures: list[str]) -> None:
+    if result.returncode != 0:
+        failures.append(
+            f"{name} exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
 
 def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    TMP.mkdir(parents=True)
+    failures: list[str] = []
+    if WORK.exists():
+        shutil.rmtree(WORK)
 
-    failures = []
+    alpha = WORK / "alpha"
+    beta = WORK / "beta"
+    explicit_subordinate = WORK / "explicit-subordinate"
+    auto_subordinate = WORK / "auto-subordinate"
 
-    try:
-        # --- 03.21: Sub peer's files don't influence decisions among normal peers ---
-        peer1 = TMP / "t0321" / "peer1"
-        peer2 = TMP / "t0321" / "peer2"
-        sub   = TMP / "t0321" / "sub"
-        peer1.mkdir(parents=True)
-        peer2.mkdir(parents=True)
-        sub.mkdir(parents=True)
+    write_file(alpha / "shared.txt", "alpha initial\n", 1_700_000_000)
+    write_file(alpha / "folder/group.txt", "group nested file\n", 1_700_000_000)
+    beta.mkdir(parents=True)
 
-        # Establish snapshots on peer1 and peer2 with matching content.
-        (peer1 / "shared.txt").write_text("original")
-        (peer2 / "shared.txt").write_text("original")
-        _run("+" + peer1.resolve().as_uri(), peer2.resolve().as_uri())
+    initial = run_sync(f"+{alpha}", str(beta))
+    check_run("initial canon sync", initial, failures)
+    check_file(beta / "shared.txt", "alpha initial\n", "initial sync copied root file to beta", failures)
+    check_file(beta / "folder/group.txt", "group nested file\n", "initial sync copied nested file to beta", failures)
 
-        # peer1 updates to a newer version; sub gets an even newer version that must be ignored.
-        (peer1 / "shared.txt").write_text("from-peer1")
-        t_newer = time.time() + 60
-        os.utime(peer1 / "shared.txt", (t_newer, t_newer))
-        (sub / "shared.txt").write_text("from-sub-ignore-me")
-        t_even_newer = time.time() + 120
-        os.utime(sub / "shared.txt", (t_even_newer, t_even_newer))
+    write_file(alpha / "shared.txt", "alpha winner\n", 1_700_000_100)
+    write_file(explicit_subordinate / "shared.txt", "explicit subordinate wrong newer\n", 1_700_000_200)
+    write_file(explicit_subordinate / "extra-only.txt", "explicit extra\n", 1_700_000_200)
+    write_file(auto_subordinate / "shared.txt", "auto subordinate wrong newest\n", 1_700_000_300)
+    write_file(auto_subordinate / "extra-auto.txt", "auto extra\n", 1_700_000_300)
 
-        _run(peer1.resolve().as_uri(), peer2.resolve().as_uri(), "-" + sub.resolve().as_uri())
+    subordinate_run = run_sync(str(alpha), str(beta), f"-{explicit_subordinate}", str(auto_subordinate))
+    check_run("subordinate sync", subordinate_run, failures)
 
-        got_peer2 = (peer2 / "shared.txt").read_text() if (peer2 / "shared.txt").exists() else None
-        print(f"[03.21] peer2/shared.txt: {got_peer2!r}")
-        if got_peer2 != "from-peer1":
-            failures.append(
-                f"03.21: expected 'from-peer1' on peer2 (sub's even-newer version must not influence), "
-                f"got {got_peer2!r}"
-            )
-
-        # --- 03.22 + 03.23: Sub loses extra files to BAK/; gains group-decided files ---
-        peer1 = TMP / "t0322" / "peer1"
-        sub   = TMP / "t0322" / "sub"
-        peer1.mkdir(parents=True)
-        sub.mkdir(parents=True)
-        (peer1 / "group_file.txt").write_text("group-content")
-        (sub / "extra.txt").write_text("sub-only")
-        _run("+" + peer1.resolve().as_uri(), "-" + sub.resolve().as_uri())
-
-        # 03.22: extra.txt not in group state → displaced to BAK/
-        present = (sub / "extra.txt").exists()
-        in_bak  = _in_bak(sub, "extra.txt")
-        print(f"[03.22] extra.txt present={present}, in BAK={in_bak}")
-        if present:
-            failures.append("03.22: extra.txt still present on sub (should be displaced to BAK/)")
-        if not in_bak:
-            failures.append("03.22: extra.txt not found in sub/.kitchensync/BAK/")
-
-        # 03.23: group_file.txt in group state but missing from sub → copied to sub
-        got = (sub / "group_file.txt").read_text() if (sub / "group_file.txt").exists() else None
-        print(f"[03.23] sub/group_file.txt: {got!r}")
-        if got != "group-content":
-            failures.append(f"03.23: expected 'group-content' on sub, got {got!r}")
-
-        # --- 03.24: Peer with no snapshot.db is auto-subordinated (no - prefix required) ---
-        peer1 = TMP / "t0324" / "peer1"
-        peer2 = TMP / "t0324" / "peer2"
-        peer1.mkdir(parents=True)
-        peer2.mkdir(parents=True)
-        (peer1 / "canonical.txt").write_text("from-canon")
-        (peer2 / "extra_no_snap.txt").write_text("should-be-displaced")
-        # peer2 has no .kitchensync/snapshot.db and no - prefix → must be auto-subordinated
-        _run("+" + peer1.resolve().as_uri(), peer2.resolve().as_uri())
-
-        canonical_present = (peer2 / "canonical.txt").exists()
-        extra_present     = (peer2 / "extra_no_snap.txt").exists()
-        extra_in_bak      = _in_bak(peer2, "extra_no_snap.txt")
-        print(f"[03.24] canonical={canonical_present}, extra present={extra_present}, extra in BAK={extra_in_bak}")
-        if not canonical_present:
-            failures.append("03.24: canonical.txt not copied to snapshotless peer (auto-subordination failed)")
-        if extra_present:
-            failures.append("03.24: extra file still present on snapshotless peer (should be displaced as subordinate)")
-        if not extra_in_bak:
-            failures.append("03.24: extra file not in BAK/ on snapshotless peer (auto-subordination failed)")
-
-        # --- 03.25: Sub peer's snapshot.db is updated and uploaded after run ---
-        peer1 = TMP / "t0325" / "peer1"
-        sub   = TMP / "t0325" / "sub"
-        peer1.mkdir(parents=True)
-        sub.mkdir(parents=True)
-        (peer1 / "file.txt").write_text("content")
-        _run("+" + peer1.resolve().as_uri(), "-" + sub.resolve().as_uri())
-
-        snap = sub / ".kitchensync" / "snapshot.db"
-        print(f"[03.25] sub snapshot.db exists: {snap.exists()}")
-        if not snap.exists():
-            failures.append("03.25: sub/.kitchensync/snapshot.db not present after subordinate sync")
-
-        # --- 03.26: Peer promoted from sub to normal participates bidirectionally ---
-        peer1 = TMP / "t0326" / "peer1"
-        sub   = TMP / "t0326" / "sub"
-        peer1.mkdir(parents=True)
-        sub.mkdir(parents=True)
-        (peer1 / "file.txt").write_text("v1")
-        (sub / "file.txt").write_text("v1")
-
-        # Run 1: sub is explicit subordinate → builds its snapshot record
-        _run("+" + peer1.resolve().as_uri(), "-" + sub.resolve().as_uri())
-
-        # sub modifies its file with a timestamp clearly newer than the snapshot
-        (sub / "file.txt").write_text("from-sub-promoted")
-        t_sub = time.time() + 60
-        os.utime(sub / "file.txt", (t_sub, t_sub))
-
-        # Run 2: sub without - → participates as normal bidirectional peer
-        _run(peer1.resolve().as_uri(), sub.resolve().as_uri())
-
-        got_peer1 = (peer1 / "file.txt").read_text() if (peer1 / "file.txt").exists() else None
-        print(f"[03.26] peer1/file.txt after promoted sub: {got_peer1!r}")
-        if got_peer1 != "from-sub-promoted":
-            failures.append(
-                f"03.26: expected 'from-sub-promoted' on peer1 (sub now normal peer, change must propagate), "
-                f"got {got_peer1!r}"
-            )
-
-        # --- 03.27: More than one subordinate peer per run is allowed ---
-        peer1 = TMP / "t0327" / "peer1"
-        sub1  = TMP / "t0327" / "sub1"
-        sub2  = TMP / "t0327" / "sub2"
-        peer1.mkdir(parents=True)
-        sub1.mkdir(parents=True)
-        sub2.mkdir(parents=True)
-        (peer1 / "group.txt").write_text("group-content")
-        (sub1 / "sub1_only.txt").write_text("sub1")
-        (sub2 / "sub2_only.txt").write_text("sub2")
-        result = _run(
-            "+" + peer1.resolve().as_uri(),
-            "-" + sub1.resolve().as_uri(),
-            "-" + sub2.resolve().as_uri(),
+    for peer_name, peer in (
+        ("alpha", alpha),
+        ("beta", beta),
+        ("explicit subordinate", explicit_subordinate),
+        ("auto subordinate", auto_subordinate),
+    ):
+        check_file(
+            peer / "shared.txt",
+            "alpha winner\n",
+            f"{peer_name} uses the normal peers' decided state, not subordinate newer content",
+            failures,
         )
-        print(f"[03.27] two-sub run exit code: {result.returncode}")
-        if result.returncode != 0:
-            failures.append(
-                f"03.27: expected exit 0 with two sub peers, got {result.returncode}; "
-                f"stderr: {result.stderr!r}"
-            )
-        got_sub1 = (sub1 / "group.txt").exists()
-        got_sub2 = (sub2 / "group.txt").exists()
-        print(f"[03.27] sub1 has group.txt={got_sub1}, sub2 has group.txt={got_sub2}")
-        if not got_sub1:
-            failures.append("03.27: group.txt not copied to sub1 in two-sub run")
-        if not got_sub2:
-            failures.append("03.27: group.txt not copied to sub2 in two-sub run")
 
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+    for peer_name, peer in (
+        ("explicit subordinate", explicit_subordinate),
+        ("auto subordinate", auto_subordinate),
+    ):
+        check_file(
+            peer / "folder/group.txt",
+            "group nested file\n",
+            f"{peer_name} received file missing from subordinate peer",
+            failures,
+        )
+        snapshot = peer / ".kitchensync/snapshot.db"
+        check(
+            snapshot.exists() and snapshot.stat().st_size > 0,
+            f"{peer_name} snapshot.db was uploaded after subordinate sync",
+            failures,
+        )
+
+    check(
+        not (explicit_subordinate / "extra-only.txt").exists(),
+        "explicit subordinate extra file was removed from live tree",
+        failures,
+    )
+    explicit_bak = bak_matches(explicit_subordinate, "extra-only.txt")
+    check(
+        bool(explicit_bak),
+        "explicit subordinate extra file was displaced to .kitchensync/BAK",
+        failures,
+    )
+    if explicit_bak:
+        check_file(explicit_bak[-1], "explicit extra\n", "explicit subordinate BAK kept displaced content", failures)
+
+    check(
+        not (auto_subordinate / "extra-auto.txt").exists(),
+        "auto-subordinate extra file was removed from live tree",
+        failures,
+    )
+    auto_bak = bak_matches(auto_subordinate, "extra-auto.txt")
+    check(
+        bool(auto_bak),
+        "auto-subordinate extra file was displaced to .kitchensync/BAK",
+        failures,
+    )
+    if auto_bak:
+        check_file(auto_bak[-1], "auto extra\n", "auto-subordinate BAK kept displaced content", failures)
+
+    write_file(explicit_subordinate / "shared.txt", "explicit later normal winner\n", 1_700_000_400)
+    later_normal_run = run_sync(str(alpha), str(beta), str(explicit_subordinate))
+    check_run("later normal sync", later_normal_run, failures)
+    for peer_name, peer in (("alpha", alpha), ("beta", beta), ("former subordinate", explicit_subordinate)):
+        check_file(
+            peer / "shared.txt",
+            "explicit later normal winner\n",
+            f"{peer_name} accepted former subordinate as a normal peer on later run",
+            failures,
+        )
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("FAILURES:")
+        for index, failure in enumerate(failures, 1):
+            print(f"{index}. {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("03_subordinate-peer passed")
     return 0
 
 

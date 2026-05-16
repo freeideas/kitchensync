@@ -15,6 +15,11 @@ Every file copy and every displacement is logged once per decision (not once per
 - `03.83` — Pool acquire and release events do not appear in the output at `-vl error`, `-vl info`, or `-vl debug`.
 - `03.84` — Pool acquire and release events use the format `endpoint=<user@host> connections=<n>/<max>` keyed by user+host.
 - `03.85` — A `list_dir` failure on one peer at one directory produces a log line at `error` verbosity that identifies the affected peer and directory.
+- `03.98` — At `-vl debug`, log output is observationally identical to `-vl info`: `C`/`X` progress lines are emitted and no debug-only messages are emitted.
+- `03.99` — Pool acquire and release events identify the endpoint as normalized `user@host:port`, including the normalized port.
+- `03.105` — Verbosity is cumulative: log messages emitted at a lower verbosity level are also emitted when a higher verbosity level is selected.
+- `03.109` — At `-vl trace`, every SFTP pool acquire and every SFTP pool release emits a pool-change log line.
+- `03.113` — Stderr remains empty during argument parsing, sync execution, and shutdown, including output from transitive logging libraries.
 
 ## Notes
 

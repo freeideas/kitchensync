@@ -1,196 +1,378 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Global option defaults take effect when their flags are omitted (01.24)."""
 
 from __future__ import annotations
 
-import datetime
 import os
+import re
+import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = (Path(PROJECT) / "tmp" / "testks" / "01_cli-grammar").resolve()
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+JAVA = PROJECT_DIR / "tools" / "compiler" / "jdk" / "bin" / "java"
+JAR = PROJECT_DIR / "released" / "kitchensync.jar"
+WORK_DIR = PROJECT_DIR / "tests" / ".tmp" / "01_cli_grammar"
+
+REMOTE_USER = "ace"
+REMOTE_HOST = "ordinarydata.com"
+REMOTE_BASE = f"/tmp/testks/01_cli_grammar_{os.getpid()}"
 
 
-def invoke(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT] + args,
+@dataclass(frozen=True)
+class CliResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    elapsed: float
+
+
+class StalledSshEndpoint:
+    def __init__(self) -> None:
+        self.accepted = 0
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._sock: socket.socket | None = None
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> StalledSshEndpoint:
+        self._thread.start()
+        if not self._ready.wait(timeout=5):
+            raise RuntimeError("stalled SSH endpoint did not start")
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=5)
+
+    @property
+    def port(self) -> int:
+        if self._sock is None:
+            raise RuntimeError("stalled SSH endpoint has no socket")
+        return int(self._sock.getsockname()[1])
+
+    def _serve(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            server.settimeout(0.2)
+            self._sock = server
+            self._ready.set()
+            clients: list[socket.socket] = []
+            try:
+                while not self._stop.is_set():
+                    try:
+                        client, _addr = server.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    self.accepted += 1
+                    clients.append(client)
+            finally:
+                for client in clients:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+
+
+def run_cli(*args: str, timeout: int = 90) -> CliResult:
+    start = time.monotonic()
+    result = subprocess.run(
+        [str(JAVA), "-jar", str(JAR), *args],
+        cwd=str(PROJECT_DIR),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=timeout,
+        check=False,
+    )
+    return CliResult(
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        elapsed=time.monotonic() - start,
     )
 
 
-def old_ts(days: int, hours: int = 0) -> str:
-    t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        days=days, hours=hours
+def run_ssh(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{REMOTE_USER}@{REMOTE_HOST}",
+            command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
     )
-    return t.strftime("%Y-%m-%d_%H-%M-%S_000000Z")
 
 
-def make_file_peers(tag: str) -> tuple[Path, Path]:
-    p1 = TMP / tag / "peer1"
-    p2 = TMP / tag / "peer2"
-    p1.mkdir(parents=True, exist_ok=True)
-    p2.mkdir(parents=True, exist_ok=True)
-    (p1 / "seed.txt").write_text("seed", encoding="utf-8")
-    return p1, p2
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 
-def sync_file_peers(p1: Path, p2: Path) -> subprocess.CompletedProcess[str]:
-    return invoke(["+" + p1.as_uri(), p2.as_uri()])
+def payload_tree(root: Path) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and ".kitchensync" not in path.parts:
+            files[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8")
+    return files
 
 
-def checkpoint(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+def progress_lines(stdout: str, marker: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith(f"{marker} ")]
+
+
+def describe_result(result: CliResult) -> str:
+    return (
+        f"exit={result.returncode} elapsed={result.elapsed:.2f}s\n"
+        f"stdout:\n{result.stdout[-2000:]}\n"
+        f"stderr:\n{result.stderr[-2000:]}"
+    )
+
+
+def check_success(failures: list[str], req_id: str, label: str, result: CliResult) -> None:
+    if result.returncode != 0:
+        failures.append(f"{req_id}: {label} should exit 0; {describe_result(result)}")
+
+
+def timestamp(days_from_now: int) -> str:
+    value = datetime.now(timezone.utc) + timedelta(days=days_from_now)
+    return value.strftime("%Y-%m-%d_%H-%M-%S_") + f"{value.microsecond:06d}Z"
+
+
+def make_peer_pair(root: Path) -> tuple[Path, Path]:
+    source = root / "source"
+    dest = root / "dest"
+    write_text(source / "alpha.txt", "alpha\n")
+    write_text(source / "nested" / "beta.txt", "beta\n")
+    dest.mkdir(parents=True, exist_ok=True)
+    return source, dest
+
+
+def make_retention_dirs(level: Path, *, old_xd: str, fresh_xd: str, old_bd: str, fresh_bd: str) -> dict[str, Path]:
+    paths = {
+        "old_tmp": level / ".kitchensync" / "TMP" / old_xd,
+        "fresh_tmp": level / ".kitchensync" / "TMP" / fresh_xd,
+        "old_bak": level / ".kitchensync" / "BAK" / old_bd,
+        "fresh_bak": level / ".kitchensync" / "BAK" / fresh_bd,
+    }
+    write_text(paths["old_tmp"] / "uuid-old" / "gone.txt", "old tmp\n")
+    write_text(paths["fresh_tmp"] / "uuid-fresh" / "kept.txt", "fresh tmp\n")
+    write_text(paths["old_bak"] / "gone.txt", "old bak\n")
+    write_text(paths["fresh_bak"] / "kept.txt", "fresh bak\n")
+    return paths
+
+
+def insert_tombstone_fixture(peer: Path, old_time: str, fresh_time: str) -> tuple[str, str]:
+    old_id = "default_td_old_tombstone"
+    fresh_id = "default_td_fresh_tombstone"
+    database = peer / ".kitchensync" / "snapshot.db"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        template = connection.execute("SELECT * FROM snapshot LIMIT 1").fetchone()
+        if template is None:
+            raise RuntimeError("snapshot fixture did not contain a template row")
+        columns = list(template.keys())
+        placeholders = ",".join("?" for _ in columns)
+        sql = f"INSERT OR REPLACE INTO snapshot ({','.join(columns)}) VALUES ({placeholders})"
+        for row_id, basename, row_time in (
+            (old_id, "__default_td_old__.txt", old_time),
+            (fresh_id, "__default_td_fresh__.txt", fresh_time),
+        ):
+            values = dict(template)
+            values.update(
+                {
+                    "id": row_id,
+                    "basename": basename,
+                    "mod_time": row_time,
+                    "byte_size": 1,
+                    "last_seen": row_time,
+                    "deleted_time": row_time,
+                }
+            )
+            connection.execute(sql, [values[column] for column in columns])
+        connection.commit()
+    return old_id, fresh_id
+
+
+def snapshot_ids(peer: Path) -> set[str]:
+    database = peer / ".kitchensync" / "snapshot.db"
+    with sqlite3.connect(database) as connection:
+        return {str(row[0]) for row in connection.execute("SELECT id FROM snapshot").fetchall()}
+
+
+def check_01_24_default_mc(failures: list[str]) -> None:
+    source = WORK_DIR / "default_mc" / "source"
+    write_text(source / "remote.txt", "default mc\n")
+    remote = f"sftp://{REMOTE_USER}@{REMOTE_HOST}{REMOTE_BASE}/default-mc"
+
+    result = run_cli("-vl", "trace", f"+{source}", f"-{remote}", timeout=120)
+    check_success(failures, "01.24", "omitted --mc SFTP trace sync", result)
+    lines = [line for line in result.stdout.splitlines() if "endpoint=" in line and "connections=" in line]
+    if not any(re.search(r"endpoint=ace@ordinarydata\.com:22 connections=\d+/10\b", line) for line in lines):
+        failures.append(f"01.24: omitted --mc should create an SFTP pool with max 10; pool lines={lines!r}")
+
+
+def check_01_29_default_ct(failures: list[str]) -> None:
+    source, fallback_dest = make_peer_pair(WORK_DIR / "default_ct")
+    with StalledSshEndpoint() as stalled:
+        peer = f"[sftp://{REMOTE_USER}@127.0.0.1:{stalled.port}/tmp/testks/never,{fallback_dest.resolve().as_uri()}]"
+        result = run_cli(f"+{source}", peer, timeout=50)
+        check_success(failures, "01.29", "omitted --ct stalled SFTP fallback sync", result)
+        if stalled.accepted < 1:
+            failures.append("01.29: stalled SFTP endpoint was not contacted")
+        if result.elapsed < 25:
+            failures.append(f"01.29: omitted --ct should wait close to the 30 second default; elapsed={result.elapsed:.2f}s")
+        if result.elapsed > 45:
+            failures.append(f"01.29: omitted --ct exceeded the expected 30 second default window; elapsed={result.elapsed:.2f}s")
+    expected = {"alpha.txt": "alpha\n", "nested/beta.txt": "beta\n"}
+    if payload_tree(fallback_dest) != expected:
+        failures.append(f"01.29: fallback file peer did not receive payload after default ct timeout: {payload_tree(fallback_dest)!r}")
+
+
+def check_01_31_default_verbosity(failures: list[str]) -> None:
+    source, omitted_dest = make_peer_pair(WORK_DIR / "default_verbosity" / "omitted")
+    info_dest = WORK_DIR / "default_verbosity" / "explicit-info" / "dest"
+    info_dest.mkdir(parents=True, exist_ok=True)
+
+    omitted = run_cli(f"+{source}", f"-{omitted_dest}")
+    explicit = run_cli("-vl", "info", f"+{source}", f"-{info_dest}")
+    check_success(failures, "01.31", "omitted -vl sync", omitted)
+    check_success(failures, "01.31", "explicit -vl info sync", explicit)
+
+    expected_progress = ["C alpha.txt", "C nested/beta.txt"]
+    omitted_progress = sorted(progress_lines(omitted.stdout, "C"))
+    explicit_progress = sorted(progress_lines(explicit.stdout, "C"))
+    if omitted_progress != expected_progress:
+        failures.append(f"01.31: omitted -vl should emit info copy lines; got {omitted_progress!r}")
+    if explicit_progress != expected_progress:
+        failures.append(f"01.31: explicit -vl info fixture should emit info copy lines; got {explicit_progress!r}")
+
+
+def check_01_32_33_34_retention_defaults(failures: list[str]) -> None:
+    root = WORK_DIR / "retention_defaults"
+    peer_a = root / "peer-a"
+    peer_b = root / "peer-b"
+    write_text(peer_a / "root.txt", "root\n")
+    write_text(peer_a / "nested" / "child.txt", "child\n")
+    peer_b.mkdir(parents=True, exist_ok=True)
+
+    setup = run_cli(f"+{peer_a}", f"-{peer_b}")
+    check_success(failures, "01.32/01.33/01.34", "retention fixture setup", setup)
+    if not (peer_a / ".kitchensync" / "snapshot.db").is_file():
+        failures.append("01.34: retention fixture did not create peer-a snapshot.db")
+        return
+
+    old_xd = timestamp(-3)
+    fresh_xd = timestamp(-1)
+    old_bd = timestamp(-91)
+    fresh_bd = timestamp(-89)
+    paths_by_level = {
+        "root": make_retention_dirs(peer_a, old_xd=old_xd, fresh_xd=fresh_xd, old_bd=old_bd, fresh_bd=fresh_bd),
+        "nested": make_retention_dirs(peer_a / "nested", old_xd=old_xd, fresh_xd=fresh_xd, old_bd=old_bd, fresh_bd=fresh_bd),
+    }
+
+    old_td = timestamp(-181)
+    fresh_td = timestamp(-179)
+    old_id, fresh_id = insert_tombstone_fixture(peer_a, old_td, fresh_td)
+
+    result = run_cli(str(peer_a), str(peer_b))
+    check_success(failures, "01.32/01.33/01.34", "omitted retention flags sync", result)
+
+    for level, paths in paths_by_level.items():
+        if paths["old_tmp"].exists():
+            failures.append(f"01.32: omitted --xd should remove stale {level} TMP older than 2 days")
+        if not paths["fresh_tmp"].is_dir():
+            failures.append(f"01.32: omitted --xd should keep fresh {level} TMP newer than 2 days")
+        if paths["old_bak"].exists():
+            failures.append(f"01.33: omitted --bd should remove stale {level} BAK older than 90 days")
+        if not paths["fresh_bak"].is_dir():
+            failures.append(f"01.33: omitted --bd should keep fresh {level} BAK newer than 90 days")
+
+    ids_after = snapshot_ids(peer_a)
+    if old_id in ids_after:
+        failures.append("01.34: omitted --td should purge tombstones older than 180 days")
+    if fresh_id not in ids_after:
+        failures.append("01.34: omitted --td should keep tombstones newer than 180 days")
 
 
 def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    TMP.mkdir(parents=True)
-
     failures: list[str] = []
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+    reset_remote = run_ssh(f"rm -rf {shlex.quote(REMOTE_BASE)} && mkdir -p {shlex.quote(REMOTE_BASE)}")
+    if reset_remote.returncode != 0:
+        failures.append(
+            "01.24: remote SFTP fixture reset failed: "
+            f"exit={reset_remote.returncode} stdout={reset_remote.stdout!r} stderr={reset_remote.stderr!r}"
+        )
+
+    checks = [
+        check_01_24_default_mc,
+        check_01_29_default_ct,
+        check_01_31_default_verbosity,
+        check_01_32_33_34_retention_defaults,
+    ]
     try:
-        # 01.24: -vl defaults to info. Info copy lines must appear when -vl is
-        # omitted, while trace-only pool lines must not appear at the default.
-        # The spec defines no debug-only messages, so info and debug are not
-        # distinguishable through CLI output.
-        p1, p2 = make_file_peers("verbosity")
-        print("[01.24 -vl] omitted -vl emits info copy output")
-        r = sync_file_peers(p1, p2)
-        if r.returncode != 0:
-            failures.append(
-                f"01.24 -vl: sync with omitted -vl failed (exit {r.returncode})\n"
-                f"  stdout: {r.stdout!r}\n  stderr: {r.stderr!r}"
-            )
-        if "C seed.txt" not in r.stdout:
-            failures.append(
-                f"01.24 -vl: omitted -vl did not emit the info-level copy line\n"
-                f"  stdout: {r.stdout!r}"
-            )
-        if "endpoint=" in r.stdout or "connections=" in r.stdout:
-            failures.append(
-                f"01.24 -vl: omitted -vl emitted trace-level pool output\n"
-                f"  stdout: {r.stdout!r}"
-            )
-
-        # 01.24: --xd defaults to 2 days. A TMP directory older than 2 days is
-        # stale; one younger than 2 days is retained.
-        p1, p2 = make_file_peers("xd")
-        r = sync_file_peers(p1, p2)
-        if r.returncode != 0:
-            failures.append(f"01.24 --xd setup: initial sync failed (exit {r.returncode})")
-        else:
-            tmp_root = p1 / ".kitchensync" / "TMP"
-            stale_tmp = tmp_root / old_ts(2, 1)
-            fresh_tmp = tmp_root / old_ts(1, 23)
-            stale_tmp.mkdir(parents=True)
-            fresh_tmp.mkdir(parents=True)
-            (stale_tmp / "stale.txt").write_text("stale", encoding="utf-8")
-            (fresh_tmp / "fresh.txt").write_text("fresh", encoding="utf-8")
-            r = sync_file_peers(p1, p2)
-            print(f"[01.24 --xd] stale exists={stale_tmp.exists()} fresh exists={fresh_tmp.exists()}")
-            if r.returncode != 0:
-                failures.append(f"01.24 --xd: default-retention sync failed (exit {r.returncode})")
-            if stale_tmp.exists():
-                failures.append("01.24 --xd: 49-hour-old TMP directory was not removed by default --xd 2")
-            if not fresh_tmp.exists():
-                failures.append("01.24 --xd: 47-hour-old TMP directory was removed by default --xd 2")
-
-        # 01.24: --bd defaults to 90 days. A BAK directory older than 90 days
-        # is stale; one younger than 90 days is retained.
-        p1, p2 = make_file_peers("bd")
-        r = sync_file_peers(p1, p2)
-        if r.returncode != 0:
-            failures.append(f"01.24 --bd setup: initial sync failed (exit {r.returncode})")
-        else:
-            bak_root = p1 / ".kitchensync" / "BAK"
-            stale_bak = bak_root / old_ts(90, 1)
-            fresh_bak = bak_root / old_ts(89, 23)
-            stale_bak.mkdir(parents=True)
-            fresh_bak.mkdir(parents=True)
-            (stale_bak / "stale.txt").write_text("stale", encoding="utf-8")
-            (fresh_bak / "fresh.txt").write_text("fresh", encoding="utf-8")
-            r = sync_file_peers(p1, p2)
-            print(f"[01.24 --bd] stale exists={stale_bak.exists()} fresh exists={fresh_bak.exists()}")
-            if r.returncode != 0:
-                failures.append(f"01.24 --bd: default-retention sync failed (exit {r.returncode})")
-            if stale_bak.exists():
-                failures.append("01.24 --bd: 90-day-1-hour-old BAK directory was not removed by default --bd 90")
-            if not fresh_bak.exists():
-                failures.append("01.24 --bd: 89-day-23-hour-old BAK directory was removed by default --bd 90")
-
-        # 01.24: --td defaults to 180 days. A tombstone older than 180 days is
-        # purged; one younger than 180 days is retained.
-        p1, p2 = make_file_peers("td")
-        r = sync_file_peers(p1, p2)
-        db_path = p1 / ".kitchensync" / "snapshot.db"
-        if r.returncode != 0:
-            failures.append(f"01.24 --td setup: initial sync failed (exit {r.returncode})")
-        elif not db_path.exists():
-            failures.append("01.24 --td setup: snapshot.db was not created")
-        else:
-            recent = old_ts(1)
-            with sqlite3.connect(str(db_path)) as conn:
-                conn.execute(
-                    "INSERT INTO snapshot(id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("tdstale0001", "rootrootroo", "td-stale.txt", recent, 1, recent, old_ts(180, 1)),
-                )
-                conn.execute(
-                    "INSERT INTO snapshot(id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("tdfresh0001", "rootrootroo", "td-fresh.txt", recent, 1, recent, old_ts(179, 23)),
-                )
-                conn.commit()
-                checkpoint(conn)
-            r = sync_file_peers(p1, p2)
-            if r.returncode != 0:
-                failures.append(f"01.24 --td: default-retention sync failed (exit {r.returncode})")
-            with sqlite3.connect(str(db_path)) as conn:
-                stale = conn.execute("SELECT id FROM snapshot WHERE id='tdstale0001'").fetchone()
-                fresh = conn.execute("SELECT id FROM snapshot WHERE id='tdfresh0001'").fetchone()
-            print(f"[01.24 --td] stale row={stale} fresh row={fresh}")
-            if stale is not None:
-                failures.append("01.24 --td: 180-day-1-hour-old tombstone was not purged by default --td 180")
-            if fresh is None:
-                failures.append("01.24 --td: 179-day-23-hour-old tombstone was purged by default --td 180")
-
-        # 01.24: --mc 10 is not reasonably testable here. The default is only
-        # observable through successful SFTP pool behavior, and this test must
-        # not depend on a configured localhost SFTP account.
-        #
-        # 01.24: --ct 30 is not reasonably testable here. The exact default is
-        # only observable by making an SSH handshake hang and distinguishing a
-        # roughly-30-second timeout, which is a slow timing test.
-        #
-        # 01.24: --ka 30 is not reasonably testable here. The exact default is
-        # only observable by watching idle SFTP connection expiry/reuse across
-        # the 30-second TTL; the CLI does not expose the configured value.
-
+        for check in checks:
+            if failures and check is check_01_24_default_mc:
+                continue
+            check(failures)
+    except subprocess.TimeoutExpired as exc:
+        failures.append(f"command timed out: {exc}")
+    except Exception as exc:
+        failures.append(f"unexpected test error: {exc!r}")
     finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+        run_ssh(f"rm -rf {shlex.quote(REMOTE_BASE)}")
+
+    print(
+        "SKIP 01.30: the --ka default is not reasonably testable through the CLI; "
+        "the public surface has no way to insert an idle interval inside one sync run and observe whether "
+        "an SFTP connection expires after the default 30 seconds."
+    )
 
     if failures:
         print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("PASS tests/01_cli-grammar.py")
     return 0
 
 

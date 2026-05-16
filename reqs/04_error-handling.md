@@ -20,3 +20,4 @@ The program tolerates some runtime errors (unreachable peer, transfer failure) b
 - `04.18` — A snapshot-upload failure is logged at `error` verbosity and the run completes normally; the peer's existing `.kitchensync/snapshot.db` is left untouched and the staging file under `.kitchensync/TMP/` is retained for `--xd` cleanup.
 - `04.19` — When every contributing peer fails to list a directory, that directory and its entire subtree are skipped: no decisions are made, no entries are processed, and no subordinate-peer files at or below that level are displaced.
 - `04.20` — When `list_dir` fails on a peer at a directory, the snapshot rows for that peer in the affected subtree are not modified during the run.
+- `04.21` — Failure to create a TMP staging directory or write the TMP staging file is treated as a transfer failure for that file.

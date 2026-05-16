@@ -1,0 +1,10 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "Build",
+  "taken_at_utc": "2026-05-15T17:06:02Z",
+  "hashes": {
+    "authoring_marker": "19af66f0e484e4c381ec88de4108e374c820d5b253a0c824ec7d8e9c70490efc",
+    "code": "3ba0ced92f6301ba3876026237d76a2a90496a42660283aa27b586f5280b9cd4",
+    "toolchain_marker": "a2213e582d2365805f57877148b773230103ead30088f1029b554859dd5f11a5"
+  }
+}

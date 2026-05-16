@@ -2,11 +2,17 @@
 
 ## Behavior
 
-Each global option (`--mc`, `--ct`, `--ka`, `-vl`, `--xd`, `--bd`, `--td`) has a documented default value that takes effect when the corresponding flag is not given on the command line. Derived from `sync.md` §"Global Options".
+Each global option (`--mc`, `--ct`, `--ka`, `-vl`, `--xd`, `--bd`, `--td`) has a documented default value that takes effect when the corresponding flag is not given on the command line. Derived from `sync.md` §"Global Options" and `specs/README.md` §"Global Options".
 
 ## $REQ_IDs
 
-- `01.24` — When no flag is given, the defaults are: `--mc 10`, `--ct 30`, `--ka 30`, `-vl info`, `--xd 2`, `--bd 90`, `--td 180`.
+- `01.24` — When `--mc` is omitted, max SFTP connections defaults to 10.
+- `01.29` — When `--ct` is omitted, SSH handshake timeout defaults to 30 seconds.
+- `01.30` — When `--ka` is omitted, SFTP idle keep-alive TTL defaults to 30 seconds.
+- `01.31` — When `-vl` is omitted, verbosity defaults to `info`.
+- `01.32` — When `--xd` is omitted, stale TMP staging cleanup defaults to 2 days.
+- `01.33` — When `--bd` is omitted, BAK cleanup defaults to 90 days.
+- `01.34` — When `--td` is omitted, deletion-record cleanup defaults to 180 days.
 
 ## Notes
 

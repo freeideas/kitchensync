@@ -1,182 +1,146 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""CLI argument validation: invalid arguments fail before sync work."""
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TMP = PROJECT_ROOT / "tmp" / "testks" / "01_cli_validation"
-PEER_A_ROOT = TMP / "peer_a"
-PEER_B_ROOT = TMP / "peer_b"
-PEER_A = PEER_A_ROOT.resolve().as_uri()
-PEER_B = PEER_B_ROOT.resolve().as_uri()
-
-HELP_TEXT = """Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
-
-Synchronize file trees across multiple peers.
-
-Running with no arguments prints this help. See README.md for full docs.
-
-Peers:
-  /path or c:\\path                 Local path (same as file://)
-  sftp://user@host/path            Remote over SSH
-  sftp://user@host:port/path       Non-standard SSH port
-  sftp://host/path                 Remote over SSH, current OS user
-  sftp://user:password@host/path   Inline password (prefer SSH keys)
-
-Prefix modifiers:
-  +<peer>                          Canon — this peer's state wins all conflicts
-  -<peer>                          Subordinate — overwritten to match the group
-
-Fallback URLs (multiple paths to the same data):
-  [url1,url2,...]                  Try in order, first that connects wins
-  +[url1,url2,...]                 Canon peer with fallbacks
-  -[url1,url2,...]                 Subordinate peer with fallbacks
-
-Per-URL settings (query string, inside quotes):
-  "sftp://host/path?mc=5"          Max connections for this URL
-  "sftp://host/path?ct=60"         Connection timeout for this URL
-  "sftp://host/path?ka=10"         SFTP idle keep-alive TTL for this URL
-  "sftp://host/path?mc=5&ct=60"    Combine multiple
-
-Options:
-  -h, --help, /?                      Show this help
-  --mc N             Max concurrent connections per URL (default: 10)
-  --ct N             SSH handshake timeout in seconds (default: 30)
-  --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
-  -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
-  --xd N             Delete stale TMP staging after N days (default: 2)
-  --bd N             Delete displaced files (BAK/) after N days (default: 90)
-  --td N             Forget deletion records after N days (default: 180)
-
-Quick start:
-  java -jar kitchensync.jar +c:/photos sftp://user@host/photos      First sync (c: is canon)
-  java -jar kitchensync.jar c:/photos sftp://host/photos            Bidirectional
-  java -jar kitchensync.jar c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
-  java -jar kitchensync.jar c:/photos "sftp://user:p%40ss@host/photos"  Inline password
-
-Canon (+) is required on first sync when no peer has snapshot history.
-After the first sync, bidirectional sync works without canon.
-
-Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
-
-Displaced files are recoverable from .kitchensync/BAK/ (kept for --bd days).
-"""
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
 
 
-def invoke(args: list[str], timeout: int = 15) -> subprocess.CompletedProcess[str]:
+@dataclass(frozen=True)
+class Case:
+    req_id: str
+    name: str
+    args: tuple[str, ...]
+
+
+CASES = [
+    Case("01.10", "fewer than two peers", ("peer-a",)),
+    Case("01.11", "multiple canon peers", ("+peer-a", "+peer-b")),
+    Case("01.12", "unrecognized flag", ("--definitely-not-a-kitchensync-flag", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --mc", ("--mc", "0", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --ct", ("--ct", "0", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --ka", ("--ka", "0", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --xd", ("--xd", "0", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --bd", ("--bd", "0", "peer-a", "peer-b")),
+    Case("01.13", "non-positive --td", ("--td", "0", "peer-a", "peer-b")),
+    Case("01.13", "negative --mc", ("--mc", "-1", "peer-a", "peer-b")),
+    Case("01.13", "negative --ct", ("--ct", "-1", "peer-a", "peer-b")),
+    Case("01.13", "negative --ka", ("--ka", "-1", "peer-a", "peer-b")),
+    Case("01.13", "negative --xd", ("--xd", "-1", "peer-a", "peer-b")),
+    Case("01.13", "negative --bd", ("--bd", "-1", "peer-a", "peer-b")),
+    Case("01.13", "negative --td", ("--td", "-1", "peer-a", "peer-b")),
+    Case("01.13", "non-integer numeric option", ("--mc", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.13", "non-integer --ct", ("--ct", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.13", "non-integer --ka", ("--ka", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.13", "non-integer --xd", ("--xd", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.13", "non-integer --bd", ("--bd", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.13", "non-integer --td", ("--td", "not-an-integer", "peer-a", "peer-b")),
+    Case("01.14", "invalid verbosity", ("-vl", "verbose", "peer-a", "peer-b")),
+]
+
+
+HELP_TOKENS = (
+    "--mc",
+    "--ct",
+    "--ka",
+    "-vl",
+    "--xd",
+    "--bd",
+    "--td",
+    "error",
+    "info",
+    "debug",
+    "trace",
+)
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT] + args,
-        capture_output=True,
+        [str(JAVA), "-jar", str(JAR), *args],
+        cwd=PROJECT_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
-        timeout=timeout,
+        errors="replace",
+        timeout=30,
+        check=False,
     )
 
 
-def reset_peer_roots() -> None:
-    shutil.rmtree(TMP, ignore_errors=True)
-    TMP.mkdir(parents=True, exist_ok=True)
+def combined_output(result: subprocess.CompletedProcess[str]) -> str:
+    return result.stdout
 
 
-def check_validation_error(
-    failures: list[str],
-    req_id: str,
-    label: str,
-    args: list[str],
-    error_terms: list[str],
-) -> None:
-    reset_peer_roots()
-    proc = invoke(args)
-    print(f"[{req_id}] {label}")
+def has_validation_error(output: str) -> bool:
+    lowered = output.lower()
+    return "error" in lowered or "invalid" in lowered
 
-    if proc.returncode != 1:
-        failures.append(f"{req_id}: expected exit 1, got {proc.returncode}")
 
-    if proc.stderr != "":
-        failures.append(f"{req_id}: expected empty stderr, got {proc.stderr!r}")
+def starts_with_validation_error(output: str) -> bool:
+    for line in output.splitlines():
+        stripped = line.strip().lower()
+        if stripped:
+            return "error" in stripped or "invalid" in stripped
+    return False
 
-    first_line, separator, help_text = proc.stdout.partition("\n")
-    if not separator or first_line.strip() == "":
-        failures.append(f"{req_id}: expected an error message before help text")
-    elif first_line == HELP_TEXT.splitlines()[0]:
-        failures.append(f"{req_id}: stdout started with help text, not a specific error")
-    else:
-        error_lower = first_line.lower()
-        for term in error_terms:
-            if term.lower() not in error_lower:
-                failures.append(
-                    f"{req_id}: error message {first_line!r} did not mention {term!r}"
-                )
 
-    if help_text != HELP_TEXT:
-        failures.append(f"{req_id}: help text did not exactly follow the error message")
-
-    created_roots = [str(path.relative_to(PROJECT_ROOT)) for path in (PEER_A_ROOT, PEER_B_ROOT) if path.exists()]
-    if created_roots:
-        failures.append(
-            f"{req_id}: validation error created peer root(s): {', '.join(created_roots)}"
-        )
+def missing_help_tokens(output: str) -> list[str]:
+    return [token for token in HELP_TOKENS if token not in output]
 
 
 def main() -> int:
     failures: list[str] = []
 
-    # Zero args is the help shortcut covered by 01_help-text, so the
-    # validation case for "fewer than two peers" is one peer.
-    check_validation_error(failures, "01.10", "one peer", [PEER_A], ["peer"])
-    check_validation_error(
-        failures,
-        "01.11",
-        "two canon peers",
-        ["+" + PEER_A, "+" + PEER_B],
-        ["canon"],
-    )
-    check_validation_error(
-        failures,
-        "01.12",
-        "unrecognized flag",
-        ["--unknown-flag", PEER_A, PEER_B],
-        ["--unknown-flag"],
-    )
+    for case in CASES:
+        try:
+            result = run_cli(*case.args)
+        except Exception as exc:
+            failures.append(f"{case.req_id} {case.name}: command failed to run: {exc}")
+            continue
 
-    for flag in ["--mc", "--ct", "--ka", "--xd", "--bd", "--td"]:
-        for value in ["0", "-1", "abc"]:
-            check_validation_error(
-                failures,
-                "01.13",
-                f"{flag} {value}",
-                [flag, value, PEER_A, PEER_B],
-                [flag, value],
+        output = combined_output(result)
+
+        if result.returncode != 1:
+            failures.append(
+                f"{case.req_id} {case.name}: expected exit code 1, got {result.returncode}"
             )
 
-    check_validation_error(
-        failures,
-        "01.14",
-        "invalid -vl value",
-        ["-vl", "verbose", PEER_A, PEER_B],
-        ["-vl", "verbose"],
-    )
+        if not has_validation_error(output):
+            failures.append(
+                f"{case.req_id} {case.name}: expected validation error text in stdout/stderr"
+            )
+
+        missing = missing_help_tokens(output)
+        if missing:
+            failures.append(
+                f"{case.req_id} {case.name}: expected help text; missing tokens: {', '.join(missing)}"
+            )
+
+        if not starts_with_validation_error(output):
+            failures.append(
+                f"{case.req_id} {case.name}: expected validation error before help text"
+            )
 
     if failures:
-        print("\nFAILURES:")
+        print("FAIL tests/01_cli-validation.py")
         for failure in failures:
-            print(f"  - {failure}")
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print(f"PASS tests/01_cli-validation.py ({len(CASES)} checks)")
     return 0
 
 

@@ -1,6 +1,6 @@
 # Database
 
-Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQLite, WAL mode, foreign keys enabled.
+Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQLite, rollback-journal mode, foreign keys enabled. Only `snapshot.db` is part of the peer state; SQLite sidecar files are not synced.
 
 At the start of a run, each peer's `snapshot.db` is downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). All reads and writes happen against this local copy. Concurrent runs are not coordinated. If two runs overlap, the last snapshot upload wins. Decisions from the losing run are re-discovered on the next run — correctness is preserved, but some work is repeated. After sync completes, the updated database is written back using TMP staging — the same mechanism used for file copies (see sync.md, TMP Staging): upload to `{peer-root}/.kitchensync/TMP/<timestamp>/<uuid>/snapshot.db`, then rename to `{peer-root}/.kitchensync/snapshot.db`. If the upload fails, the TMP staging file is left behind and cleaned up after `--xd` days like any other stale staging file. If a peer has no existing `snapshot.db`, a new one is created locally.
 
@@ -67,4 +67,6 @@ Paths are hashed with xxHash64 (seed 0) and encoded as base62 (digits `0-9`, upp
 
 Format: `YYYY-MM-DD_HH-mm-ss_ffffffZ` — UTC, microsecond precision, lexicographic sort, filesystem-safe. This format is used everywhere timestamps appear: database columns, BAK/ directory names, TMP/ directory names, and log output.
 
-Monotonic within a process: add 1μs on collision. Every distinct call site that needs "now" — every `last_seen` write, every `deleted_time` write, every BAK/ or TMP/ directory name — calls the timestamp generator afresh and gets a value strictly greater than every value it has previously returned in this process. Do not capture a single "run timestamp" at startup and reuse it across snapshot rows: every row's `last_seen` (and every row's `deleted_time` when set) must be unique within a single sync run.
+Monotonic within a process: add 1μs on collision. Every distinct call site that needs a new "now" value — every `last_seen` write and every BAK/ or TMP/ directory name — calls the timestamp generator afresh and gets a value strictly greater than every value it has previously returned in this process. Do not capture a single "run timestamp" at startup and reuse it across snapshot rows: every generated timestamp must be unique within a single sync run.
+
+`deleted_time` is a deletion estimate, not a generated "now" value. A write that stores a copied timestamp is not a timestamp-generator call site and is excluded from the monotonic freshness rule above. When an entry is confirmed absent or displaced, `deleted_time` is copied from the row's existing `last_seen`; descendant cascades reuse the displaced entry's deletion estimate for all affected descendant rows. These copied `deleted_time` values need not be unique within a run.

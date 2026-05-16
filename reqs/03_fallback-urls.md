@@ -12,6 +12,7 @@ Square brackets group multiple URLs into a single peer — different network pat
 - `03.55` — If every URL in the bracket fails, the peer is unreachable for the run (same handling as a single-URL peer that cannot connect).
 - `03.56` — A `+` or `-` prefix on the bracket applies to the whole peer (not to individual URLs inside).
 - `03.57` — Per-URL query string settings (`?mc=...`, `?ct=...`, `?ka=...`) attach to individual URLs inside the bracket.
+- `03.108` — After a fallback peer selects a winning URL at startup, later directory-listing or transfer connection failures are handled as operation failures for that run; remaining fallback URLs are not retried.
 
 ## Notes
 

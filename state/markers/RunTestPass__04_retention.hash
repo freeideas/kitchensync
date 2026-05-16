@@ -1,0 +1,10 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "RunTestPass",
+  "taken_at_utc": "2026-05-16T14:01:16Z",
+  "hashes": {
+    "build_marker": "47293b2f791c2a2ad7a305c26be181e32fe416f9e3f29b978a95497c6ba54da6",
+    "released_lib": "6f930150918503b6c7c19756b6f4ab608abd594a7c28a9b283cd3c43ae2a6f6e",
+    "test": "b411d55039975ca8e3d779d09da6e3bdc3e0f9325a29da15761b205d249c560d"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "AggregateLib",
+  "taken_at_utc": "2026-05-15T17:12:00Z",
+  "hashes": {
+    "subpjx/gitignore-matcher/subpjx/gitignore-pattern-set/released_lib": "deea754c09690e750daf9188a3d1109d307d1feec339449dad3d09d4fa8111f1",
+    "subpjx/gitignore-matcher/subpjx/gitignore-pattern-set/released_mcp": "69d7ecfca88a40caa7b6eafdb24a53b75fec532c5ead2b22889f9db5329f72d4"
+  }
+}

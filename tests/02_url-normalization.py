@@ -1,148 +1,247 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""URL normalization: canonical form before any comparison or lookup."""
 
 from __future__ import annotations
 
-import getpass, os, shutil, subprocess, sys
+import getpass
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = Path(PROJECT) / "tmp" / "testks" / "02_url-normalization"
-PEER1 = TMP / "peer1"
-PEER2 = TMP / "peer2"
-SFTP_DIR = TMP / "sftp_peer"
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
+JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
 
-FIRST_SYNC_MSG = "First sync? Mark the authoritative peer with a leading +"
+LOCAL_BASE = Path("/tmp/kitchensync-test-02-url-normalization")
+LOCAL_CWD = LOCAL_BASE / "cwd"
+LOCAL_PEER = LOCAL_CWD / "localpeer"
+LOCAL_SINK = LOCAL_BASE / "localsink"
+
+REMOTE_HOST = "ordinarydata.com"
+REMOTE_USER = getpass.getuser()
+REMOTE_BASE = "/tmp/testks/ks_url_normalization"
+REMOTE_HOME_RELATIVE_BASE = "~/tmp/testks/ks_url_normalization"
+REMOTE_PEER = f"{REMOTE_BASE}/remotepeer"
+REMOTE_HOME_RELATIVE_PEER = f"{REMOTE_HOME_RELATIVE_BASE}/remotepeer"
+REMOTE_VARIANT = (
+    f"SFTP://{REMOTE_HOST.upper()}:22//tmp//testks//ks_url_normalization//remo%74epeer/?mc=1"
+)
+REMOTE_CANONICAL = f"sftp://{REMOTE_USER}@{REMOTE_HOST}{REMOTE_PEER}"
 
 
-def invoke(args, timeout=30):
+def run(
+    args: list[str],
+    *,
+    cwd: Path = PROJECT_DIR,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT] + args,
-        capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+        args,
+        cwd=str(cwd),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
     )
 
 
-def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    PEER1.mkdir(parents=True)
-    PEER2.mkdir(parents=True)
-    SFTP_DIR.mkdir(parents=True)
+def run_cli(*args: str, cwd: Path = PROJECT_DIR) -> subprocess.CompletedProcess[str]:
+    return run([str(JAVA), "-jar", str(JAR), *args], cwd=cwd)
 
-    failures = []
-    user = getpass.getuser()
-    peer1_abs = str(PEER1.resolve())
-    peer1_url = PEER1.resolve().as_uri()
-    peer2_url = PEER2.resolve().as_uri()
-    sftp_abs = str(SFTP_DIR.resolve())
+
+def run_ssh(command: str) -> subprocess.CompletedProcess[str]:
+    return run(
+        [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{REMOTE_USER}@{REMOTE_HOST}",
+            command,
+        ],
+        timeout=60,
+    )
+
+
+def quote_shell(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def reset_local() -> None:
+    if LOCAL_BASE.exists():
+        shutil.rmtree(LOCAL_BASE)
+    LOCAL_PEER.mkdir(parents=True)
+    LOCAL_SINK.mkdir(parents=True)
+    (LOCAL_PEER / "from-local.txt").write_text(
+        "local canonical identity\n", encoding="utf-8", newline="\n"
+    )
+
+
+def reset_remote(failures: list[str]) -> None:
+    cleanup = (
+        f"rm -rf {quote_shell(REMOTE_BASE)} {REMOTE_HOME_RELATIVE_BASE} && "
+        f"mkdir -p {quote_shell(REMOTE_PEER)}"
+    )
+    result = run_ssh(cleanup)
+    if result.returncode != 0:
+        failures.append(
+            "remote fixture setup failed: "
+            f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+
+
+def cleanup_remote() -> None:
+    run_ssh(f"rm -rf {quote_shell(REMOTE_BASE)} {REMOTE_HOME_RELATIVE_BASE}")
+
+
+def check(condition: bool, failures: list[str], message: str) -> None:
+    if not condition:
+        failures.append(message)
+
+
+def check_process_ok(
+    result: subprocess.CompletedProcess[str], failures: list[str], context: str
+) -> None:
+    check(
+        result.returncode == 0,
+        failures,
+        f"{context} failed: exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}",
+    )
+
+
+def check_process_failed(
+    result: subprocess.CompletedProcess[str], failures: list[str], context: str
+) -> None:
+    check(
+        result.returncode != 0,
+        failures,
+        f"{context} should have failed after equivalent URLs collapsed to one peer: "
+        f"exit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}",
+    )
+
+
+def encoded_file_variant() -> str:
+    encoded = LOCAL_PEER.as_uri().replace("localpeer", "%6cocalpeer")
+    return f"{encoded}/?mc=5"
+
+
+def local_identity_checks(failures: list[str]) -> None:
+    relative_variant = "+localpeer//"
+    result = run_cli(relative_variant, encoded_file_variant(), cwd=LOCAL_CWD)
+    check_process_failed(
+        result,
+        failures,
+        "sync with equivalent bare-path and file URL spellings as the only peers",
+    )
+
+
+def local_cwd_resolution_check(failures: list[str]) -> None:
+    result = run_cli("+localpeer", str(LOCAL_SINK), cwd=LOCAL_CWD)
+    check_process_ok(result, failures, "local sync with bare relative path from cwd")
+
+    copied_file = LOCAL_SINK / "from-local.txt"
+    copied_text = copied_file.read_text(encoding="utf-8") if copied_file.exists() else None
+    check(
+        copied_text == "local canonical identity\n",
+        failures,
+        f"local sink did not receive the file from the normalized bare path peer at {copied_file}",
+    )
+
+
+def local_file_url_variant_check(failures: list[str]) -> None:
+    result = run_cli(f"+{encoded_file_variant()}", str(LOCAL_SINK), cwd=LOCAL_CWD)
+    check_process_ok(
+        result,
+        failures,
+        "local sync with equivalent encoded file URL variant",
+    )
+
+    copied_file = LOCAL_SINK / "from-local.txt"
+    copied_text = copied_file.read_text(encoding="utf-8") if copied_file.exists() else None
+    check(
+        copied_text == "local canonical identity\n",
+        failures,
+        f"local sink did not receive the file from the normalized file URL peer at {copied_file}",
+    )
+
+
+def remote_identity_checks(failures: list[str]) -> None:
+    result = run_cli(f"+{REMOTE_VARIANT}", REMOTE_CANONICAL)
+    check_process_failed(
+        result,
+        failures,
+        "sync with equivalent SFTP URL spellings as the only peers",
+    )
+
+
+def remote_copy_check(failures: list[str], remote_url: str, context: str) -> None:
+    local_source = LOCAL_BASE / "remotesource"
+    if local_source.exists():
+        shutil.rmtree(local_source)
+    local_source.mkdir(parents=True)
+    (local_source / "from-remote-source.txt").write_text(
+        "remote canonical identity\n", encoding="utf-8", newline="\n"
+    )
+
+    result = run_cli(f"+{local_source}", remote_url)
+    check_process_ok(result, failures, context)
+
+    absolute_exists = run_ssh(f"test -f {quote_shell(REMOTE_PEER + '/from-remote-source.txt')}")
+    check_process_ok(absolute_exists, failures, "absolute SFTP path check")
+
+    home_relative_exists = run_ssh(
+        f"test ! -e {REMOTE_HOME_RELATIVE_PEER}/from-remote-source.txt"
+    )
+    check_process_ok(
+        home_relative_exists,
+        failures,
+        "home-relative SFTP path absence check",
+    )
+
+
+def remote_absolute_path_check(failures: list[str]) -> None:
+    remote_copy_check(failures, REMOTE_VARIANT, "SFTP sync with normalized absolute remote URL")
+
+
+def remote_canonical_url_check(failures: list[str]) -> None:
+    remote_copy_check(failures, REMOTE_CANONICAL, "SFTP sync with canonical remote URL")
+
+
+def main() -> int:
+    failures: list[str] = []
+    reset_local()
+    reset_remote(failures)
 
     try:
-        # 02.12 — bare path normalized to file:// URL
-        print("[02.12] bare absolute path accepted as file:// URL")
-        proc = invoke([peer1_abs, peer2_url])
-        combined = proc.stdout + proc.stderr
-        if proc.returncode != 1 or FIRST_SYNC_MSG not in combined:
-            failures.append(
-                f"02.12: expected exit 1 + first-sync guidance for bare path, "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.13 — scheme and hostname of SFTP URL normalized to lowercase
-        # Two URLs identical except for case → same peer after normalization → dedup → < 2 peers → exit 1
-        print("[02.13] SFTP scheme/hostname case-normalized → same peer → dedup → exit 1")
-        sftp_upper = f"SFTP://{user}@LOCALHOST{sftp_abs}"
-        sftp_lower = f"sftp://{user}@localhost{sftp_abs}"
-        proc = invoke([sftp_upper, sftp_lower])
-        if proc.returncode != 1:
-            failures.append(
-                f"02.13: expected exit 1 (peers differ only by case), "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.14 — default port :22 on sftp:// URL removed during normalization
-        print("[02.14] sftp:22 and sftp without port → same peer → dedup → exit 1")
-        sftp_port22 = f"sftp://{user}@localhost:22{sftp_abs}"
-        sftp_no_port = f"sftp://{user}@localhost{sftp_abs}"
-        proc = invoke([sftp_port22, sftp_no_port])
-        if proc.returncode != 1:
-            failures.append(
-                f"02.14: expected exit 1 (peers differ only by :22), "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.15 — consecutive slashes in path collapsed
-        # Insert an extra / before "peer1" → //peer1 → collapses to /peer1 → same directory
-        print("[02.15] consecutive slashes in file path collapsed → resolves to peer dir → first-sync")
-        double_slash_url = peer1_url[:-6] + "//peer1"  # peer1_url ends with "/peer1" (6 chars)
-        proc = invoke([double_slash_url, peer2_url])
-        combined = proc.stdout + proc.stderr
-        if proc.returncode != 1 or FIRST_SYNC_MSG not in combined:
-            failures.append(
-                f"02.15: expected exit 1 + first-sync guidance for URL with '//', "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.16 — query-string parameters stripped from URL identity
-        # file:///path and file:///path?mc=5 → same peer after stripping → dedup → exit 1
-        print("[02.16] query-string stripped from URL identity → same peer → dedup → exit 1")
-        url_qs = peer1_url + "?mc=5"
-        proc = invoke([url_qs, peer1_url])
-        if proc.returncode != 1:
-            failures.append(
-                f"02.16: expected exit 1 (peers differ only by ?mc=5), "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.17 — SFTP URL with no username gets current OS user inserted
-        print("[02.17] SFTP no-username URL gains OS user → same as explicit-user URL → dedup → exit 1")
-        sftp_no_user = f"sftp://localhost{sftp_abs}"
-        sftp_with_user = f"sftp://{user}@localhost{sftp_abs}"
-        proc = invoke([sftp_no_user, sftp_with_user])
-        if proc.returncode != 1:
-            failures.append(
-                f"02.17: expected exit 1 (peers differ only by absent username), "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.32 — trailing slash on path removed during normalization
-        # file:///path/ and file:///path → same peer after stripping → dedup → exit 1
-        print("[02.32] trailing slash stripped → same peer → dedup → exit 1")
-        url_trailing = peer1_url + "/"
-        proc = invoke([url_trailing, peer1_url])
-        if proc.returncode != 1:
-            failures.append(
-                f"02.32: expected exit 1 (peers differ only by trailing /), "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # 02.33 — percent-encoded unreserved characters decoded
-        # Encode 'p' (%70) in "peer1" → /%70eer1 → decoded → /peer1 → same directory → first-sync
-        print("[02.33] percent-encoded unreserved char in path decoded → resolves to peer dir → first-sync")
-        url_encoded = peer1_url[:-6] + "/%70eer1"  # replaces "/peer1" with "/%70eer1"
-        proc = invoke([url_encoded, peer2_url])
-        combined = proc.stdout + proc.stderr
-        if proc.returncode != 1 or FIRST_SYNC_MSG not in combined:
-            failures.append(
-                f"02.33: expected exit 1 + first-sync guidance for percent-encoded path, "
-                f"got rc={proc.returncode}\n  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
+        if not failures:
+            local_identity_checks(failures)
+            reset_local()
+            local_cwd_resolution_check(failures)
+            reset_local()
+            local_file_url_variant_check(failures)
+            remote_identity_checks(failures)
+            reset_remote(failures)
+            remote_absolute_path_check(failures)
+            reset_remote(failures)
+            remote_canonical_url_check(failures)
     finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+        cleanup_remote()
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("FAIL")
+        for index, failure in enumerate(failures, start=1):
+            print(f"\n{index}. {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("PASS")
     return 0
 
 

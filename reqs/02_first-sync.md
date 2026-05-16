@@ -7,6 +7,7 @@ The first sync of a group needs an authoritative source because there are no sna
 ## $REQ_IDs
 
 - `02.1` — When two or more peers are provided and no peer has an existing `.kitchensync/snapshot.db` and no `+` peer is designated, the program prints `First sync? Mark the authoritative peer with a leading +` and exits 1.
+- `02.2` — When two or more peers are provided and snapshot files exist but every reachable snapshot contains zero rows and no `+` peer is designated, the program prints `First sync? Mark the authoritative peer with a leading +` and exits 1.
 
 ## Notes
 

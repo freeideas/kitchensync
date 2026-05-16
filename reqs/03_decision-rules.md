@@ -20,6 +20,7 @@ For each file entry at a directory level, the program compares peer states to th
 - `03.91` — When a contributing peer's snapshot row has `deleted_time` set but the entry is now live in that peer's listing (resurrection), the entry is classified as modified for decision purposes.
 - `03.19` — On a resurrection (live entry whose snapshot row had `deleted_time` set), the peer's snapshot row has `deleted_time` cleared back to NULL during this run's snapshot update.
 - `03.92` — When a destination peer already has the winning file (mod_time within ±5 seconds and matching byte_size), no file copy is performed for that destination — only the peer's snapshot row is created or updated.
+- `03.110` — A contributing peer with no snapshot row for a file does not vote on the winner but, when the decided state is an existing file, receives that file if it lacks it.
 
 ## Notes
 

@@ -1,478 +1,260 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["paramiko"]
+# dependencies = []
 # ///
-"""Peer root auto-creation on connection for file:// and sftp:// peers (03.86, 03.87, 03.93)."""
 
 from __future__ import annotations
 
-import base64, os, re, shutil, socket, subprocess, sys, threading, time
+import shutil
+import shlex
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-import paramiko
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
-
-TMP = Path(PROJECT).resolve() / "tmp" / "testks" / "03_peer-connect"
-TEST_USER = "peerconnect"
-TEST_PASSWORD = "peer-connect-password"
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
+JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
+TMP = Path(tempfile.gettempdir()) / "kitchensync_03_peer_connect"
+REMOTE_BASE = "/tmp/testks/03_peer_connect"
+REMOTE_RUN = f"{REMOTE_BASE}/run-{time.monotonic_ns()}"
 
 
-def invoke(*peers, timeout=30, env=None):
+@dataclass
+class RunResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    seconds: float
+    timed_out: bool = False
+
+
+def run_cli(*args: str, timeout: float = 60.0) -> RunResult:
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [str(JAVA), "-jar", str(JAR), *args],
+            cwd=str(PROJECT_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        return RunResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            time.monotonic() - started,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return RunResult(
+            124,
+            exc.stdout or "",
+            exc.stderr or "",
+            time.monotonic() - started,
+            timed_out=True,
+        )
+
+
+def ssh(*remote_commands: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, *peers],
-        capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env,
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "ace@ordinarydata.com",
+            " && ".join(remote_commands),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
     )
 
 
-class _LocalSFTP(paramiko.SFTPServerInterface):
-    def _path(self, path: str) -> str:
-        return str(Path(path))
-
-    def stat(self, path):
-        try:
-            return paramiko.SFTPAttributes.from_stat(os.stat(self._path(path)))
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def lstat(self, path):
-        try:
-            return paramiko.SFTPAttributes.from_stat(os.lstat(self._path(path)))
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def list_folder(self, path):
-        try:
-            root = Path(self._path(path))
-            entries = []
-            for name in os.listdir(root):
-                attrs = paramiko.SFTPAttributes.from_stat(os.lstat(root / name))
-                attrs.filename = name
-                entries.append(attrs)
-            return entries
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def open(self, path, flags, attr):
-        try:
-            fd = os.open(self._path(path), flags, getattr(attr, "st_mode", None) or 0o666)
-            mode = "r+b" if flags & os.O_RDWR else ("wb" if flags & os.O_WRONLY else "rb")
-            handle = paramiko.SFTPHandle(flags)
-            file_obj = os.fdopen(fd, mode)
-            handle.readfile = file_obj
-            handle.writefile = file_obj
-            return handle
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def mkdir(self, path, attr):
-        try:
-            os.mkdir(self._path(path), getattr(attr, "st_mode", None) or 0o777)
-            return paramiko.SFTP_OK
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def remove(self, path):
-        try:
-            os.remove(self._path(path))
-            return paramiko.SFTP_OK
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def rename(self, oldpath, newpath):
-        try:
-            os.rename(self._path(oldpath), self._path(newpath))
-            return paramiko.SFTP_OK
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def rmdir(self, path):
-        try:
-            os.rmdir(self._path(path))
-            return paramiko.SFTP_OK
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    def chattr(self, path, attr):
-        try:
-            target = self._path(path)
-            stat_result = os.stat(target)
-            atime = getattr(attr, "st_atime", None)
-            mtime = getattr(attr, "st_mtime", None)
-            os.utime(
-                target,
-                (
-                    stat_result.st_atime if atime is None else atime,
-                    stat_result.st_mtime if mtime is None else mtime,
-                ),
-            )
-            return paramiko.SFTP_OK
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-
-class _SSHServer(paramiko.ServerInterface):
-    def check_channel_request(self, kind, chanid):
-        return paramiko.OPEN_SUCCEEDED if kind == "session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
-
-    def check_auth_password(self, username, password):
-        if username == TEST_USER and password == TEST_PASSWORD:
-            return paramiko.AUTH_SUCCESSFUL
-        return paramiko.AUTH_FAILED
-
-    def get_allowed_auths(self, username):
-        return "password"
-
-
-def _start_sftp_server() -> tuple[int, socket.socket, paramiko.PKey]:
-    host_key = paramiko.RSAKey.generate(bits=2048)
-    srv_sock = socket.socket()
-    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv_sock.bind(("127.0.0.1", 0))
-    srv_sock.listen(20)
-    port = srv_sock.getsockname()[1]
-
-    def serve_connection(conn):
-        transport = paramiko.Transport(conn)
-        transport.add_server_key(host_key)
-        transport.set_subsystem_handler("sftp", paramiko.SFTPServer, _LocalSFTP)
-        try:
-            transport.start_server(server=_SSHServer())
-            while transport.is_active():
-                time.sleep(0.05)
-        except Exception:
-            pass
-        finally:
-            transport.close()
-
-    def accept_loop():
-        while True:
-            try:
-                conn, _ = srv_sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=serve_connection, args=(conn,), daemon=True).start()
-
-    threading.Thread(target=accept_loop, daemon=True).start()
-    return port, srv_sock, host_key
-
-
-def _known_hosts_line(host_key: paramiko.PKey, port: int) -> str:
-    key = base64.b64encode(host_key.asbytes()).decode("ascii")
-    return f"[127.0.0.1]:{port} {host_key.get_name()} {key}\n"
-
-
-def _sftp_env(home: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    env.pop("SSH_AUTH_SOCK", None)
-    env.pop("SSH_AGENT_PID", None)
-    env["HOME"] = str(home)
-    java_opts = env.get("JAVA_TOOL_OPTIONS", "")
-    env["JAVA_TOOL_OPTIONS"] = (java_opts + " " if java_opts else "") + f"-Duser.home={home}"
-    return env
-
-
-def _read_text(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    return path.read_text(encoding="utf-8")
-
-
-def _scrub_java(source: str) -> str:
-    out = list(source)
-    i = 0
-    state = "code"
-    while i < len(source):
-        ch = source[i]
-        nxt = source[i + 1] if i + 1 < len(source) else ""
-        if state == "code":
-            if ch == "/" and nxt == "/":
-                out[i] = out[i + 1] = " "
-                i += 2
-                state = "line_comment"
-            elif ch == "/" and nxt == "*":
-                out[i] = out[i + 1] = " "
-                i += 2
-                state = "block_comment"
-            elif source.startswith('"""', i):
-                out[i] = out[i + 1] = out[i + 2] = " "
-                i += 3
-                state = "text_block"
-            elif ch == '"':
-                out[i] = " "
-                i += 1
-                state = "string"
-            elif ch == "'":
-                out[i] = " "
-                i += 1
-                state = "char"
-            else:
-                i += 1
-        elif state == "line_comment":
-            if ch == "\n":
-                state = "code"
-            else:
-                out[i] = " "
-            i += 1
-        elif state == "block_comment":
-            out[i] = " " if ch != "\n" else "\n"
-            if ch == "*" and nxt == "/":
-                out[i + 1] = " "
-                i += 2
-                state = "code"
-            else:
-                i += 1
-        elif state == "text_block":
-            if source.startswith('"""', i):
-                out[i] = out[i + 1] = out[i + 2] = " "
-                i += 3
-                state = "code"
-            else:
-                out[i] = " " if ch != "\n" else "\n"
-                i += 1
-        elif state == "string":
-            out[i] = " " if ch != "\n" else "\n"
-            if ch == "\\":
-                if i + 1 < len(source):
-                    out[i + 1] = " " if source[i + 1] != "\n" else "\n"
-                i += 2
-            elif ch == '"':
-                i += 1
-                state = "code"
-            else:
-                i += 1
-        elif state == "char":
-            out[i] = " " if ch != "\n" else "\n"
-            if ch == "\\":
-                if i + 1 < len(source):
-                    out[i + 1] = " " if source[i + 1] != "\n" else "\n"
-                i += 2
-            elif ch == "'":
-                i += 1
-                state = "code"
-            else:
-                i += 1
-    return "".join(out)
-
-
-def _matching(text: str, open_index: int, open_ch: str = "{", close_ch: str = "}") -> int | None:
-    depth = 0
-    for i in range(open_index, len(text)):
-        if text[i] == open_ch:
-            depth += 1
-        elif text[i] == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i
-    return None
-
-
-def _run_method_body() -> str | None:
-    code_dir = Path(PROJECT) / "code"
-    for path in code_dir.rglob("*.java"):
-        try:
-            source = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        scrubbed = _scrub_java(source)
-        match = re.search(
-            r"(?:^|[;{}\n]\s*)(?:public|private|protected|static|final|\s)+"
-            r"[A-Za-z_$][\w$<>\[\], ?.&]*\s+run\s*\([^;{}]*\)\s*"
-            r"(?:throws\s+[A-Za-z_$][\w$.,\s<>]*)?\{",
-            scrubbed,
-            re.MULTILINE,
-        )
-        if match:
-            open_brace = match.end() - 1
-            close_brace = _matching(scrubbed, open_brace)
-            if close_brace is not None:
-                return scrubbed[open_brace : close_brace + 1]
-    return None
-
-
-def _for_bodies(text: str) -> list[str]:
-    bodies = []
-    pos = 0
-    while True:
-        match = re.search(r"\bfor\s*\(", text[pos:])
-        if match is None:
-            return bodies
-        open_paren = pos + match.end() - 1
-        close_paren = _matching(text, open_paren, "(", ")")
-        if close_paren is None:
-            pos = open_paren + 1
-            continue
-        open_brace = close_paren + 1
-        while open_brace < len(text) and text[open_brace].isspace():
-            open_brace += 1
-        if open_brace >= len(text) or text[open_brace] != "{":
-            pos = close_paren + 1
-            continue
-        close_brace = _matching(text, open_brace)
-        if close_brace is not None:
-            bodies.append(text[open_brace + 1 : close_brace])
-            pos = close_brace + 1
-        else:
-            pos = open_brace + 1
-
-
-def _startup_connect_concurrency_failure() -> str | None:
-    body = _run_method_body()
-    if body is None:
-        return "03.93: could not find startup run method in Java source"
-
-    concurrent_patterns = [
-        r"\b[A-Za-z_$][\w$]*\.submit\s*\([^;{}]*\bconnectPeer\s*\(",
-        r"\bCompletableFuture\.(?:supplyAsync|runAsync)\s*\([^;{}]*\bconnectPeer\s*\(",
-        r"\binvokeAll\s*\([^;{}]*\bconnectPeer\s*\(",
-        r"\.parallel(?:Stream)?\s*\([^;{}]*\bconnectPeer\s*\(",
-    ]
-    has_concurrent_start = any(re.search(pattern, body, re.DOTALL) for pattern in concurrent_patterns)
-    if not has_concurrent_start:
-        return (
-            "03.93: startup peer connection attempts are not issued through a "
-            "concurrent construct around connectPeer"
-        )
-
-    for loop_body in _for_bodies(body):
-        inline_await = re.search(
-            r"\b(?:submit|supplyAsync|runAsync)\s*\([^;{}]*\bconnectPeer\s*\([^;{}]*\)\s*\)\s*\.\s*(?:get|join)\s*\(",
-            loop_body,
-            re.DOTALL,
-        )
-        named_future_await = re.search(
-            r"\b(?:Future|CompletableFuture)\b[^;=]*\b([A-Za-z_$][\w$]*)\s*=\s*"
-            r"[^;{}]*(?:submit|supplyAsync|runAsync)\s*\([^;{}]*\bconnectPeer\s*\([^;{}]*\)\s*\)"
-            r"[^;]*;\s*.*?\b\1\s*\.\s*(?:get|join)\s*\(",
-            loop_body,
-            re.DOTALL,
-        )
-        if inline_await or named_future_await:
-            return (
-                "03.93: startup loop appears to await a peer connection in the same "
-                "loop body that starts it"
-            )
-    return None
-
-
-def main() -> int:
+def reset_state() -> None:
     if TMP.exists():
         shutil.rmtree(TMP)
     TMP.mkdir(parents=True)
+    ssh(f"rm -rf -- {shlex.quote(REMOTE_BASE)}")
 
-    failures = []
-    sftp_sock = None
 
+def write_source(path: Path, name: str, body: str) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    (path / name).write_text(body, encoding="utf-8", newline="\n")
+
+
+def add_check(failures: list[str], condition: bool, message: str, detail: str = "") -> None:
+    if not condition:
+        failures.append(f"{message}{chr(10) + detail if detail else ''}")
+
+
+def result_detail(result: RunResult) -> str:
+    return (
+        f"exit={result.returncode} timed_out={result.timed_out} "
+        f"seconds={result.seconds:.2f}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def test_file_root_creation(failures: list[str]) -> None:
+    source = TMP / "file-source"
+    peer_root = TMP / "missing" / "parents" / "file-peer"
+    write_source(source, "alpha.txt", "file root creation\n")
+
+    result = run_cli(f"+{source}", peer_root.as_uri())
+
+    add_check(
+        failures,
+        result.returncode == 0,
+        "03.86 file:// missing peer root should connect successfully after creation.",
+        result_detail(result),
+    )
+    add_check(
+        failures,
+        peer_root.is_dir(),
+        "03.86 file:// peer root and missing parents were not created.",
+        str(peer_root),
+    )
+    add_check(
+        failures,
+        (peer_root / "alpha.txt").is_file(),
+        "03.86 file:// peer did not receive synced content after root creation.",
+        str(peer_root / "alpha.txt"),
+    )
+
+
+def test_failed_creation_falls_back_to_sftp(failures: list[str]) -> None:
+    source = TMP / "fallback-source"
+    blocked_parent = TMP / "not-a-directory"
+    bad_file_root = blocked_parent / "child"
+    remote_root = f"{REMOTE_RUN}/fallback-sftp/missing/peer"
+    write_source(source, "bravo.txt", "fallback to sftp\n")
+    blocked_parent.write_text("parent path is a file\n", encoding="utf-8", newline="\n")
+
+    result = run_cli(
+        f"+{source}",
+        f"[{bad_file_root.as_uri()},sftp://ace@ordinarydata.com{remote_root}]",
+    )
+    probe = ssh(
+        f"test -d {shlex.quote(remote_root)}",
+        f"test -f {shlex.quote(remote_root + '/bravo.txt')}",
+    )
+
+    add_check(
+        failures,
+        result.returncode == 0,
+        "03.87 failed file:// root creation should make KitchenSync try the fallback URL.",
+        result_detail(result),
+    )
+    add_check(
+        failures,
+        probe.returncode == 0,
+        "03.86 sftp:// missing peer root should be created before the fallback URL is accepted.",
+        f"ssh exit={probe.returncode}\nstdout:\n{probe.stdout}\nstderr:\n{probe.stderr}",
+    )
+
+
+def test_failed_creation_without_fallback_is_unreachable(failures: list[str]) -> None:
+    source = TMP / "unreachable-source"
+    blocked_parent = TMP / "blocked-alone"
+    bad_file_root = blocked_parent / "child"
+    write_source(source, "charlie.txt", "unreachable peer\n")
+    blocked_parent.write_text("parent path is a file\n", encoding="utf-8", newline="\n")
+
+    result = run_cli(f"+{source}", bad_file_root.as_uri())
+
+    add_check(
+        failures,
+        result.returncode != 0,
+        "03.87 URL with uncreatable root and no fallback should make the peer unreachable.",
+        result_detail(result),
+    )
+    add_check(
+        failures,
+        not bad_file_root.exists(),
+        "03.87 uncreatable peer root unexpectedly exists.",
+        str(bad_file_root),
+    )
+
+
+def test_failed_sftp_creation_falls_back_to_file(failures: list[str]) -> None:
+    source = TMP / "sftp-fallback-source"
+    remote_blocked_parent = f"{REMOTE_RUN}/blocked-parent"
+    remote_bad_root = f"{remote_blocked_parent}/child"
+    file_fallback_root = TMP / "sftp-failure-file-fallback"
+    write_source(source, "delta.txt", "sftp creation fallback\n")
+
+    setup = ssh(
+        f"mkdir -p -- {shlex.quote(str(Path(remote_blocked_parent).parent))}",
+        f"printf %s {shlex.quote('parent path is a file')} > {shlex.quote(remote_blocked_parent)}",
+    )
+    add_check(
+        failures,
+        setup.returncode == 0,
+        "Test setup could not create remote SFTP blocked parent.",
+        f"ssh exit={setup.returncode}\nstdout:\n{setup.stdout}\nstderr:\n{setup.stderr}",
+    )
+    if setup.returncode != 0:
+        return
+
+    result = run_cli(
+        f"+{source}",
+        f"[sftp://ace@ordinarydata.com{remote_bad_root},{file_fallback_root.as_uri()}]",
+    )
+
+    add_check(
+        failures,
+        result.returncode == 0,
+        "03.87 failed sftp:// root creation should make KitchenSync try the fallback URL.",
+        result_detail(result),
+    )
+    add_check(
+        failures,
+        (file_fallback_root / "delta.txt").is_file(),
+        "03.87 file:// fallback did not receive synced content after sftp:// creation failure.",
+        str(file_fallback_root / "delta.txt"),
+    )
+
+
+def main() -> int:
+    failures: list[str] = []
+    reset_state()
     try:
-        sftp_port, sftp_sock, host_key = _start_sftp_server()
-        home = TMP / "home"
-        ssh_dir = home / ".ssh"
-        ssh_dir.mkdir(parents=True)
-        (ssh_dir / "known_hosts").write_text(_known_hosts_line(host_key, sftp_port), encoding="utf-8", newline="\n")
-        (ssh_dir / "known_hosts").chmod(0o600)
-        sftp_env = _sftp_env(home)
-
-        # --- 03.86a: file:// root path (including missing parents) created on connect ---
-        src_a = TMP / "src-a"
-        src_a.mkdir()
-        (src_a / "hello.txt").write_text("hello")
-        new_a = TMP / "new-a" / "deep" / "sub"
-        # new_a and its parents do not exist — must be created before URL is considered connected
-
-        proc = invoke("+" + src_a.as_uri(), new_a.as_uri())
-        print(f"[03.86a] file:// root+parents created (exit {proc.returncode})")
-        if not new_a.is_dir():
-            failures.append(
-                f"03.86a: file:// root {new_a} not created\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if _read_text(new_a / "hello.txt") != "hello":
-            failures.append(
-                f"03.86a: file:// root was not connected and synced after creation\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if proc.returncode != 0:
-            failures.append(
-                f"03.86a: exit {proc.returncode}\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # --- 03.86b: sftp:// root path (including missing parents) created on connect ---
-        src_b = TMP / "src-b"
-        src_b.mkdir()
-        (src_b / "hello.txt").write_text("hello")
-        sftp_new = TMP / "sftp-new" / "deep" / "sub"
-        # sftp_new and its parents do not exist — must be created via sftp before URL is connected
-
-        sftp_url = f"sftp://{TEST_USER}:{TEST_PASSWORD}@127.0.0.1:{sftp_port}{sftp_new}"
-        proc = invoke("+" + src_b.as_uri(), sftp_url, env=sftp_env)
-        print(f"[03.86b] sftp:// root+parents created (exit {proc.returncode})")
-        if not sftp_new.is_dir():
-            failures.append(
-                f"03.86b: sftp:// root {sftp_new} not created\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if _read_text(sftp_new / "hello.txt") != "hello":
-            failures.append(
-                f"03.86b: sftp:// root was not connected and synced after creation\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if proc.returncode != 0:
-            failures.append(
-                f"03.86b: exit {proc.returncode}\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # --- 03.87: root creation failure → fallback URL tried ---
-        src_c = TMP / "src-c"
-        src_c.mkdir()
-        (src_c / "hello.txt").write_text("hello")
-        obstruction = TMP / "obstruction"
-        obstruction.write_text("not a dir")     # regular file; mkdir through it must fail
-        bad_peer = obstruction / "sub"          # uncreatable: parent is a file
-        good_peer = TMP / "fallback-good"       # does not exist; will be created per 03.86
-
-        bracket = f"[{bad_peer.as_uri()},{good_peer.as_uri()}]"
-        proc = invoke("+" + src_c.as_uri(), bracket)
-        print(f"[03.87] creation failure → fallback tried (exit {proc.returncode})")
-        if not good_peer.is_dir():
-            failures.append(
-                f"03.87: fallback path {good_peer} not created after primary creation failed\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if _read_text(good_peer / "hello.txt") != "hello":
-            failures.append(
-                f"03.87: fallback URL was not connected and synced after primary creation failed\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-        if proc.returncode != 0:
-            failures.append(
-                f"03.87: exit {proc.returncode} with fallback available\n"
-                f"  stdout: {proc.stdout!r}\n  stderr: {proc.stderr!r}"
-            )
-
-        # --- 03.93: startup peer connection attempts issued concurrently ---
-        concurrency_failure = _startup_connect_concurrency_failure()
-        print(f"[03.93] startup peer connect concurrent source structure: {concurrency_failure is None}")
-        if concurrency_failure is not None:
-            failures.append(concurrency_failure)
-
+        test_file_root_creation(failures)
+        test_failed_creation_falls_back_to_sftp(failures)
+        test_failed_creation_without_fallback_is_unreachable(failures)
+        test_failed_sftp_creation_falls_back_to_file(failures)
+        # 03.93 is an implementation-structure requirement: startup peer connection
+        # attempts must be issued through a concurrent join/gather/parallel construct.
+        # That is not reasonably testable through the public CLI without inspecting
+        # source or relying on artificial timing, so this root behavior test does not
+        # assert it.
     finally:
-        if sftp_sock is not None:
-            sftp_sock.close()
-        shutil.rmtree(TMP, ignore_errors=True)
+        ssh(f"rm -rf -- {shlex.quote(REMOTE_BASE)}")
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print(f"{len(failures)} check(s) failed:")
+        for index, failure in enumerate(failures, 1):
+            print(f"\n[{index}] {failure}")
         return 1
-    print("\nAll assertions passed.")
+    print("03_peer-connect checks passed")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

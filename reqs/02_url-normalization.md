@@ -14,6 +14,7 @@ URLs are normalized to a canonical form before any comparison or lookup. Two URL
 - `02.17` — An SFTP URL with no username is normalized to include the current OS user as the username.
 - `02.32` — A trailing slash on the path is removed during normalization.
 - `02.33` — Percent-encoded unreserved characters in a URL are decoded during normalization.
+- `02.46` — An `sftp://.../path` peer treats `/path` as an absolute path on the SFTP server's filesystem, not as a path relative to the remote user's home directory.
 
 ## Notes
 

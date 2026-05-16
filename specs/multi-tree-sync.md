@@ -33,9 +33,12 @@ function sync_directory(peers, path):
     // Phase 2b: Resolve .syncignore before other entries (see ignore.md)
     if ".syncignore" in all_names:
         resolve and sync .syncignore using normal decision rules
-        read winning .syncignore from the peer that has it (via filesystem interface)
-        if read fails: log warning, use only parent ignore rules for this directory
-        else: merge with parent ignore rules
+        if the winning state is an existing .syncignore:
+            read winning .syncignore from the peer that has it (via filesystem interface)
+            if read fails: log at error level, use only parent ignore rules for this directory
+            else: merge with parent ignore rules
+        else:
+            use only parent ignore rules for this directory
         all_names = all_names - matched_by_ignore_rules
         remove ".syncignore" from all_names  // already handled
 
@@ -71,7 +74,7 @@ function sync_directory(peers, path):
                 displace(peer, path/name)
 ```
 
-**All displacement is inline.** Every displacement (type conflicts, deletions) executes during the combined-tree walk, not in the operation queue. Displacement is a same-filesystem rename to BAK/ — fast on any transport. Running it inline eliminates ordering dependencies between displacement and file copies (e.g., a type-conflict directory must be gone before a file copy can rename into that path).
+**All displacement is inline.** Every displacement (type conflicts, deletions) executes during the combined-tree walk, not in the operation queue. Displacement is a same-filesystem rename to BAK/. Running it inline eliminates ordering dependencies between displacement and file copies (e.g., a type-conflict directory must be gone before a file copy can rename into that path).
 
 **Directory deletion:** Do not recurse into a directory that is being displaced on a peer. The displacement moves the entire subtree in a single rename, and the snapshot cascade marks all children as deleted. Only peers that are keeping the directory participate in recursion. Because the traversal is pre-order (decide every entry before recursing), a displaced directory is always renamed as a whole before any of its children are visited — never split files and directories into separate passes.
 
@@ -161,7 +164,7 @@ Directories do not use mod_time for decision-making. Directory mod_times are fil
 
 Directory decisions are existence-based only:
 - If any contributing peer has the directory, it should exist on all peers. Create it on peers that lack it.
-- If all contributing peers that have a snapshot row for the directory have deleted it (tombstone in snapshot, absent in listing), delete it on all remaining peers (displace to BAK/). A contributing peer with no snapshot row for the directory has no opinion and does not block deletion — consistent with the file decision rules where no-row peers do not vote.
+- If no contributing peer has the directory live in its listing, and all contributing peers that have a snapshot row for the directory have deleted it (tombstone in snapshot, absent in listing), delete it on all remaining peers (displace to BAK/). A contributing peer with no snapshot row for the directory has no opinion and does not block deletion — consistent with the file decision rules where no-row peers do not vote.
 - If no contributing peer has the directory — neither live in its listing nor as a snapshot row (with or without tombstone) — the directory does not exist in the group's view. Subordinate peers that have it are displaced to BAK/.
 - Canon peer (`+`) overrides as usual: canon has it → create everywhere; canon lacks it → delete everywhere.
 
@@ -169,7 +172,7 @@ Directories are displaced to BAK/ just like files. The snapshot still tracks dir
 
 ## Type Conflicts
 
-When the same path is a file on one peer and a directory on another: if a canon peer is present, its type wins — the tiebreaker below applies only when no canon peer is designated, or when the canon peer does not have an entry at that path. Otherwise, the file wins. The directory is displaced to BAK/ on the peer(s) that have it, then the winning file is selected by the normal decision rules (rules 1–6) applied to the file entries only and synced to all peers.
+When the same path is a file on one peer and a directory on another: if a canon peer is present, the canon peer's state wins unconditionally. Canon has a file -> displace directories and sync the file everywhere. Canon has a directory -> displace files and create/sync the directory everywhere. Canon lacks the path -> displace the path everywhere else. When no canon peer is designated, the file wins. The directory is displaced to BAK/ on the peer(s) that have it, then the winning file is selected by the normal decision rules (rules 1-6) applied to the file entries only and synced to all peers.
 
 ## Snapshot Updates
 

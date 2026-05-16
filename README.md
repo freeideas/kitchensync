@@ -4,13 +4,13 @@ Synchronize file trees across multiple peers.
 
 ## Why KitchenSync?
 
-**Fast!** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them.
+**Concurrent by design.** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them.
 
-**Never lose files!** Old copies of overwritten or deleted files go to `.kitchensync/BAK/`. Multiple previous versions are kept for 90 days (configurable).
+**Recover overwritten and deleted files.** Old copies of overwritten or deleted files go to a `.kitchensync/BAK/` directory beside the affected path. Multiple previous versions are kept for 90 days (configurable).
 
-**Zero infrastructure on peers.** Only needs SSH access — no daemons, no ports, no services. If you can `ssh user@host`, KitchenSync can sync with it.
+**Zero KitchenSync infrastructure on peers.** Only needs SSH access — no KitchenSync daemons, ports, or services. If you can `ssh user@host`, KitchenSync can sync with it.
 
-**Fully command-line driven.** No config files, no setup wizards, no JSON. Just URLs on a command line. Want a fancy config file? Write a shell script. Or don't — it's up to you.
+**Fully command-line driven.** Peer lists and run options come from the command line. No setup wizards, no JSON. Want a fancy saved command? Write a shell script. Or don't — it's up to you.
 
 **Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections — plug them in and KitchenSync brings them current. Each peer carries its own snapshot history, so it always knows what changed.
 
@@ -28,7 +28,7 @@ Synchronize file trees across multiple peers.
 
 ## Quick Start
 
-Any peer without a snapshot is automatically treated as `-` — it receives the group's state without influencing decisions.
+Any non-canon peer without a snapshot is automatically treated as `-` — it receives the group's state without influencing decisions.
 
 Sync your photos to a cloud drive. First time, use `+` so your local copy wins every disagreement:
 
@@ -96,7 +96,7 @@ java -jar kitchensync.jar --mc 5 --ct 60 c:/photos sftp://host/photos
 
 | Flag   | Default | Meaning                                     |
 | ------ | ------- | ------------------------------------------- |
-| `--mc` | 10      | Max concurrent connections per URL          |
+| `--mc` | 10      | Max SFTP connections per user+host+port     |
 | `--ct` | 30      | SSH handshake timeout (seconds)             |
 | `--ka` | 30      | SFTP idle keep-alive TTL (seconds)          |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
@@ -104,21 +104,6 @@ java -jar kitchensync.jar --mc 5 --ct 60 c:/photos sftp://host/photos
 | `--bd` | 90      | Delete displaced files after N days         |
 | `--td` | 180     | Forget deletion records after N days        |
 
-## How It Compares
-
-|                           | KitchenSync             | rsync        | Syncthing        | Unison       |
-| ------------------------- | ----------------------- | ------------ | ---------------- | ------------ |
-| Deleted/Overwritten files | Recoverable for a while | LOST FOREVER | LOST FOREVER     | LOST FOREVER |
-| Needed on peers           | SSH or maybe nothing *  | rsync + SSH  | Syncthing daemon | SSH + Unison |
-| Bidirectional             | Yes                     | No           | Yes              | Yes          |
-| Multi-peer mesh           | Yes                     | No           | Yes              | Tricky       |
-| Delete propagation        | Yes                     | Opt-in       | Yes              | Yes          |
-| Conflict resolution       | Newest Wins             | Overwrite    | Configurable     | Interactive  |
-| Config files              | No                      | No           | OMG Yes          | Yes          |
-| Windows support           | Excellent               | Tricky       | Excellent        | OK           |
-
-*Maybe slightly misleading because rsync and KitchenSync can both operate on local file systems without SSH. But on Windows, without SSH has some extra-meaningful usefulness — e.g. Windows server file shares — and rsync is difficult to install on Windows.*
- 
 ## URL Schemes
 
 | Form                                 | Meaning                           |
@@ -167,4 +152,3 @@ These are never synced between peers.
 8. Upload updated snapshots back to each peer (atomic rename)
 
 Decisions are made once per entry, not per peer pair. Snapshots track what each peer had last time, enabling deletion detection and conflict resolution.
-

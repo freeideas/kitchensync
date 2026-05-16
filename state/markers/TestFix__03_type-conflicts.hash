@@ -1,0 +1,12 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "TestFix",
+  "taken_at_utc": "2026-05-16T00:00:38Z",
+  "hashes": {
+    "code": "3d087d4ffd7e70462bf31c50f115549b4c30fc1781d29fea58919907c0ad96e8",
+    "fail_marker": "b7087563b35db38f6093670d49348be5274d38b6b0896be2ee370422cab68c9e",
+    "lib": "3a1a0999eeb8855a7f01a3227fd2348061ed978dadba906865752d4d63008c0d",
+    "semantic_source": "ef21bd688e85597ed60ba1e194bacb33e52829bb5f445f59c62d3e001b8348cf",
+    "test": "d670f481651cc863238673fd5d877711a193b9999091464faf4046876594a55b"
+  }
+}

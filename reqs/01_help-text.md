@@ -17,6 +17,9 @@ When invoked with no arguments, `-h`, `--help`, or `/?`, the program prints the 
 - `01.8` — Help text describes fallback URL bracket syntax.
 - `01.9` — Help text lists the global option flags (`--mc`, `--ct`, `--ka`, `-vl`, `--xd`, `--bd`, `--td`) with their defaults.
 - `01.25` — Help text describes per-URL query string settings.
+- `01.26` — If `-h`, `--help`, or `/?` appears in an otherwise invalid invocation, the program prints help to stdout and exits 0 before reporting validation errors.
+- `01.27` — Help invocations print the mandated help text verbatim.
+- `01.28` — The built JAR contains the mandated help text so help output does not depend on reading `specs/help.md` or another external help file at runtime.
 
 ## Notes
 

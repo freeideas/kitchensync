@@ -1,165 +1,264 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Built-in exclusions: .kitchensync/, symlinks, special files, .git/ default, !.git/ override."""
 
 from __future__ import annotations
 
-import os, shutil, subprocess, sys
+import os
+import shutil
+import socket
+import subprocess
+import sys
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = Path(PROJECT) / "tmp" / "testks" / "03_builtin-excludes"
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
+WORK = PROJECT_DIR / "tests/.tmp/03_builtin-excludes"
 
 
-def sync(peer1: Path, peer2: Path) -> subprocess.CompletedProcess:
-    url1 = "+" + peer1.resolve().as_uri()
-    url2 = peer2.resolve().as_uri()
+def clean(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, url1, url2],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
+        [str(JAVA), "-jar", str(JAR), *peers],
+        cwd=str(PROJECT_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
+        check=False,
     )
 
 
-def setup(name: str) -> tuple[Path, Path]:
-    d = TMP / name
-    if d.exists():
-        shutil.rmtree(d)
-    peer1 = d / "peer1"
-    peer2 = d / "peer2"
-    peer1.mkdir(parents=True)
-    peer2.mkdir(parents=True)
-    return peer1, peer2
+def note_result(
+    failures: list[str], name: str, condition: bool, detail: str = ""
+) -> None:
+    if condition:
+        print(f"PASS: {name}")
+    else:
+        message = f"FAIL: {name}"
+        if detail:
+            message = f"{message}: {detail}"
+        print(message)
+        failures.append(message)
+
+
+def no_entry(path: Path) -> bool:
+    return not path.exists() and not path.is_symlink()
+
+
+def text_equals(path: Path, expected: str, failures: list[str], name: str) -> None:
+    try:
+        actual = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        note_result(failures, name, False, f"could not read {path}: {exc}")
+        return
+    note_result(
+        failures,
+        name,
+        actual == expected,
+        f"expected {expected!r} at {path}, got {actual!r}",
+    )
+
+
+def check_sync_succeeded(
+    failures: list[str], name: str, result: subprocess.CompletedProcess[str]
+) -> None:
+    detail = (
+        f"exit={result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    note_result(failures, name, result.returncode == 0, detail)
+
+
+def make_symlink(link: Path, target: Path, failures: list[str], name: str) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError as exc:
+        failures.append(f"FAIL: {name}: could not create symlink: {exc}")
+
+
+def make_fifo(path: Path, failures: list[str]) -> None:
+    try:
+        os.mkfifo(path)
+    except OSError as exc:
+        failures.append(f"FAIL: fifo fixture: could not create FIFO: {exc}")
+
+
+def bind_socket(path: Path, failures: list[str]) -> socket.socket | None:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(path))
+        sock.listen(1)
+        return sock
+    except OSError as exc:
+        sock.close()
+        failures.append(f"FAIL: socket fixture: could not create socket: {exc}")
+        return None
+
+
+def exercise_hard_excludes(failures: list[str]) -> None:
+    source = WORK / "hard-source"
+    target = WORK / "hard-target"
+    source.mkdir(parents=True)
+    target.mkdir(parents=True)
+
+    write_text(
+        source / ".syncignore",
+        "\n".join(
+            [
+                "!.kitchensync/",
+                "!nested/.kitchensync/",
+                "!link-file",
+                "!link-dir/",
+                "!fifo-entry",
+                "!socket-entry",
+                "",
+            ]
+        ),
+    )
+    write_text(source / "regular.txt", "regular file copied\n")
+    write_text(source / "nested/keep.txt", "keeps parent directory observable\n")
+    write_text(source / ".kitchensync/root-hidden.txt", "must not sync\n")
+    write_text(source / "nested/.kitchensync/hidden.txt", "must not sync\n")
+    write_text(source / ".git/config", "must not sync by default\n")
+    write_text(source / "real-file.txt", "symlink target\n")
+    write_text(source / "real-dir/inside.txt", "directory symlink target\n")
+    make_symlink(source / "link-file", source / "real-file.txt", failures, "file symlink fixture")
+    make_symlink(source / "link-dir", source / "real-dir", failures, "directory symlink fixture")
+    # Device nodes are also special files, but portable plain-Python tests cannot
+    # create them without elevated, OS-specific setup. FIFOs and sockets cover the
+    # observable special-file exclusion through the public sync surface.
+    make_fifo(source / "fifo-entry", failures)
+    sock = bind_socket(source / "socket-entry", failures)
+
+    try:
+        result = run_sync(f"+{source}", f"-{target}")
+    finally:
+        if sock is not None:
+            sock.close()
+
+    check_sync_succeeded(failures, "sync with built-in excluded entries", result)
+    text_equals(
+        target / "regular.txt",
+        "regular file copied\n",
+        failures,
+        "ordinary files still sync in built-in exclusion scenario",
+    )
+    note_result(
+        failures,
+        "root .kitchensync payload is never synced even when unignored",
+        no_entry(target / ".kitchensync/root-hidden.txt"),
+        f"unexpected entry at {target / '.kitchensync/root-hidden.txt'}",
+    )
+    note_result(
+        failures,
+        "nested .kitchensync payload is never synced even when unignored",
+        no_entry(target / "nested/.kitchensync/hidden.txt"),
+        f"unexpected entry at {target / 'nested/.kitchensync/hidden.txt'}",
+    )
+    note_result(
+        failures,
+        "file symlink is never synced even when unignored",
+        no_entry(target / "link-file"),
+        f"unexpected entry at {target / 'link-file'}",
+    )
+    note_result(
+        failures,
+        "directory symlink is never synced even when unignored",
+        no_entry(target / "link-dir"),
+        f"unexpected entry at {target / 'link-dir'}",
+    )
+    note_result(
+        failures,
+        "FIFO is never synced even when unignored",
+        no_entry(target / "fifo-entry"),
+        f"unexpected entry at {target / 'fifo-entry'}",
+    )
+    note_result(
+        failures,
+        "socket is never synced even when unignored",
+        no_entry(target / "socket-entry"),
+        f"unexpected entry at {target / 'socket-entry'}",
+    )
+    note_result(
+        failures,
+        ".git is excluded by default",
+        no_entry(target / ".git/config"),
+        f"unexpected entry at {target / '.git/config'}",
+    )
+
+
+def exercise_git_unignore(failures: list[str]) -> None:
+    source = WORK / "git-source"
+    target = WORK / "git-target"
+    source.mkdir(parents=True)
+    target.mkdir(parents=True)
+
+    write_text(source / ".syncignore", "!.git/\n")
+    write_text(source / ".git/config", "[core]\n\trepositoryformatversion = 0\n")
+    write_text(source / ".git/refs/heads/main", "0123456789abcdef\n")
+    write_text(source / "subdir/.git/config", "[core]\n\tbare = false\n")
+    write_text(source / "normal.txt", "normal file copied\n")
+
+    result = run_sync(f"+{source}", f"-{target}")
+    check_sync_succeeded(failures, "sync with .git explicitly unignored", result)
+    text_equals(
+        target / ".git/config",
+        "[core]\n\trepositoryformatversion = 0\n",
+        failures,
+        "!.git/ re-enables .git at that level",
+    )
+    text_equals(
+        target / ".git/refs/heads/main",
+        "0123456789abcdef\n",
+        failures,
+        "!.git/ re-enables entries below that level",
+    )
+    text_equals(
+        target / "subdir/.git/config",
+        "[core]\n\tbare = false\n",
+        failures,
+        "!.git/ follows normal hierarchy for lower .git directories",
+    )
 
 
 def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
+    failures: list[str] = []
+    clean(WORK)
+    WORK.mkdir(parents=True, exist_ok=True)
 
-    failures = []
-
-    # --- 03.47: .kitchensync/ never synced, cannot be re-enabled by .syncignore ---
-    peer1, peer2 = setup("t47")
-    (peer1 / "regular.txt").write_text("hello")
-    (peer1 / ".syncignore").write_text("!.kitchensync/\n")
-    (peer1 / ".kitchensync").mkdir()
-    (peer1 / ".kitchensync" / "sentinel.txt").write_text("should not sync")
-    (peer1 / "sub").mkdir()
-    (peer1 / "sub" / ".kitchensync").mkdir()
-    (peer1 / "sub" / ".kitchensync" / "sentinel.txt").write_text("should not sync")
-    r = sync(peer1, peer2)
-    synced = (peer2 / "regular.txt").exists()
-    root_leaked = (peer2 / ".kitchensync" / "sentinel.txt").exists()
-    nested_leaked = (peer2 / "sub" / ".kitchensync" / "sentinel.txt").exists()
-    print(
-        f"[03.47] .kitchensync/ not synced: regular_synced={synced} "
-        f"root_sentinel_leaked={root_leaked} nested_sentinel_leaked={nested_leaked} exit={r.returncode}"
-    )
-    if not synced:
-        failures.append(f"03.47: regular.txt not synced — sync may not have run (exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
-    if root_leaked:
-        failures.append("03.47: .kitchensync/sentinel.txt was synced to peer2 (must never sync, even with !.kitchensync/ in .syncignore)")
-    if nested_leaked:
-        failures.append("03.47: sub/.kitchensync/sentinel.txt was synced to peer2 (must never sync, even with !.kitchensync/ in .syncignore)")
-
-    # --- 03.48: Symlinks never synced, cannot be re-enabled by .syncignore ---
-    peer1, peer2 = setup("t48")
-    (peer1 / "regular.txt").write_text("hello")
-    (peer1 / "target.txt").write_text("target content")
-    (peer1 / "targetdir").mkdir()
-    (peer1 / "targetdir" / "nested.txt").write_text("target content")
-    (peer1 / "mylink").symlink_to("target.txt")
-    (peer1 / "dirlink").symlink_to("targetdir", target_is_directory=True)
-    (peer1 / ".syncignore").write_text("!mylink\n!dirlink\n")
-    r = sync(peer1, peer2)
-    synced = (peer2 / "regular.txt").exists()
-    file_link_leaked = (peer2 / "mylink").is_symlink() or (peer2 / "mylink").exists()
-    dir_link_leaked = (peer2 / "dirlink").is_symlink() or (peer2 / "dirlink").exists()
-    print(
-        f"[03.48] symlinks not synced: regular_synced={synced} "
-        f"file_link_leaked={file_link_leaked} dir_link_leaked={dir_link_leaked} exit={r.returncode}"
-    )
-    if not synced:
-        failures.append(f"03.48: regular.txt not synced — sync may not have run (exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
-    if file_link_leaked:
-        failures.append("03.48: symlink 'mylink' was synced to peer2 (must never sync, even with !mylink in .syncignore)")
-    if dir_link_leaked:
-        failures.append("03.48: directory symlink 'dirlink' was synced to peer2 (must never sync, even with !dirlink in .syncignore)")
-
-    # --- 03.49: Special files (FIFO) never synced, cannot be re-enabled by .syncignore ---
-    peer1, peer2 = setup("t49")
-    (peer1 / "regular.txt").write_text("hello")
-    os.mkfifo(peer1 / "myfifo")
-    (peer1 / ".syncignore").write_text("!myfifo\n")
-    r = sync(peer1, peer2)
-    synced = (peer2 / "regular.txt").exists()
-    leaked = (peer2 / "myfifo").exists()
-    print(f"[03.49] FIFO not synced: regular_synced={synced} fifo_leaked={leaked} exit={r.returncode}")
-    if not synced:
-        failures.append(f"03.49: regular.txt not synced — sync may not have run (exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
-    if leaked:
-        failures.append("03.49: FIFO 'myfifo' was synced to peer2 (must never sync, even with !myfifo in .syncignore)")
-
-    # --- 03.50: .git/ excluded by default ---
-    peer1, peer2 = setup("t50")
-    (peer1 / "regular.txt").write_text("hello")
-    (peer1 / ".git").mkdir()
-    (peer1 / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
-    (peer1 / "sub").mkdir()
-    (peer1 / "sub" / ".git").mkdir()
-    (peer1 / "sub" / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
-    r = sync(peer1, peer2)
-    synced = (peer2 / "regular.txt").exists()
-    root_git_leaked = (peer2 / ".git").exists()
-    nested_git_leaked = (peer2 / "sub" / ".git").exists()
-    print(
-        f"[03.50] .git/ excluded by default: regular_synced={synced} "
-        f"root_git_leaked={root_git_leaked} nested_git_leaked={nested_git_leaked} exit={r.returncode}"
-    )
-    if not synced:
-        failures.append(f"03.50: regular.txt not synced — sync may not have run (exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
-    if root_git_leaked:
-        failures.append("03.50: .git/ was synced to peer2 (must be excluded by default)")
-    if nested_git_leaked:
-        failures.append("03.50: sub/.git/ was synced to peer2 (must be excluded by default)")
-
-    # --- 03.51: !.git/ in .syncignore re-enables .git/ sync ---
-    peer1, peer2 = setup("t51")
-    (peer1 / "regular.txt").write_text("hello")
-    (peer1 / ".syncignore").write_text("!.git/\n")
-    (peer1 / ".git").mkdir()
-    (peer1 / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
-    (peer1 / "sub").mkdir()
-    (peer1 / "sub" / ".git").mkdir()
-    (peer1 / "sub" / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")
-    r = sync(peer1, peer2)
-    synced = (peer2 / "regular.txt").exists()
-    git_synced = (peer2 / ".git" / "config").exists()
-    nested_git_synced = (peer2 / "sub" / ".git" / "config").exists()
-    print(
-        f"[03.51] !.git/ re-enables .git/ sync: regular_synced={synced} "
-        f"git_synced={git_synced} nested_git_synced={nested_git_synced} exit={r.returncode}"
-    )
-    if not synced:
-        failures.append(f"03.51: regular.txt not synced — sync may not have run (exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r})")
-    if not git_synced:
-        failures.append(f"03.51: .git/config not synced despite !.git/ in .syncignore (stdout={r.stdout!r} stderr={r.stderr!r})")
-    if not nested_git_synced:
-        failures.append(f"03.51: sub/.git/config not synced despite parent !.git/ in .syncignore (stdout={r.stdout!r} stderr={r.stderr!r})")
+    try:
+        exercise_hard_excludes(failures)
+        exercise_git_unignore(failures)
+    except subprocess.TimeoutExpired as exc:
+        failures.append(f"FAIL: sync timed out: {exc}")
+    except Exception as exc:
+        failures.append(f"FAIL: unexpected test error: {type(exc).__name__}: {exc}")
+    finally:
+        clean(WORK)
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("\nFailures:")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
     return 0
 
 

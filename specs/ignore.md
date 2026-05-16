@@ -12,8 +12,8 @@ Any directory may contain a `.syncignore` file listing patterns of files and dir
 
 At each directory level, after listing all peers and computing the union of entry names, `.syncignore` is resolved **before** other entries:
 
-1. If `.syncignore` appears in the union, apply normal decision rules to it first (decide the winning version, enqueue copies to peers that need it).
-2. Read the winning `.syncignore` and combine its patterns with the accumulated ignore rules from parent directories.
+1. If `.syncignore` appears in the union, apply normal decision rules to it first (decide whether it exists, then enqueue copies or displacements needed to make peers match).
+2. If the winning state is an existing `.syncignore`, read that file and combine its patterns with the accumulated ignore rules from parent directories. If the winning state is absence/deletion, only parent-level rules apply at this directory.
 3. Filter the remaining union entries through the accumulated rules — entries that match are skipped (no decisions, no copies, no snapshot updates).
 
 If no peer has a `.syncignore` at the current level, only parent-level rules (if any) apply.

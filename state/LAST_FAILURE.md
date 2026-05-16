@@ -1,14 +1,16 @@
 # Project failure: .
 
-**Raised by:** NextCarve
-**Timestamp:** 2026-05-14-23-17-31-180
+**Raised by:** RunTest
+**Counter:** RunTest = 1/3
+**Timestamp:** 2026-05-16-16-09-37-670
 
 ## Failure summary
 
-AI driver subprocess failed during dispatch_ai.
+Test `03_logging` failed against the current release.
 
 ## Evidence
 
 ```
-RuntimeError: driver exited with code 1; stderr:
+FAILURES:
+- trace should include a release back to 0/2; lines=['endpoint=ace@ordinarydata.com:22 connections=1/2', 'endpoint=ace@ordinarydata.com:22 connections=1/2']
 ```

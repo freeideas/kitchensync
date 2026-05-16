@@ -17,6 +17,11 @@ Any directory may contain a `.syncignore` file with gitignore-style patterns; ma
 - `03.88` — A `!pattern` line in a child-directory `.syncignore` un-ignores entries that a parent-directory `.syncignore` rule would otherwise ignore.
 - `03.89` — If reading the winning `.syncignore` at a directory level fails, a warning is logged.
 - `03.95` — If reading the winning `.syncignore` at a directory level fails, entries in that directory are filtered using only the accumulated parent-level ignore rules.
+- `03.102` — If reading the winning `.syncignore` at a directory level fails, the diagnostic is emitted at `error` verbosity.
+- `03.103` — If the winning state for a directory's `.syncignore` is absence/deletion, entries in that directory are filtered using only the accumulated parent-level ignore rules.
+- `03.104` — A `!pattern` line in a `.syncignore` re-includes entries excluded by an earlier pattern in the same `.syncignore` file.
+- `03.107` — At a directory level, the winning `.syncignore` state is decided and its patterns are applied before decisions for any other entries at that same level.
+- `03.111` — Parent-directory `.syncignore` patterns continue to filter entries in descendant directories that have no `.syncignore` file of their own.
 
 ## Notes
 

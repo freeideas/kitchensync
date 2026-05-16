@@ -1,131 +1,257 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Type-conflict resolution: file vs directory at same path (03.36, 03.37, 03.38)."""
 
 from __future__ import annotations
 
-import os, shutil, subprocess, sys
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = Path(PROJECT) / "tmp" / "testks" / "03_type-conflicts"
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
+WORK = PROJECT_DIR / "tests/.tmp/03_type-conflicts"
 
 
-def _run(*peer_args, timeout=60):
+def run_cli(*peers: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, *peer_args],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
-        timeout=timeout,
+        [str(JAVA), "-jar", str(JAR), *[str(peer) for peer in peers]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
     )
 
 
-def _in_bak(peer_dir: Path, name: str) -> bool:
-    bak_root = peer_dir / ".kitchensync" / "BAK"
-    if not bak_root.exists():
-        return False
-    for ts_dir in bak_root.iterdir():
-        if (ts_dir / name).exists():
-            return True
-    return False
+def reset_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def bak_entries(peer: Path, name: str) -> list[Path]:
+    bak = peer / ".kitchensync/BAK"
+    if not bak.exists():
+        return []
+    return sorted(entry for entry in bak.glob(f"*/{name}"))
+
+
+def check(condition: bool, failures: list[str], message: str) -> None:
+    if condition:
+        print(f"PASS: {message}")
+    else:
+        print(f"FAIL: {message}")
+        failures.append(message)
+
+
+def check_file(path: Path, text: str, failures: list[str], message: str) -> None:
+    if path.is_file():
+        actual = path.read_text(encoding="utf-8")
+        check(actual == text, failures, f"{message}: expected content {text!r}")
+    else:
+        check(False, failures, f"{message}: expected file at {path}")
+
+
+def check_absent(path: Path, failures: list[str], message: str) -> None:
+    check(not path.exists(), failures, f"{message}: expected absent at {path}")
+
+
+def check_run_ok(
+    result: subprocess.CompletedProcess[str], failures: list[str], message: str
+) -> bool:
+    detail = (
+        f"{message}: exit {result.returncode}; "
+        f"stdout={result.stdout.strip()!r}; stderr={result.stderr.strip()!r}"
+    )
+    check(result.returncode == 0, failures, detail)
+    return result.returncode == 0
+
+
+def scenario_file_wins_without_canon(failures: list[str]) -> None:
+    root = WORK / "file-wins-without-canon"
+    reset_dir(root)
+    file_peer = root / "file-peer"
+    dir_peer = root / "dir-peer"
+    empty_peer = root / "empty-peer"
+    for peer in (file_peer, dir_peer, empty_peer):
+        peer.mkdir()
+
+    write_text(file_peer / "seed.txt", "snapshot history\n")
+    seeded = run_cli(Path("+" + str(file_peer)), dir_peer, empty_peer)
+    if not check_run_ok(
+        seeded,
+        failures,
+        "03.36 setup creates snapshot history before no-canon conflict",
+    ):
+        return
+
+    write_text(file_peer / "conflict", "file winner\n")
+    write_text(dir_peer / "conflict/inside.txt", "directory loser\n")
+
+    result = run_cli(file_peer, dir_peer, empty_peer)
+    if not check_run_ok(
+        result,
+        failures,
+        "03.36/03.37 sync succeeds when file and directory conflict without canon",
+    ):
+        return
+
+    for peer in (file_peer, dir_peer, empty_peer):
+        check_file(
+            peer / "conflict",
+            "file winner\n",
+            failures,
+            f"03.37 winning file is present on {peer.name}",
+        )
+
+    entries = bak_entries(dir_peer, "conflict")
+    check(
+        len(entries) == 1 and entries[0].is_dir(),
+        failures,
+        "03.36 losing directory is displaced to BAK on the peer that had it",
+    )
+    if entries and entries[0].is_dir():
+        check_file(
+            entries[0] / "inside.txt",
+            "directory loser\n",
+            failures,
+            "03.36 displaced directory keeps its original contents",
+        )
+
+
+def scenario_canon_type_wins(failures: list[str]) -> None:
+    root = WORK / "canon-type-wins"
+    reset_dir(root)
+    canon_dir = root / "canon-dir"
+    file_peer = root / "file-peer"
+    empty_peer = root / "empty-peer"
+    for peer in (canon_dir, file_peer, empty_peer):
+        peer.mkdir()
+
+    write_text(canon_dir / "conflict/from-canon.txt", "canon directory\n")
+    write_text(file_peer / "conflict", "non-canon file\n")
+
+    result = run_cli(Path("+" + str(canon_dir)), file_peer, empty_peer)
+    if not check_run_ok(
+        result,
+        failures,
+        "03.38 sync succeeds when canon directory conflicts with non-canon file",
+    ):
+        return
+
+    for peer in (canon_dir, file_peer, empty_peer):
+        check(
+            (peer / "conflict").is_dir(),
+            failures,
+            f"03.38 canon directory type is present on {peer.name}",
+        )
+        check_file(
+            peer / "conflict/from-canon.txt",
+            "canon directory\n",
+            failures,
+            f"03.38 canon directory contents are synced to {peer.name}",
+        )
+
+    entries = bak_entries(file_peer, "conflict")
+    check(
+        len(entries) == 1 and entries[0].is_file(),
+        failures,
+        "03.38 losing file is displaced to BAK on the peer that had it",
+    )
+    if entries and entries[0].is_file():
+        check_file(
+            entries[0],
+            "non-canon file\n",
+            failures,
+            "03.38 displaced file keeps its original contents",
+        )
+
+
+def scenario_canon_absence_wins(failures: list[str]) -> None:
+    root = WORK / "canon-absence-wins"
+    reset_dir(root)
+    canon_empty = root / "canon-empty"
+    file_peer = root / "file-peer"
+    dir_peer = root / "dir-peer"
+    for peer in (canon_empty, file_peer, dir_peer):
+        peer.mkdir()
+
+    write_text(file_peer / "conflict", "file displaced\n")
+    write_text(dir_peer / "conflict/inside.txt", "directory displaced\n")
+
+    result = run_cli(Path("+" + str(canon_empty)), file_peer, dir_peer)
+    if not check_run_ok(
+        result,
+        failures,
+        "03.39 sync succeeds when canon lacks a file/directory conflict path",
+    ):
+        return
+
+    for peer in (canon_empty, file_peer, dir_peer):
+        check_absent(
+            peer / "conflict",
+            failures,
+            f"03.39 canon absence removes conflict path from {peer.name}",
+        )
+
+    file_entries = bak_entries(file_peer, "conflict")
+    check(
+        len(file_entries) == 1 and file_entries[0].is_file(),
+        failures,
+        "03.39 non-canon file is displaced to BAK when canon lacks the path",
+    )
+    if file_entries and file_entries[0].is_file():
+        check_file(
+            file_entries[0],
+            "file displaced\n",
+            failures,
+            "03.39 displaced file keeps its original contents",
+        )
+
+    dir_entries = bak_entries(dir_peer, "conflict")
+    check(
+        len(dir_entries) == 1 and dir_entries[0].is_dir(),
+        failures,
+        "03.39 non-canon directory is displaced to BAK when canon lacks the path",
+    )
+    if dir_entries and dir_entries[0].is_dir():
+        check_file(
+            dir_entries[0] / "inside.txt",
+            "directory displaced\n",
+            failures,
+            "03.39 displaced directory keeps its original contents",
+        )
 
 
 def main() -> int:
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    TMP.mkdir(parents=True)
+    reset_dir(WORK)
+    failures: list[str] = []
 
-    failures = []
-
-    try:
-        # ── 03.36 + 03.37: no canon peer → file wins, directory displaced ───
-
-        peer_a = TMP / "t0336" / "peer_a"
-        peer_b = TMP / "t0336" / "peer_b"
-        peer_a.mkdir(parents=True)
-        peer_b.mkdir(parents=True)
-
-        # Phase 1: establish snapshots so a no-canon sync is valid on phase 2
-        (peer_a / "baseline.txt").write_text("base")
-        (peer_b / "baseline.txt").write_text("base")
-        _run("+" + peer_a.resolve().as_uri(), peer_b.resolve().as_uri())
-
-        # Phase 2: introduce a file-vs-directory conflict, sync without canon
-        (peer_a / "conflict").write_text("file-content")
-        (peer_b / "conflict").mkdir()
-        (peer_b / "conflict" / "inner.txt").write_text("dir-content")
-        _run(peer_a.resolve().as_uri(), peer_b.resolve().as_uri())
-
-        # 03.36: peer_b directory must be displaced to BAK/
-        in_bak = _in_bak(peer_b, "conflict")
-        print(f"[03.36] peer_b 'conflict' in BAK: {in_bak}")
-        if not in_bak:
-            failures.append("03.36: peer_b 'conflict' directory not displaced to BAK/")
-
-        # 03.36: peer_b must no longer have 'conflict' as a directory
-        conflict_b = peer_b / "conflict"
-        still_dir = conflict_b.exists() and conflict_b.is_dir()
-        print(f"[03.36] peer_b 'conflict' still a directory: {still_dir}")
-        if still_dir:
-            failures.append("03.36: peer_b 'conflict' is still a directory after sync")
-
-        # 03.37: winning file propagated to peer_b
-        is_file = conflict_b.exists() and conflict_b.is_file()
-        content = conflict_b.read_text() if is_file else None
-        print(f"[03.37] peer_b 'conflict' is file: {is_file}, content: {content!r}")
-        if not is_file:
-            failures.append("03.37: winning file not propagated to peer_b")
-        elif content != "file-content":
-            failures.append(f"03.37: peer_b 'conflict' has wrong content: {content!r}")
-
-        # ── 03.38: canon peer's type wins ────────────────────────────────────
-
-        peer_c = TMP / "t0338" / "peer_c"  # canon — has 'conflict' as directory
-        peer_d = TMP / "t0338" / "peer_d"  # non-canon — has 'conflict' as file
-        peer_c.mkdir(parents=True)
-        peer_d.mkdir(parents=True)
-
-        (peer_c / "conflict").mkdir()
-        (peer_c / "conflict" / "inner.txt").write_text("canon-content")
-        (peer_d / "conflict").write_text("file-content-d")
-
-        _run("+" + peer_c.resolve().as_uri(), peer_d.resolve().as_uri())
-
-        # 03.38: non-canon peer_d file must be displaced to BAK/
-        in_bak_d = _in_bak(peer_d, "conflict")
-        print(f"[03.38] peer_d 'conflict' file in BAK: {in_bak_d}")
-        if not in_bak_d:
-            failures.append("03.38: peer_d 'conflict' file not displaced to BAK/ when canon has directory")
-
-        # 03.38: peer_d must now have 'conflict' as a directory (canon's type)
-        conflict_d = peer_d / "conflict"
-        is_dir_d = conflict_d.exists() and conflict_d.is_dir()
-        print(f"[03.38] peer_d 'conflict' is directory: {is_dir_d}")
-        if not is_dir_d:
-            failures.append("03.38: peer_d 'conflict' is not a directory after canon type resolution")
-
-        # 03.38: canon peer_c's 'conflict' directory must remain intact
-        conflict_c = peer_c / "conflict"
-        canon_intact = conflict_c.exists() and conflict_c.is_dir()
-        print(f"[03.38] canon peer_c 'conflict' directory intact: {canon_intact}")
-        if not canon_intact:
-            failures.append("03.38: canon peer_c 'conflict' directory was unexpectedly displaced")
-
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+    scenario_file_wins_without_canon(failures)
+    scenario_canon_type_wins(failures)
+    scenario_canon_absence_wins(failures)
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("\nFailures:")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("\nAll type-conflict checks passed.")
     return 0
 
 

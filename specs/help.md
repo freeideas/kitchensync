@@ -1,6 +1,6 @@
 # Help Screen
 
-`-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors (fewer than two peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the JAR at build time.
+`-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the JAR at build time.
 
 ```
 Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
@@ -26,14 +26,14 @@ Fallback URLs (multiple paths to the same data):
   -[url1,url2,...]                 Subordinate peer with fallbacks
 
 Per-URL settings (query string, inside quotes):
-  "sftp://host/path?mc=5"          Max connections for this URL
+  "sftp://host/path?mc=5"          Max SFTP connections for this user+host+port
   "sftp://host/path?ct=60"         Connection timeout for this URL
   "sftp://host/path?ka=10"         SFTP idle keep-alive TTL for this URL
   "sftp://host/path?mc=5&ct=60"    Combine multiple
 
 Options:
   -h, --help, /?                      Show this help
-  --mc N             Max concurrent connections per URL (default: 10)
+  --mc N             Max SFTP connections per user+host+port (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
   --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
@@ -52,5 +52,5 @@ After the first sync, bidirectional sync works without canon.
 
 Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 
-Displaced files are recoverable from .kitchensync/BAK/ (kept for --bd days).
+Displaced files are recoverable from nearby .kitchensync/BAK/ directories (kept for --bd days).
 ```

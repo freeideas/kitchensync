@@ -1,8 +1,8 @@
 {
   "schema": "aitc.hash.v1",
   "job": "ReqCurate",
-  "taken_at_utc": "2026-05-14T21:14:42Z",
+  "taken_at_utc": "2026-05-16T10:59:13Z",
   "hashes": {
-    "reqs": "08507304dd9f9782cb73aec7a4bcb504749554437d0e414817bec3e88234c70b"
+    "reqs": "9e0fa26dbd1a39bdbd5270cdc100de8566282b7992cacfbf11f65b35262ba017"
   }
 }

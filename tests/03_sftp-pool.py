@@ -1,653 +1,527 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["paramiko==3.5.1"]
+# dependencies = [
+#   "paramiko>=3.4,<4",
+# ]
 # ///
-"""SFTP connection pool: pool identity (03.58), per-URL overrides (03.59), mc cap (03.60),
-ka keep-alive (03.61), ct timeout with fallback (03.62), file:// exemption (03.63),
-transfer borrows from both pools (03.64)."""
 
 from __future__ import annotations
 
-import errno, logging, os, posixpath, re, shutil, socket, subprocess, sys, threading, time
+import shutil
+import socket
+import re
+import stat
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import paramiko
-from paramiko import SFTPAttributes, SFTPHandle, SFTPServer
-
-logging.getLogger("paramiko").setLevel(logging.CRITICAL + 1)
-
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
-
-USER = "pooltest"
-PASSWORD = "poolpass"
-HOST = "127.0.0.1"
-ENDPOINT = f"{USER}@{HOST}"
-SFTP_PORT = 0
-
-TMP = (Path(PROJECT) / "tmp" / "testks" / "03_sftp-pool").resolve()
-TEST_HOME = TMP / "home"
 
 
-def sftp(path: Path, **query) -> str:
-    rel = "/" + path.relative_to(TMP).as_posix()
-    url = f"sftp://{USER}:{PASSWORD}@{HOST}:{SFTP_PORT}{rel}"
-    if query:
-        url += "?" + "&".join(f"{k}={v}" for k, v in query.items())
-    return url
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+JAVA = PROJECT_DIR / "tools" / "compiler" / "jdk" / "bin" / "java"
+JAR = PROJECT_DIR / "released" / "kitchensync.jar"
+WORK_DIR = PROJECT_DIR / "tests" / ".tmp" / "03_sftp_pool"
+
+SSH_HOST = "ordinarydata.com"
+SSH_USER = "ace"
+REMOTE_ROOT = "/tmp/testks/03_sftp_pool"
 
 
-TRACE_EVENT = re.compile(r"endpoint=(\S+) connections=(\d+)/(\d+)")
-TIMEOUT_EXIT = 124
+@dataclass(frozen=True)
+class CliResult:
+    args: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    elapsed: float
 
 
-def invoke(args: list[str], timeout: int = 60) -> tuple[int, str, str]:
-    env = os.environ.copy()
-    env.pop("SSH_AUTH_SOCK", None)
-    env["JAVA_TOOL_OPTIONS"] = (
-        (env.get("JAVA_TOOL_OPTIONS", "") + " ").strip()
-        + f"-Duser.home={TEST_HOME}"
-    ).strip()
-    try:
-        proc = subprocess.run(
-            [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT] + args,
-            capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as ex:
-        stdout = ex.stdout.decode("utf-8", errors="replace") if isinstance(ex.stdout, bytes) else ex.stdout
-        stderr = ex.stderr.decode("utf-8", errors="replace") if isinstance(ex.stderr, bytes) else ex.stderr
-        return TIMEOUT_EXIT, stdout or "", stderr or ""
+class StalledSshEndpoint:
+    def __init__(self) -> None:
+        self.accepted = 0
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._sock: socket.socket | None = None
+        self._thread = threading.Thread(target=self._serve, daemon=True)
 
+    def __enter__(self) -> StalledSshEndpoint:
+        self._thread.start()
+        if not self._ready.wait(timeout=5):
+            raise RuntimeError("stalled SSH endpoint did not start")
+        return self
 
-def trace_counts(stdout: str, endpoint: str = ENDPOINT) -> list[tuple[int, int]]:
-    return [
-        (int(match.group(2)), int(match.group(3)))
-        for match in TRACE_EVENT.finditer(stdout)
-        if match.group(1) == endpoint
-    ]
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=5)
 
-
-def max_in_use(stdout: str, endpoint: str = ENDPOINT) -> int:
-    counts = trace_counts(stdout, endpoint)
-    return max((used for used, _ in counts), default=0)
-
-
-def saw_trace_count(stdout: str, used: int, max_conn: int, endpoint: str = ENDPOINT) -> bool:
-    return (used, max_conn) in trace_counts(stdout, endpoint)
-
-
-class PasswordServer(paramiko.ServerInterface):
-    def check_auth_password(self, username: str, password: str) -> int:
-        if username == USER and password == PASSWORD:
-            return paramiko.AUTH_SUCCESSFUL
-        return paramiko.AUTH_FAILED
-
-    def get_allowed_auths(self, username: str) -> str:
-        return "password"
-
-    def check_channel_request(self, kind: str, chanid: int) -> int:
-        if kind == "session":
-            return paramiko.OPEN_SUCCEEDED
-        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
-
-
-class RootedSftp(paramiko.SFTPServerInterface):
-    def __init__(self, server, root: str, blocked_write_prefixes: tuple[str, ...]):
-        super().__init__(server)
-        self.root = Path(root).resolve()
-        self.blocked_write_prefixes = blocked_write_prefixes
-
-    @staticmethod
-    def _remote(path: str) -> str:
-        return posixpath.normpath("/" + path.lstrip("/"))
-
-    def _local(self, path: str) -> Path:
-        normalized = self._remote(path)
-        local = (self.root / normalized.lstrip("/")).resolve()
-        if local == self.root or self.root in local.parents:
-            return local
-        raise OSError(errno.EACCES, "path outside test root")
-
-    def _write_blocked(self, path: str) -> bool:
-        normalized = self._remote(path)
-        for prefix in self.blocked_write_prefixes:
-            if normalized == prefix or normalized.startswith(prefix + "/"):
-                return True
-        return False
-
-    @staticmethod
-    def _attr(path: Path) -> SFTPAttributes:
-        attrs = SFTPAttributes.from_stat(path.stat())
-        attrs.filename = path.name
-        return attrs
-
-    def list_folder(self, path: str):
-        try:
-            return [self._attr(child) for child in self._local(path).iterdir()]
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def stat(self, path: str):
-        try:
-            return SFTPAttributes.from_stat(self._local(path).stat())
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def lstat(self, path: str):
-        return self.stat(path)
-
-    def open(self, path: str, flags: int, attr: SFTPAttributes):
-        try:
-            if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC) and self._write_blocked(path):
-                return paramiko.SFTP_PERMISSION_DENIED
-            local = self._local(path)
-            if flags & os.O_CREAT:
-                local.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(local, flags, getattr(attr, "st_mode", None) or 0o666)
-            mode = "r+b" if flags & os.O_RDWR else "wb" if flags & os.O_WRONLY else "rb"
-            file_obj = os.fdopen(fd, mode)
-            handle = SFTPHandle(flags)
-            if "r" in mode or "+" in mode:
-                handle.readfile = file_obj
-            if "w" in mode or "+" in mode:
-                handle.writefile = file_obj
-            return handle
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def remove(self, path: str):
-        try:
-            self._local(path).unlink()
-            return paramiko.SFTP_OK
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def rename(self, oldpath: str, newpath: str):
-        try:
-            os.replace(self._local(oldpath), self._local(newpath))
-            return paramiko.SFTP_OK
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def posix_rename(self, oldpath: str, newpath: str):
-        return self.rename(oldpath, newpath)
-
-    def mkdir(self, path: str, attr: SFTPAttributes):
-        try:
-            self._local(path).mkdir(mode=getattr(attr, "st_mode", None) or 0o777)
-            return paramiko.SFTP_OK
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def rmdir(self, path: str):
-        try:
-            self._local(path).rmdir()
-            return paramiko.SFTP_OK
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-    def chattr(self, path: str, attr: SFTPAttributes):
-        try:
-            local = self._local(path)
-            if attr.st_atime is not None or attr.st_mtime is not None:
-                current = local.stat()
-                atime = attr.st_atime if attr.st_atime is not None else current.st_atime
-                mtime = attr.st_mtime if attr.st_mtime is not None else current.st_mtime
-                os.utime(local, (atime, mtime))
-            return paramiko.SFTP_OK
-        except OSError as ex:
-            return SFTPServer.convert_errno(ex.errno)
-
-
-class LocalSftpServer:
-    def __init__(self, root: Path, blocked_write_prefixes: tuple[str, ...] = ()):
-        self.root = root
-        self.blocked_write_prefixes = tuple(
-            "/" + prefix.strip("/") for prefix in blocked_write_prefixes
-        )
-        self.key = paramiko.RSAKey.generate(2048)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((HOST, 0))
-        self.sock.listen(32)
-        self.port = self.sock.getsockname()[1]
-        self.transports: list[paramiko.Transport] = []
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
+    @property
+    def port(self) -> int:
+        if self._sock is None:
+            raise RuntimeError("stalled SSH endpoint has no socket")
+        return int(self._sock.getsockname()[1])
 
     def _serve(self) -> None:
-        self.sock.settimeout(0.2)
-        while not self.stop.is_set():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            server.settimeout(0.2)
+            self._sock = server
+            self._ready.set()
+            clients: list[socket.socket] = []
             try:
-                client, _ = self.sock.accept()
-            except socket.timeout:
-                continue
+                while not self._stop.is_set():
+                    try:
+                        client, _addr = server.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    self.accepted += 1
+                    clients.append(client)
+            finally:
+                for client in clients:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+
+
+def run_cli(*args: str, timeout: int = 90) -> CliResult:
+    start = time.monotonic()
+    result = subprocess.run(
+        [str(JAVA), "-jar", str(JAR), *args],
+        cwd=str(PROJECT_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+    return CliResult(
+        args=[str(JAVA), "-jar", str(JAR), *args],
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        elapsed=time.monotonic() - start,
+    )
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def write_bytes(path: Path, size: int, seed: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = bytes(((index + seed) % 251 for index in range(8192)))
+    remaining = size
+    with path.open("wb") as handle:
+        while remaining > 0:
+            chunk = block[: min(len(block), remaining)]
+            handle.write(chunk)
+            remaining -= len(chunk)
+
+
+def visible_local_files(root: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and ".kitchensync" not in path.parts:
+            files[path.relative_to(root).as_posix()] = path.read_bytes()
+    return files
+
+
+def remote_url(path: str, query: str = "", port: int | None = None) -> str:
+    host = SSH_HOST if port is None else f"{SSH_HOST}:{port}"
+    encoded = quote(path, safe="/")
+    suffix = f"?{query}" if query else ""
+    return f"sftp://{SSH_USER}@{host}{encoded}{suffix}"
+
+
+def local_url(path: Path) -> str:
+    return path.resolve().as_uri()
+
+
+def ssh_client() -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.WarningPolicy())
+    client.connect(
+        SSH_HOST,
+        username=SSH_USER,
+        timeout=15,
+        banner_timeout=15,
+        auth_timeout=15,
+        look_for_keys=True,
+        allow_agent=True,
+    )
+    return client
+
+
+def remote_rm_rf(sftp: paramiko.SFTPClient, path: str) -> None:
+    try:
+        entries = sftp.listdir_attr(path)
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        child = f"{path.rstrip('/')}/{entry.filename}"
+        if entry.st_mode is not None and stat.S_ISDIR(entry.st_mode):
+            remote_rm_rf(sftp, child)
+        else:
+            try:
+                sftp.remove(child)
+            except FileNotFoundError:
+                pass
             except OSError:
-                break
-            transport = paramiko.Transport(client)
-            transport.add_server_key(self.key)
-            transport.set_subsystem_handler(
-                "sftp",
-                SFTPServer,
-                RootedSftp,
-                str(self.root),
-                self.blocked_write_prefixes,
-            )
-            try:
-                transport.start_server(server=PasswordServer())
-                with self.lock:
-                    self.transports.append(transport)
-            except Exception:
-                transport.close()
+                remote_rm_rf(sftp, child)
+    try:
+        sftp.rmdir(path)
+    except FileNotFoundError:
+        pass
 
-    def connection_count(self) -> int:
-        with self.lock:
-            return len(self.transports)
 
-    def write_known_hosts(self, home: Path) -> None:
-        ssh = home / ".ssh"
-        ssh.mkdir(parents=True, exist_ok=True)
-        (ssh / "known_hosts").write_text(
-            f"[{HOST}]:{self.port} {self.key.get_name()} {self.key.get_base64()}\n",
-            encoding="utf-8",
-        )
-
-    def close(self) -> None:
-        self.stop.set()
+def remote_mkdir_p(sftp: paramiko.SFTPClient, path: str) -> None:
+    parts = [part for part in path.split("/") if part]
+    current = ""
+    for part in parts:
+        current += f"/{part}"
         try:
-            self.sock.close()
+            sftp.mkdir(current)
         except OSError:
             pass
-        with self.lock:
-            transports = list(self.transports)
-        for transport in transports:
-            transport.close()
 
 
-def start_blackhole() -> tuple[socket.socket, int]:
-    """Accepts TCP connections but never speaks SSH — simulates a hung SSH server."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(16)
-    port = srv.getsockname()[1]
-    held: list[socket.socket] = []
+def remote_read_tree(sftp: paramiko.SFTPClient, root: str) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
 
-    def _loop() -> None:
-        srv.settimeout(60)
-        try:
-            while True:
-                try:
-                    conn, _ = srv.accept()
-                    held.append(conn)
-                except OSError:
-                    break
-        finally:
-            for c in held:
-                try:
-                    c.close()
-                except OSError:
-                    pass
+    def walk(path: str, rel: str) -> None:
+        for entry in sftp.listdir_attr(path):
+            child = f"{path.rstrip('/')}/{entry.filename}"
+            child_rel = f"{rel}/{entry.filename}" if rel else entry.filename
+            if ".kitchensync" in child_rel.split("/"):
+                continue
+            if entry.st_mode is not None and stat.S_ISDIR(entry.st_mode):
+                walk(child, child_rel)
+            else:
+                with sftp.open(child, "rb") as handle:
+                    files[child_rel] = handle.read()
 
-    threading.Thread(target=_loop, daemon=True).start()
-    return srv, port
+    try:
+        walk(root, "")
+    except FileNotFoundError:
+        return {}
+    return files
+
+
+def remote_read_tree_fresh(root: str) -> dict[str, bytes]:
+    client = ssh_client()
+    try:
+        with client.open_sftp() as sftp:
+            return remote_read_tree(sftp, root)
+    finally:
+        client.close()
+
+
+def wait_remote_tree(root: str, expected: dict[str, bytes], timeout: float = 10.0) -> dict[str, bytes]:
+    deadline = time.monotonic() + timeout
+    actual: dict[str, bytes] = {}
+    while time.monotonic() < deadline:
+        actual = remote_read_tree_fresh(root)
+        if actual == expected:
+            return actual
+        time.sleep(0.5)
+    return actual
+
+
+def describe_result(result: CliResult) -> str:
+    return (
+        f"exit={result.returncode} elapsed={result.elapsed:.2f}s "
+        f"stdout={result.stdout[-1200:]!r} stderr={result.stderr[-1200:]!r}"
+    )
+
+
+def pool_events(stdout: str) -> list[tuple[str, int, int]]:
+    events: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"endpoint=(\S+)\s+connections=(\d+)/(\d+)", stdout):
+        events.append((match.group(1), int(match.group(2)), int(match.group(3))))
+    return events
+
+
+def require_success(failures: list[str], req_ids: str, name: str, result: CliResult) -> None:
+    if result.returncode != 0:
+        failures.append(f"{req_ids} {name}: expected exit 0; {describe_result(result)}")
+
+
+def check_local_file_peer_flags() -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "local_flags"
+    source = root / "source"
+    dest = root / "dest"
+    write_text(source / "alpha.txt", "local alpha\n")
+    write_text(source / "nested" / "beta.txt", "local beta\n")
+    dest.mkdir(parents=True, exist_ok=True)
+
+    result = run_cli("--mc", "1", "--ct", "1", "--ka", "1", f"+{source}", str(dest))
+    require_success(failures, "03.63", "file peers ignore SFTP pool flags", result)
+    expected = visible_local_files(source)
+    actual = visible_local_files(dest)
+    if actual != expected:
+        failures.append(f"03.63 file peers ignore SFTP pool flags: expected {sorted(expected)}, got {sorted(actual)}")
+    return failures
+
+
+def check_handshake_timeout_fallback() -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "handshake_timeout"
+    source = root / "source"
+    fallback_dest = root / "fallback_dest"
+    write_text(source / "fallback.txt", "fallback after stalled ssh\n")
+    fallback_dest.mkdir(parents=True, exist_ok=True)
+
+    with StalledSshEndpoint() as stalled:
+        peer = (
+            f"[sftp://{SSH_USER}@127.0.0.1:{stalled.port}/tmp/testks/never"
+            f"?ct=1&mc=1&ka=1,{local_url(fallback_dest)}]"
+        )
+        result = run_cli("--ct", "30", "--mc", "5", "--ka", "5", f"+{source}", peer, timeout=45)
+        require_success(
+            failures,
+            "03.59 03.62",
+            "per-URL ct overrides global ct and failed SFTP fallback is tried",
+            result,
+        )
+        if stalled.accepted < 1:
+            failures.append("03.62 SFTP handshake timeout: stalled SSH endpoint was never contacted")
+        if result.elapsed >= 12:
+            failures.append(
+                "03.59 03.62 per-URL ct override: expected fallback well before global --ct 30; "
+                f"elapsed={result.elapsed:.2f}s"
+            )
+    if visible_local_files(fallback_dest) != {"fallback.txt": b"fallback after stalled ssh\n"}:
+        failures.append("03.62 SFTP handshake timeout: fallback file peer did not receive source payload")
+    return failures
+
+
+def check_default_and_explicit_sftp_ports(sftp: paramiko.SFTPClient) -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "ports"
+    source_default = root / "source_default"
+    source_explicit = root / "source_explicit"
+    default_remote = f"{REMOTE_ROOT}/ports/default22"
+    explicit_remote = f"{REMOTE_ROOT}/ports/explicit22"
+    write_text(source_default / "default.txt", "default port 22\n")
+    write_text(source_explicit / "explicit.txt", "explicit port 22\n")
+
+    default_result = run_cli(f"+{source_default}", remote_url(default_remote, "mc=2&ct=20&ka=3"))
+    explicit_result = run_cli(f"+{source_explicit}", remote_url(explicit_remote, "mc=2&ct=20&ka=3", port=22))
+    require_success(failures, "03.59 03.100", "omitted SFTP port connects to default port 22", default_result)
+    require_success(failures, "03.59 03.100", "explicit SFTP port 22 connects to SSH port 22", explicit_result)
+
+    if wait_remote_tree(default_remote, {"default.txt": b"default port 22\n"}) != {"default.txt": b"default port 22\n"}:
+        failures.append("03.100 omitted/default port: remote payload was not written through port 22")
+    if wait_remote_tree(explicit_remote, {"explicit.txt": b"explicit port 22\n"}) != {"explicit.txt": b"explicit port 22\n"}:
+        failures.append("03.100 explicit port: remote payload was not written through explicit port 22")
+    return failures
+
+
+def check_shared_pool_transfer_behavior(sftp: paramiko.SFTPClient) -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "shared_pool"
+    source = root / "source"
+    dest_a = f"{REMOTE_ROOT}/shared_pool/path_a"
+    dest_b = f"{REMOTE_ROOT}/shared_pool/path_b"
+    for index in range(5):
+        write_bytes(source / f"blob-{index}.bin", 256 * 1024, index)
+
+    result: CliResult | None = None
+    for attempt in range(3):
+        if attempt:
+            shutil.rmtree(source / ".kitchensync", ignore_errors=True)
+            remote_rm_rf(sftp, dest_a)
+            remote_rm_rf(sftp, dest_b)
+        result = run_cli(
+            "-vl",
+            "trace",
+            "--mc",
+            "9",
+            "--ka",
+            "9",
+            f"+{source}",
+            remote_url(dest_a, "mc=1&ka=2&ct=20"),
+            remote_url(dest_b, "mc=7&ka=20&ct=20", port=22),
+            timeout=120,
+        )
+        if "unreachable peer" not in result.stdout:
+            break
+    if result is None:
+        raise RuntimeError("shared pool sync did not run")
+    require_success(
+        failures,
+        "03.58 03.59 03.60 03.64 03.96 03.97 03.107",
+        "same user@host:port remote paths share the first configured capped transfer pool and complete queued copies",
+        result,
+    )
+    expected = visible_local_files(source)
+    actual_a = wait_remote_tree(dest_a, expected, timeout=30.0)
+    actual_b = wait_remote_tree(dest_b, expected, timeout=30.0)
+    if actual_a != expected:
+        failures.append(f"03.58 shared pool path A: expected payload files {sorted(expected)}, got {sorted(actual_a)}")
+    if actual_b != expected:
+        failures.append(f"03.58 shared pool path B: expected payload files {sorted(expected)}, got {sorted(actual_b)}")
+
+    events = pool_events(result.stdout)
+    if not events:
+        failures.append("03.60 shared pool cap: trace output did not expose any SFTP transfer-pool acquire/release events")
+        return failures
+
+    ordinary_events = [event for event in events if event[0] == f"{SSH_USER}@{SSH_HOST}:22"]
+    if not ordinary_events:
+        failures.append(f"03.96 shared pool identity: expected normalized endpoint {SSH_USER}@{SSH_HOST}:22 in trace events, got {sorted({event[0] for event in events})}")
+        return failures
+    if any(open_count > max_count for _endpoint, open_count, max_count in ordinary_events):
+        failures.append(f"03.60 shared pool cap: trace reported open connections above cap: {ordinary_events}")
+    if {max_count for _endpoint, _open_count, max_count in ordinary_events} != {1}:
+        failures.append(f"03.59 03.97 03.107 pool settings: first same-endpoint URL mc=1 should set the shared pool cap, got {ordinary_events}")
+    return failures
+
+
+def check_available_transfer_connections_are_used(sftp: paramiko.SFTPClient) -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "available_connections"
+    source = root / "source"
+    dest = f"{REMOTE_ROOT}/available_connections/dest"
+    for index in range(8):
+        write_bytes(source / f"large-{index}.bin", 1024 * 1024, index)
+
+    result = run_cli("-vl", "trace", f"+{source}", remote_url(dest, "mc=2&ct=20&ka=3"), timeout=180)
+    require_success(
+        failures,
+        "03.59 03.60 03.64 03.101",
+        "multiple enqueued copies use available destination SFTP transfer connections up to mc",
+        result,
+    )
+    expected = visible_local_files(source)
+    actual = wait_remote_tree(dest, expected, timeout=45.0)
+    if actual != expected:
+        failures.append(f"03.64 transfer connections returned after copies: expected payload files {sorted(expected)}, got {sorted(actual)}")
+
+    ordinary_events = [event for event in pool_events(result.stdout) if event[0] == f"{SSH_USER}@{SSH_HOST}:22"]
+    if not ordinary_events:
+        failures.append("03.101 transfer concurrency: no trace events for destination transfer pool")
+        return failures
+    max_open = max(open_count for _endpoint, open_count, _max_count in ordinary_events)
+    if max_open < 2:
+        failures.append(f"03.101 transfer concurrency: expected trace to show two concurrent destination transfer connections, got {ordinary_events}")
+    if any(max_count != 2 for _endpoint, _open_count, max_count in ordinary_events):
+        failures.append(f"03.59 per-URL mc override: expected destination pool cap 2, got {ordinary_events}")
+    if any(open_count > 2 for _endpoint, open_count, _max_count in ordinary_events):
+        failures.append(f"03.60 transfer pool cap: trace reported more than two open destination transfer connections, got {ordinary_events}")
+    return failures
+
+
+def check_explicit_nondefault_sftp_ports() -> list[str]:
+    failures: list[str] = []
+    root = WORK_DIR / "port_identity"
+    source = root / "source"
+    fallback_dest = root / "fallback_dest"
+    write_text(source / "port.txt", "different port has separate endpoint identity\n")
+    fallback_dest.mkdir(parents=True, exist_ok=True)
+
+    with StalledSshEndpoint() as first, StalledSshEndpoint() as second:
+        first_endpoint = f"sftp://{SSH_USER}@127.0.0.1:{first.port}/tmp/testks/unused?ct=1&mc=1&ka=1"
+        second_endpoint = f"sftp://{SSH_USER}@127.0.0.1:{second.port}/tmp/testks/unused?ct=1&mc=1&ka=1"
+        peer = f"[{first_endpoint},{second_endpoint},{local_url(fallback_dest)}]"
+        result = run_cli(f"+{source}", peer, timeout=45)
+        require_success(failures, "03.100", "explicit non-default SFTP ports are contacted as SSH ports", result)
+        if first.accepted < 1:
+            failures.append("03.100 explicit non-default port: first local SFTP port was not contacted")
+        if second.accepted < 1:
+            failures.append("03.100 explicit non-default port: second local SFTP port was not contacted")
+    if visible_local_files(fallback_dest) != {"port.txt": b"different port has separate endpoint identity\n"}:
+        failures.append("03.100 explicit non-default port fallback: fallback peer did not receive payload")
+    return failures
+
+
+# 03.61 and 03.106 require observing the identity and idle timer of a returned
+# SSH+SFTP connection inside one CLI process. The public CLI exposes pool counts
+# at trace level, not connection identity or keep-alive timer resets, so those
+# exact timer semantics are not reasonably testable in this root black-box test.
+#
+# 03.112 and 03.114 distinguish startup/listing connections from lazily-created
+# transfer-pool connections. Trace output makes transfer-pool counts observable
+# during copies, but it does not expose startup connection bookkeeping directly;
+# asserting that lifecycle boundary here would invent an implementation detail.
+#
+# 03.96 is tested for same-endpoint sharing with omitted port and explicit :22.
+# The "different ports do not share a pool" half would require two reachable,
+# trusted SFTP services for the same user+host on different SSH ports; the root
+# SFTP fixture only provides ordinarydata.com:22.
 
 
 def main() -> int:
-    global SFTP_PORT
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    TMP.mkdir(parents=True)
-
     failures: list[str] = []
-    blackhole_srv = None
-    sftp_srv = None
+    if WORK_DIR.exists():
+        shutil.rmtree(WORK_DIR)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        sftp_srv = LocalSftpServer(TMP, blocked_write_prefixes=("/64_fail_dst",))
-        SFTP_PORT = sftp_srv.port
-        sftp_srv.write_known_hosts(TEST_HOME)
-        blackhole_srv, bh_port = start_blackhole()
+        client = ssh_client()
+    except Exception as exc:
+        print(f"FAIL tests/03_sftp-pool.py: could not connect to SFTP fixture {SSH_USER}@{SSH_HOST}: {exc!r}")
+        return 1
 
-        # ── 03.58 ── Two SFTP URLs same user+host share one pool ──────────────
-        # The peers differ only by path. During the cross-SFTP transfer, trace
-        # output must show one endpoint reaching connections=2/2, not two
-        # independent path-scoped pools at 1/2.
-        print("[03.58] same-user+host SFTP peers share one path-independent pool")
-        p58_a = TMP / "58_a"
-        p58_b = TMP / "58_b"
-        p58_a.mkdir(parents=True)
-        p58_b.mkdir(parents=True)
-        (p58_a / "from_a.txt").write_text("hello from a")
+    try:
+        with client.open_sftp() as sftp:
+            remote_rm_rf(sftp, REMOTE_ROOT)
+            remote_mkdir_p(sftp, REMOTE_ROOT)
 
-        rc, out, err = invoke([
-            "+" + sftp(p58_a, mc=2),
-            sftp(p58_b, mc=2),
-            "-vl",
-            "trace",
-        ])
-        print(f"[03.58] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.58: sync between two same-user+host SFTP peers failed (exit {rc})\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not (p58_b / "from_a.txt").exists():
-            failures.append("03.58: file not propagated across same-user+host SFTP peers")
-        elif not saw_trace_count(out, 2, 2):
-            failures.append(
-                "03.58: trace never showed one user+host pool serving both paths "
-                f"at connections=2/2\n  stdout: {out!r}"
-            )
-        else:
-            print("[03.58] PASS: one user+host pool served both SFTP paths")
+            checks = [
+                ("03.63", check_local_file_peer_flags),
+                ("03.59/03.62", check_handshake_timeout_fallback),
+                ("03.59/03.100", lambda: check_default_and_explicit_sftp_ports(sftp)),
+                (
+                    "03.58/03.59/03.60/03.64/03.96/03.97/03.107",
+                    lambda: check_shared_pool_transfer_behavior(sftp),
+                ),
+                ("03.59/03.60/03.64/03.101", lambda: check_available_transfer_connections_are_used(sftp)),
+                ("03.100", check_explicit_nondefault_sftp_ports),
+            ]
 
-        # ── 03.59 ── Per-URL settings override global flags ───────────────────
-        # mc: both SFTP URLs have ?mc=2 while global --mc is 1. A cross-SFTP
-        # transfer between same-user+host paths needs two borrowed connections
-        # from the shared pool, so success plus trace connections=2/2 observes
-        # the per-URL mc override.
-        print("[03.59] per-URL ?mc=2 overrides global --mc 1")
-        p59_mc_a = TMP / "59_mc_a"
-        p59_mc_b = TMP / "59_mc_b"
-        p59_mc_a.mkdir(parents=True)
-        p59_mc_b.mkdir(parents=True)
-        (p59_mc_a / "mc.txt").write_text("mc")
-
-        rc, out, err = invoke([
-            "+" + sftp(p59_mc_a, mc=2),
-            sftp(p59_mc_b, mc=2),
-            "--mc",
-            "1",
-            "-vl",
-            "trace",
-        ], timeout=15)
-        print(f"[03.59/mc] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.59: per-URL ?mc=2 did not override global --mc 1; sync failed "
-                f"(exit {rc})\n  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not (p59_mc_b / "mc.txt").exists():
-            failures.append("03.59: file not propagated while testing per-URL mc override")
-        elif not saw_trace_count(out, 2, 2):
-            failures.append(
-                "03.59: trace did not show the per-URL mc=2 pool limit "
-                f"overriding global --mc 1\n  stdout: {out!r}"
-            )
-        else:
-            print("[03.59/mc] PASS: per-URL mc override controlled the pool cap")
-
-        # ct: URL points at a blackhole with ?ct=2. Global --ct 30 is set.
-        # Per-URL ct=2 must win: sync fails within ~2 s, not ~30 s.
-        print("[03.59] per-URL ?ct=2 overrides global --ct 30")
-        p59 = TMP / "59_file"
-        p59.mkdir(parents=True)
-        (p59 / "x.txt").write_text("x")
-
-        bh_url = f"sftp://{USER}:{PASSWORD}@127.0.0.1:{bh_port}/ks59?ct=2"
-        t0 = time.monotonic()
-        rc, out, err = invoke(
-            ["+" + p59.as_uri(), bh_url, "--ct", "30"],
-            timeout=15,
-        )
-        elapsed = time.monotonic() - t0
-        print(f"[03.59] exit={rc}, elapsed={elapsed:.1f}s")
-        if rc == 0:
-            failures.append("03.59: blackhole SFTP peer unexpectedly connected")
-        elif elapsed >= 8:
-            failures.append(
-                f"03.59: per-URL ?ct=2 did not override --ct 30; "
-                f"sync took {elapsed:.1f}s (expected <8 s)"
-            )
-        else:
-            print(f"[03.59] PASS: per-URL ct=2 applied; timed out in {elapsed:.1f}s")
-
-        # ka override TTL expiry is not reasonably testable through the one-shot
-        # CLI: the CLI does not expose pool internals, cannot schedule an idle
-        # gap inside a run, and shuts down the pool when the process exits. The
-        # reusable-within-ka behavior itself is exercised in 03.61 below.
-
-        # ── 03.60 ── Pool cap mc=1 respected ──────────────────────────────────
-        # Several file copies borrow from the same SFTP source pool. Trace output
-        # must never exceed one in-use pooled connection, and all files must
-        # still arrive, showing callers waited rather than exceeding the cap.
-        print("[03.60] mc=1 caps in-use pooled connections while transfers complete")
-        p60_sftp = TMP / "60_sftp"
-        p60_file = TMP / "60_file"
-        p60_sftp.mkdir(parents=True)
-        p60_file.mkdir(parents=True)
-        for i in range(4):
-            (p60_sftp / f"q{i}.txt").write_text(f"q{i}")
-
-        rc, out, err = invoke([
-            "+" + sftp(p60_sftp, mc=1),
-            p60_file.as_uri(),
-            "-vl",
-            "trace",
-        ])
-        print(f"[03.60] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.60: sync with mc=1 SFTP peer failed (exit {rc})\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not all((p60_file / f"q{i}.txt").exists() for i in range(4)):
-            failures.append("03.60: not all files propagated with mc=1 pool")
-        elif max_in_use(out) > 1:
-            failures.append(
-                f"03.60: pool exceeded mc=1; max trace in-use was {max_in_use(out)}\n"
-                f"  stdout: {out!r}"
-            )
-        elif not saw_trace_count(out, 1, 1):
-            failures.append(
-                "03.60: trace never showed an mc=1 pool acquisition\n"
-                f"  stdout: {out!r}"
-            )
-        else:
-            print("[03.60] PASS: in-use pooled connections stayed within mc=1")
-
-        # ── 03.61 ── Ka keep-alive: pooled connection reused within window ────
-        # Copy multiple files in one run with mc=1 and ka=30. A listing
-        # connection plus one reusable pooled connection is enough; repeated new
-        # SSH sessions would show that returned connections are not kept alive.
-        print("[03.61] returned SFTP connection is reused within ka window")
-        p61_sftp = TMP / "61_sftp"
-        p61_file = TMP / "61_file"
-        p61_sftp.mkdir(parents=True)
-        p61_file.mkdir(parents=True)
-        for i in range(3):
-            (p61_sftp / f"r{i}.txt").write_text(f"r{i}")
-
-        before_connections = sftp_srv.connection_count()
-        rc, out, err = invoke([
-            "+" + sftp(p61_sftp, mc=1, ka=30),
-            p61_file.as_uri(),
-            "-vl",
-            "trace",
-        ])
-        accepted = sftp_srv.connection_count() - before_connections
-        print(f"[03.61] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.61: sync exercising ka keep-alive failed (exit {rc})\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not all((p61_file / f"r{i}.txt").exists() for i in range(3)):
-            failures.append("03.61: not all files propagated during ka keep-alive sync")
-        elif accepted > 3:
-            failures.append(
-                "03.61: too many SSH sessions opened for one listing connection "
-                f"plus one reusable pooled connection (accepted {accepted})"
-            )
-        elif not saw_trace_count(out, 0, 1):
-            failures.append(
-                "03.61: trace did not show the mc=1 pooled connection returned "
-                f"after use\n  stdout: {out!r}"
-            )
-        else:
-            print("[03.61] PASS: returned connection stayed reusable within ka=30s")
-
-        # Expiration after the ka window is not reasonably testable through this
-        # CLI because the process shuts the pool down at run end; there is no
-        # exposed wrapper hook to keep the same pool alive and idle across a
-        # controlled wait.
-
-        # ── 03.62 ── ct timeout → fallback URL tried ──────────────────────────
-        # Peer uses fallback syntax: first URL is a blackhole with ct=2 (times
-        # out); second URL is the real SFTP endpoint.  Sync must succeed because
-        # the fallback is tried after the handshake timeout fires.
-        print("[03.62] ct timeout fires and fallback URL is tried")
-        p62_sftp = TMP / "62_sftp"
-        p62_file = TMP / "62_file"
-        p62_sftp.mkdir(parents=True)
-        p62_file.mkdir(parents=True)
-        (p62_sftp / "s.txt").write_text("s")
-
-        real_sftp = sftp(p62_sftp)
-        fallback_peer = f"[sftp://{USER}:{PASSWORD}@127.0.0.1:{bh_port}/ks62?ct=2,{real_sftp}]"
-
-        t0 = time.monotonic()
-        rc, out, err = invoke(
-            ["+" + fallback_peer, p62_file.as_uri()],
-            timeout=20,
-        )
-        elapsed = time.monotonic() - t0
-        print(f"[03.62] exit={rc}, elapsed={elapsed:.1f}s")
-        if rc != 0:
-            failures.append(
-                f"03.62: fallback sync failed (exit {rc}); expected fallback to succeed\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not (p62_file / "s.txt").exists():
-            failures.append("03.62: file not propagated via fallback URL")
-        else:
-            print(f"[03.62] PASS: fallback tried after ct=2 timeout; sync completed in {elapsed:.1f}s")
-
-        # ── 03.63 ── file:// peers: --mc/--ct/--ka flags have no effect ───────
-        # A sync between two file:// peers with all three pool flags set must
-        # complete normally and emit no pool trace lines.
-        print("[03.63] file:// peers unaffected by --mc/--ct/--ka flags")
-        p63_a = TMP / "63_a"
-        p63_b = TMP / "63_b"
-        p63_a.mkdir(parents=True)
-        p63_b.mkdir(parents=True)
-        (p63_a / "t.txt").write_text("t")
-
-        rc, out, err = invoke([
-            "+" + p63_a.as_uri(),
-            p63_b.as_uri(),
-            "--mc", "5",
-            "--ct", "5",
-            "--ka", "5",
-            "-vl", "trace",
-        ])
-        print(f"[03.63] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.63: file:// sync with --mc/--ct/--ka failed (exit {rc})\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not (p63_b / "t.txt").exists():
-            failures.append("03.63: file not propagated for file:// peers")
-        elif TRACE_EVENT.search(out):
-            failures.append(
-                "03.63: file:// sync emitted SFTP pool trace events\n"
-                f"  stdout: {out!r}"
-            )
-        else:
-            print("[03.63] PASS: file:// peers unaffected by --mc/--ct/--ka flags")
-
-        # ── 03.64 ── Transfer borrows one connection from each pool ───────────
-        # Source and destination share user+host here, so both borrows come from
-        # the same pool. The trace must reach 2/2 during transfer and return to
-        # 0/2 afterward.
-        print("[03.64] cross-SFTP transfer borrows and returns both connections")
-        p64_src = TMP / "64_src"
-        p64_dst = TMP / "64_dst"
-        p64_src.mkdir(parents=True)
-        p64_dst.mkdir(parents=True)
-        (p64_src / "u.txt").write_text("u")
-
-        rc, out, err = invoke([
-            "+" + sftp(p64_src, mc=2),
-            sftp(p64_dst, mc=2),
-            "-vl",
-            "trace",
-        ])
-        print(f"[03.64] exit={rc}")
-        if rc != 0:
-            failures.append(
-                f"03.64: cross-SFTP transfer failed (exit {rc})\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif not (p64_dst / "u.txt").exists():
-            failures.append("03.64: file not transferred across SFTP peers")
-        elif not saw_trace_count(out, 2, 2):
-            failures.append(
-                "03.64: trace never showed both source and destination "
-                f"connections borrowed for the transfer\n  stdout: {out!r}"
-            )
-        elif trace_counts(out)[-1:] != [(0, 2)]:
-            failures.append(
-                "03.64: trace did not show both transfer connections returned "
-                f"after success\n  stdout: {out!r}"
-            )
-        else:
-            print("[03.64] PASS: successful transfer borrowed and returned both connections")
-
-        # Failed transfer return path: the server denies writes under the
-        # destination root after both pooled connections have been borrowed.
-        p64_fail_src = TMP / "64_fail_src"
-        p64_fail_dst = TMP / "64_fail_dst"
-        p64_fail_src.mkdir(parents=True)
-        p64_fail_dst.mkdir(parents=True)
-        (p64_fail_src / "blocked.txt").write_text("blocked")
-
-        rc, out, err = invoke([
-            "+" + sftp(p64_fail_src, mc=2),
-            sftp(p64_fail_dst, mc=2),
-            "-vl",
-            "trace",
-        ])
-        counts = trace_counts(out)
-        print(f"[03.64/fail] exit={rc}")
-        if not saw_trace_count(out, 2, 2):
-            failures.append(
-                "03.64: failed transfer path did not borrow both connections "
-                f"before the write failed\n  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif counts[-1:] != [(0, 2)]:
-            failures.append(
-                "03.64: failed transfer path did not return both connections\n"
-                f"  stdout: {out!r}\n  stderr: {err!r}"
-            )
-        elif (p64_fail_dst / "blocked.txt").exists():
-            failures.append("03.64: denied destination unexpectedly received failed transfer")
-        else:
-            print("[03.64/fail] PASS: failed transfer returned both borrowed connections")
-
+            for label, check in checks:
+                try:
+                    check_failures = check()
+                except subprocess.TimeoutExpired as exc:
+                    check_failures = [f"{label}: command timed out: {exc}"]
+                except Exception as exc:
+                    check_failures = [f"{label}: unexpected test error: {exc!r}"]
+                if check_failures:
+                    failures.extend(check_failures)
+                else:
+                    print(f"PASS {label}")
     finally:
-        if blackhole_srv is not None:
-            try:
-                blackhole_srv.close()
-            except OSError:
-                pass
-        if sftp_srv is not None:
-            sftp_srv.close()
-        shutil.rmtree(TMP, ignore_errors=True)
+        client.close()
 
     if failures:
         print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("PASS tests/03_sftp-pool.py")
     return 0
 
 

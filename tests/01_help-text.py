@@ -1,140 +1,225 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Help-text behavior: exit 0, stdout-only, and content coverage."""
 
 from __future__ import annotations
 
-import os, subprocess, sys
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY",
-                               "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
+
+PROJECT_DIR = Path(".")
+JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
+JAR = PROJECT_DIR / "released/kitchensync.jar"
+WORK_DIR = PROJECT_DIR / "tests/.tmp/01_help-text"
+ISOLATED_JAR = WORK_DIR / "isolated/kitchensync.jar"
 
 
-def _invoke(args: list[str]) -> tuple[str, str, int]:
-    proc = subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT] + args,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
+EXPECTED_HELP = """Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
+
+Synchronize file trees across multiple peers.
+
+Running with no arguments prints this help. See README.md for full docs.
+
+Peers:
+  /path or c:\\path                 Local path (same as file://)
+  sftp://user@host/path            Remote over SSH
+  sftp://user@host:port/path       Non-standard SSH port
+  sftp://host/path                 Remote over SSH, current OS user
+  sftp://user:password@host/path   Inline password (prefer SSH keys)
+
+Prefix modifiers:
+  +<peer>                          Canon — this peer's state wins all conflicts
+  -<peer>                          Subordinate — overwritten to match the group
+
+Fallback URLs (multiple paths to the same data):
+  [url1,url2,...]                  Try in order, first that connects wins
+  +[url1,url2,...]                 Canon peer with fallbacks
+  -[url1,url2,...]                 Subordinate peer with fallbacks
+
+Per-URL settings (query string, inside quotes):
+  "sftp://host/path?mc=5"          Max SFTP connections for this user+host+port
+  "sftp://host/path?ct=60"         Connection timeout for this URL
+  "sftp://host/path?ka=10"         SFTP idle keep-alive TTL for this URL
+  "sftp://host/path?mc=5&ct=60"    Combine multiple
+
+Options:
+  -h, --help, /?                      Show this help
+  --mc N             Max SFTP connections per user+host+port (default: 10)
+  --ct N             SSH handshake timeout in seconds (default: 30)
+  --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
+  -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
+  --xd N             Delete stale TMP staging after N days (default: 2)
+  --bd N             Delete displaced files (BAK/) after N days (default: 90)
+  --td N             Forget deletion records after N days (default: 180)
+
+Quick start:
+  java -jar kitchensync.jar +c:/photos sftp://user@host/photos      First sync (c: is canon)
+  java -jar kitchensync.jar c:/photos sftp://host/photos            Bidirectional
+  java -jar kitchensync.jar c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
+  java -jar kitchensync.jar c:/photos "sftp://user:p%40ss@host/photos"  Inline password
+
+Canon (+) is required on first sync when no peer has snapshot history.
+After the first sync, bidirectional sync works without canon.
+
+Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
+
+Displaced files are recoverable from nearby .kitchensync/BAK/ directories (kept for --bd days).
+"""
+
+
+@dataclass(frozen=True)
+class Case:
+    req_ids: tuple[str, ...]
+    name: str
+    args: tuple[str, ...]
+
+
+HELP_CASES = [
+    Case(("01.1", "01.5", "01.17", "01.27", "01.28"), "no arguments", ()),
+    Case(("01.2", "01.5", "01.17", "01.27", "01.28"), "-h", ("-h",)),
+    Case(("01.3", "01.5", "01.17", "01.27", "01.28"), "--help", ("--help",)),
+    Case(("01.4", "01.5", "01.17", "01.27", "01.28"), "/?", ("/?",)),
+    Case(
+        ("01.26", "01.5", "01.17", "01.27", "01.28"),
+        "-h before validation errors",
+        ("--definitely-not-a-kitchensync-flag", "-h", "+peer-a", "+peer-b"),
+    ),
+    Case(
+        ("01.26", "01.5", "01.17", "01.27", "01.28"),
+        "--help before validation errors",
+        ("--definitely-not-a-kitchensync-flag", "--help", "+peer-a", "+peer-b"),
+    ),
+    Case(
+        ("01.26", "01.5", "01.17", "01.27", "01.28"),
+        "/? before validation errors",
+        ("--definitely-not-a-kitchensync-flag", "/?", "+peer-a", "+peer-b"),
+    ),
+]
+
+
+REQUIRED_FRAGMENTS = [
+    ("01.6", "/path or c:\\path"),
+    ("01.6", "sftp://user@host/path"),
+    ("01.6", "sftp://user@host:port/path"),
+    ("01.6", "sftp://user:password@host/path"),
+    ("01.7", "+<peer>"),
+    ("01.7", "-<peer>"),
+    ("01.8", "[url1,url2,...]"),
+    ("01.9", "--mc N"),
+    ("01.9", "default: 10"),
+    ("01.9", "--ct N"),
+    ("01.9", "default: 30"),
+    ("01.9", "--ka N"),
+    ("01.9", "-vl LEVEL"),
+    ("01.9", "default: info"),
+    ("01.9", "--xd N"),
+    ("01.9", "default: 2"),
+    ("01.9", "--bd N"),
+    ("01.9", "default: 90"),
+    ("01.9", "--td N"),
+    ("01.9", "default: 180"),
+    ("01.25", '"sftp://host/path?mc=5"'),
+    ("01.25", '"sftp://host/path?ct=60"'),
+    ("01.25", '"sftp://host/path?ka=10"'),
+    ("01.25", '"sftp://host/path?mc=5&ct=60"'),
+]
+
+
+def req_label(req_ids: tuple[str, ...]) -> str:
+    return ", ".join(req_ids)
+
+
+def prepare_work_dir() -> None:
+    if WORK_DIR.exists():
+        shutil.rmtree(WORK_DIR)
+    ISOLATED_JAR.parent.mkdir(parents=True)
+    shutil.copy2(JAR, ISOLATED_JAR)
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(JAVA.resolve()), "-jar", str(ISOLATED_JAR.name), *args],
+        cwd=ISOLATED_JAR.parent,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
     )
-    return proc.stdout, proc.stderr, proc.returncode
+
+
+def first_difference(left: str, right: str) -> str:
+    if left == right:
+        return "no difference"
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return (
+                f"first difference at byte/char {index}: "
+                f"got {left[index:index + 40]!r}, expected {right[index:index + 40]!r}"
+            )
+    return f"length differs: got {len(left)}, expected {len(right)}"
+
+
+def check_help_case(case: Case, failures: list[str]) -> str | None:
+    try:
+        result = run_cli(*case.args)
+    except Exception as exc:
+        failures.append(f"{req_label(case.req_ids)} {case.name}: command failed to run: {exc}")
+        return None
+
+    if result.returncode != 0:
+        failures.append(
+            f"{req_label(case.req_ids)} {case.name}: expected exit code 0, got {result.returncode}"
+        )
+
+    if result.stderr != "":
+        failures.append(
+            f"{req_label(case.req_ids)} {case.name}: expected empty stderr, got {result.stderr!r}"
+        )
+
+    if result.stdout != EXPECTED_HELP:
+        failures.append(
+            f"{req_label(case.req_ids)} {case.name}: stdout did not match mandated help text; "
+            f"{first_difference(result.stdout, EXPECTED_HELP)}"
+        )
+
+    return result.stdout
 
 
 def main() -> int:
     failures: list[str] = []
+    prepare_work_dir()
 
-    # Collect outputs for each help-triggering invocation.
-    cases = [
-        ("no args",   []),
-        ("-h",        ["-h"]),
-        ("--help",    ["--help"]),
-        ("/?",        ["/?"])
-    ]
+    observed_help = None
+    for case in HELP_CASES:
+        stdout = check_help_case(case, failures)
+        if observed_help is None and stdout:
+            observed_help = stdout
 
-    outputs: dict[str, tuple[str, str, int]] = {}
-    for label, args in cases:
-        out, err, rc = _invoke(args)
-        outputs[label] = (out, err, rc)
-        print(f"[{label}] exit={rc} stdout={len(out)}B stderr={len(err)}B")
-
-    # 01.1 — no arguments exits 0
-    _, _, rc = outputs["no args"]
-    print(f"[01.1] no-args exit code: {rc}")
-    if rc != 0:
-        failures.append("01.1: no-args exit code was not 0")
-
-    # 01.2 — -h exits 0
-    _, _, rc = outputs["-h"]
-    print(f"[01.2] -h exit code: {rc}")
-    if rc != 0:
-        failures.append("01.2: -h exit code was not 0")
-
-    # 01.3 — --help exits 0
-    _, _, rc = outputs["--help"]
-    print(f"[01.3] --help exit code: {rc}")
-    if rc != 0:
-        failures.append("01.3: --help exit code was not 0")
-
-    # 01.4 — /? exits 0
-    _, _, rc = outputs["/?"]
-    print(f"[01.4] /? exit code: {rc}")
-    if rc != 0:
-        failures.append("01.4: /? exit code was not 0")
-
-    # 01.5 — help output goes to stdout (non-empty stdout for every case)
-    for label, (out, _, _) in outputs.items():
-        print(f"[01.5] {label} stdout non-empty: {bool(out.strip())}")
-        if not out.strip():
-            failures.append(f"01.5: stdout was empty for '{label}'")
-
-    # 01.17 — stderr is empty when help is printed
-    for label, (_, err, _) in outputs.items():
-        print(f"[01.17] {label} stderr empty: {not err.strip()}")
-        if err.strip():
-            failures.append(f"01.17: stderr was not empty for '{label}': {err[:120]!r}")
-
-    # Use the no-args output for all content checks (same text for all cases).
-    text = outputs["no args"][0]
-
-    # 01.6 — URL forms: local paths, sftp://user@host/path, port and password variants
-    has_local_path = any(kw in text for kw in ["/path", "file://", "local path", "local-path", "/"])
-    has_sftp = "sftp://" in text
-    has_port = any(kw in text for kw in [":port", ":22", "port"])
-    has_password = any(kw in text for kw in ["password", "passwd", ":pass"])
-    print(f"[01.6] local-path={has_local_path} sftp={has_sftp} port={has_port} password={has_password}")
-    if not has_local_path:
-        failures.append("01.6: help text does not describe local path URLs")
-    if not has_sftp:
-        failures.append("01.6: help text does not mention sftp:// URL form")
-    if not has_port:
-        failures.append("01.6: help text does not describe port variant")
-    if not has_password:
-        failures.append("01.6: help text does not describe password variant")
-
-    # 01.7 — + (canon) and - (subordinate) prefix modifiers
-    has_plus = "+" in text and any(kw in text for kw in ["canon", "Canon"])
-    has_minus = "-" in text and any(kw in text for kw in ["subordinate", "Subordinate"])
-    print(f"[01.7] canon(+)={has_plus} subordinate(-)={has_minus}")
-    if not has_plus:
-        failures.append("01.7: help text does not describe + (canon) prefix modifier")
-    if not has_minus:
-        failures.append("01.7: help text does not describe - (subordinate) prefix modifier")
-
-    # 01.8 — fallback URL bracket syntax
-    has_bracket = "[" in text and "]" in text and any(kw in text for kw in ["fallback", "bracket", "Fallback"])
-    print(f"[01.8] bracket-fallback={has_bracket}")
-    if not has_bracket:
-        failures.append("01.8: help text does not describe fallback URL bracket syntax")
-
-    # 01.9 — global option flags with defaults
-    required_flags = ["--mc", "--ct", "--ka", "-vl", "--xd", "--bd", "--td"]
-    for flag in required_flags:
-        present = flag in text
-        print(f"[01.9] flag {flag}: {present}")
-        if not present:
-            failures.append(f"01.9: help text missing flag {flag}")
-    has_defaults = "default:" in text
-    print(f"[01.9] defaults shown: {has_defaults}")
-    if not has_defaults:
-        failures.append("01.9: help text does not show flag defaults")
-
-    # 01.25 — per-URL query string settings
-    has_query = "?" in text and any(kw in text for kw in ["query", "?mc=", "?ct=", "per-URL", "per-url", "per URL"])
-    print(f"[01.25] per-URL query settings={has_query}")
-    if not has_query:
-        failures.append("01.25: help text does not describe per-URL query string settings")
+    if observed_help:
+        for req_id, fragment in REQUIRED_FRAGMENTS:
+            if fragment not in observed_help:
+                failures.append(f"{req_id}: help text missing required fragment {fragment!r}")
+    else:
+        failures.append("01.6, 01.7, 01.8, 01.9, 01.25: no help output was observed to check required content")
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("FAIL tests/01_help-text.py")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print(f"PASS tests/01_help-text.py ({len(HELP_CASES)} invocations)")
     return 0
 
 

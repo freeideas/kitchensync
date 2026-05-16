@@ -1,148 +1,186 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Existence-based directory decisions (03.9–03.13)."""
 
 from __future__ import annotations
 
-import os, shutil, subprocess, sys
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-BASE = Path(PROJECT) / "tmp" / "testks" / "03_directory-decisions"
-
-
-def invoke(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [str(UV), "run", "--script", str(BUILD_PY), "invoke-cli", PROJECT, *args],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", timeout=60,
-    )
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
+JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
+BASE = Path(tempfile.gettempdir()) / "kitchensync_03_directory_decisions"
 
 
-def url(p: Path) -> str:
-    return p.resolve().as_uri()
+failures: list[str] = []
 
 
-def find_in_bak(peer_root: Path, name: str) -> bool:
-    """Return True if <name> exists under <peer_root>/.kitchensync/BAK/<any-ts>/."""
-    bak = peer_root / ".kitchensync" / "BAK"
-    if not bak.is_dir():
+def record(condition: bool, message: str) -> None:
+    if condition:
+        print(f"PASS: {message}")
+    else:
+        print(f"FAIL: {message}")
+        failures.append(message)
+
+
+def peer(path: Path, subordinate: bool = False) -> str:
+    text = str(path)
+    return f"-{text}" if subordinate else text
+
+
+def canon_peer(path: Path) -> str:
+    return f"+{path}"
+
+
+def reset(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def mkdir(path: Path, mtime: int | None = None) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def run_sync(label: str, *args: str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(JAVA), "-jar", str(JAR), "-vl", "error", *args],
+            cwd=PROJECT_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        failures.append(f"{label}: sync timed out")
+        print(f"FAIL: {label}: sync timed out after {exc.timeout}s")
         return False
-    return any((ts / name).exists() for ts in bak.iterdir())
+
+    if result.returncode != 0:
+        failures.append(f"{label}: sync exited {result.returncode}")
+        print(f"FAIL: {label}: sync exited {result.returncode}")
+        print(f"stdout:\n{result.stdout[-2000:]}")
+        print(f"stderr:\n{result.stderr[-2000:]}")
+        return False
+    else:
+        print(f"PASS: {label}: sync exited 0")
+        return True
+
+
+def bak_entries(peer_root: Path, basename: str) -> list[Path]:
+    bak = peer_root / ".kitchensync" / "BAK"
+    if not bak.exists():
+        return []
+    return [path for path in bak.rglob(basename) if path.name == basename]
+
+
+def scenario_live_directory_wins_over_tombstone() -> None:
+    root = BASE / "live-wins"
+    p1 = root / "p1"
+    p2 = root / "p2"
+    reset(p1)
+    reset(p2)
+
+    dirname = "old-live-dir"
+    synced = True
+    synced &= run_sync("03.9/03.13 establish empty snapshots", canon_peer(p1), peer(p2))
+    mkdir(p1 / dirname)
+    synced &= run_sync("03.9/03.13 record live directory on both peers", canon_peer(p1), peer(p2))
+    shutil.rmtree(p1 / dirname, ignore_errors=True)
+    shutil.rmtree(p2 / dirname, ignore_errors=True)
+    synced &= run_sync("03.9/03.13 record tombstones on both peers", peer(p1), peer(p2))
+
+    mkdir(p1 / dirname, mtime=946684800)
+    synced &= run_sync("03.9/03.13 old live directory displaces newer tombstones", peer(p1), peer(p2))
+
+    record(synced and (p1 / dirname).is_dir(), "03.13 keeps an old live directory instead of deleting it by directory mod_time")
+    record(synced and (p2 / dirname).is_dir(), "03.9 creates a directory on a contributing peer that lacks it")
+
+
+def scenario_tombstones_delete_remaining_peer_and_no_row_does_not_block() -> None:
+    root = BASE / "tombstones-with-no-row"
+    p1 = root / "p1"
+    p2 = root / "p2"
+    p3 = root / "p3"
+    p4 = root / "p4"
+    for path in (p1, p2, p3, p4):
+        reset(path)
+
+    dirname = "deleted-by-all-who-knew"
+    marker = "subordinate-only.txt"
+    synced = True
+    synced &= run_sync("03.10/03.11 establish p3 as contributing peer with no row", canon_peer(p1), peer(p2), peer(p3))
+    mkdir(p1 / dirname)
+    mkdir(p2 / dirname)
+    synced &= run_sync("03.10/03.11 record live row on peers that know the directory", canon_peer(p1), peer(p2))
+    shutil.rmtree(p1 / dirname, ignore_errors=True)
+    shutil.rmtree(p2 / dirname, ignore_errors=True)
+    synced &= run_sync("03.10/03.11 record tombstones on every peer that knew it", peer(p1), peer(p2))
+
+    write_text(p4 / dirname / marker, "preserve this displaced subordinate content\n")
+    synced &= run_sync("03.10/03.11 delete remaining subordinate copy", peer(p1), peer(p2), peer(p3), peer(p4, subordinate=True))
+
+    backups = bak_entries(p4, dirname)
+    record(synced and not (p4 / dirname).exists(), "03.10 displaces a remaining peer's directory when all peers that knew it tombstoned it")
+    record(synced and any((entry / marker).is_file() for entry in backups), "03.10 places the displaced directory under BAK/")
+    record(synced and not (p3 / dirname).exists(), "03.11 a contributing peer with no snapshot row does not preserve or create the directory")
+
+
+def scenario_no_live_and_no_snapshot_row_deletes_subordinate() -> None:
+    root = BASE / "no-row-anywhere"
+    p1 = root / "p1"
+    p2 = root / "p2"
+    p3 = root / "p3"
+    for path in (p1, p2, p3):
+        reset(path)
+
+    dirname = "never-known"
+    marker = "subordinate-content.txt"
+    seed = "snapshot-history.txt"
+    synced = True
+    write_text(p1 / seed, "seed snapshot history without creating a row for the tested directory\n")
+    synced &= run_sync("03.12 establish contributing snapshots with no directory row", canon_peer(p1), peer(p2))
+    write_text(p3 / dirname / marker, "this directory is not in any contributing listing or snapshot\n")
+    synced &= run_sync("03.12 delete subordinate directory unknown to contributors", peer(p1), peer(p2), peer(p3, subordinate=True))
+
+    backups = bak_entries(p3, dirname)
+    record(synced and not (p3 / dirname).exists(), "03.12 removes a subordinate directory absent from all contributing listings and snapshots")
+    record(synced and any((entry / marker).is_file() for entry in backups), "03.12 places the unknown subordinate directory under BAK/")
 
 
 def main() -> int:
-    if BASE.exists():
-        shutil.rmtree(BASE)
-    BASE.mkdir(parents=True)
+    shutil.rmtree(BASE, ignore_errors=True)
+    BASE.mkdir(parents=True, exist_ok=True)
 
-    failures: list[str] = []
-
-    # ── 03.9: any contributing peer has a directory → created on every peer that lacks it ──
-    a1, a2 = BASE / "09_p1", BASE / "09_p2"
-    a1.mkdir(); a2.mkdir()
-    (a1 / "subdir_a").mkdir()
-    r = invoke(f"+{url(a1)}", url(a2))
-    print(f"[03.9] sync exit={r.returncode}")
-    ok = (a2 / "subdir_a").is_dir()
-    print(f"[03.9] peer2 has subdir_a/: {ok}")
-    if not ok:
-        failures.append("03.9: directory not created on peer lacking it")
-
-    # ── 03.10: all snapshot-row contributing peers tombstone → remaining peer displaced ──
-    # Run 1 with 2 contributing + 1 subordinate peer to establish snapshots for all three.
-    # Delete the directory from both contributing peers; keep it on the subordinate.
-    # Run 2: both contributing peers tombstone → subordinate's copy displaced to BAK/.
-    b1, b2, b3 = BASE / "10_p1", BASE / "10_p2", BASE / "10_p3"
-    for d in (b1, b2, b3):
-        d.mkdir()
-        (d / "subdir_b").mkdir()
-    r1 = invoke(f"+{url(b1)}", url(b2), f"-{url(b3)}")
-    print(f"[03.10] run1 exit={r1.returncode}")
-    shutil.rmtree(b1 / "subdir_b")
-    shutil.rmtree(b2 / "subdir_b")
-    r2 = invoke(url(b1), url(b2), f"-{url(b3)}")
-    print(f"[03.10] run2 exit={r2.returncode}")
-    absent = not (b3 / "subdir_b").is_dir()
-    in_bak = find_in_bak(b3, "subdir_b")
-    print(f"[03.10] subdir_b absent from root: {absent}, in BAK: {in_bak}")
-    if not (absent and in_bak):
-        failures.append(f"03.10: absent={absent} in_bak={in_bak}")
-
-    # ── 03.11: contributing peer with no snapshot row does not block deletion ──
-    # c2 must be a contributing peer (has snapshot.db) with no row for subdir_c.
-    # Establish c2's snapshot via a separate sync that does not involve subdir_c,
-    # then use c2 alongside c1 (tombstoning subdir_c) to show deletion still proceeds.
-    c1 = BASE / "11_c1"
-    c2 = BASE / "11_c2"
-    c2_aux = BASE / "11_c2_aux"
-    c3 = BASE / "11_c3"
-    c1.mkdir(); c2.mkdir(); c2_aux.mkdir(); c3.mkdir()
-    (c1 / "subdir_c").mkdir()
-    (c3 / "subdir_c").mkdir()
-    (c2 / "dummy.txt").write_text("x")
-    # Give c2 a snapshot.db without any subdir_c row
-    r_c2 = invoke(f"+{url(c2)}", url(c2_aux))
-    print(f"[03.11] c2-snapshot-setup exit={r_c2.returncode}")
-    # Give c1 and c3 snapshots that know subdir_c
-    r_c1 = invoke(f"+{url(c1)}", f"-{url(c3)}")
-    print(f"[03.11] c1/c3-snapshot-setup exit={r_c1.returncode}")
-    shutil.rmtree(c1 / "subdir_c")
-    # c1 tombstones; c2 (contributing, no subdir_c row) must not block; c3 displaced
-    r = invoke(url(c1), url(c2), f"-{url(c3)}")
-    print(f"[03.11] deletion-sync exit={r.returncode}")
-    absent = not (c3 / "subdir_c").is_dir()
-    in_bak = find_in_bak(c3, "subdir_c")
-    print(f"[03.11] subdir_c absent from root: {absent}, in BAK: {in_bak}")
-    if not (absent and in_bak):
-        failures.append(f"03.11: absent={absent} in_bak={in_bak}")
-
-    # ── 03.12: no contributing peer has directory live or in any snapshot → subordinate displaced ──
-    # Canon peer (d1) has no subdir_d and no snapshot at all → no contributing peer has it.
-    # Subordinate (d3) has subdir_d → displaced to BAK/.
-    d1, d3 = BASE / "12_d1", BASE / "12_d3"
-    d1.mkdir(); d3.mkdir()
-    (d3 / "subdir_d").mkdir()
-    r = invoke(f"+{url(d1)}", f"-{url(d3)}")
-    print(f"[03.12] sync exit={r.returncode}")
-    absent = not (d3 / "subdir_d").is_dir()
-    in_bak = find_in_bak(d3, "subdir_d")
-    print(f"[03.12] subdir_d absent from root: {absent}, in BAK: {in_bak}")
-    if not (absent and in_bak):
-        failures.append(f"03.12: absent={absent} in_bak={in_bak}")
-
-    # ── 03.13: directory mod_times are not used to decide directory existence ──
-    # Both peers have subdir_e after run 1; set wildly different mod_times, then sync again.
-    # Neither directory should be displaced — mod_time does not determine directory fate.
-    e1, e2 = BASE / "13_e1", BASE / "13_e2"
-    e1.mkdir(); e2.mkdir()
-    (e1 / "subdir_e").mkdir()
-    r1 = invoke(f"+{url(e1)}", url(e2))
-    print(f"[03.13] run1 exit={r1.returncode}")
-    os.utime(e1 / "subdir_e", (946684800.0, 946684800.0))   # 2000-01-01
-    os.utime(e2 / "subdir_e", (4102444800.0, 4102444800.0)) # 2099-12-31
-    r2 = invoke(url(e1), url(e2))
-    print(f"[03.13] run2 exit={r2.returncode}")
-    e1_ok = (e1 / "subdir_e").is_dir()
-    e2_ok = (e2 / "subdir_e").is_dir()
-    print(f"[03.13] peer1 has subdir_e: {e1_ok}, peer2 has subdir_e: {e2_ok}")
-    if not (e1_ok and e2_ok):
-        failures.append(f"03.13: peer1_has={e1_ok} peer2_has={e2_ok}")
+    scenario_live_directory_wins_over_tombstone()
+    scenario_tombstones_delete_remaining_peer_and_no_row_does_not_block()
+    scenario_no_live_and_no_snapshot_row_deletes_subordinate()
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("\nFailures:")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

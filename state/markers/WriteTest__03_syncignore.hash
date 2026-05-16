@@ -1,0 +1,10 @@
+{
+  "schema": "aitc.hash.v1",
+  "job": "WriteTest",
+  "taken_at_utc": "2026-05-15T20:27:26Z",
+  "hashes": {
+    "req": "201acfc58e5958dea915902c8d2c4c4e26e141b4ad7237bd84d844b3450629c1",
+    "specs/README.md": "5d6036877bde66ba769cc1d660c58e2ae754940e4cfd991fbb403ba7ac7cddb8",
+    "testing_guidelines": "843700d1e14f94ee699cef02a31af184cb0fe186efee8cdf329c7ec888d7bafe"
+  }
+}

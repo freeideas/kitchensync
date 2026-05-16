@@ -37,25 +37,25 @@ Query-string parameters on a URL override global settings (see concurrency.md fo
 "sftp://host/path?mc=5&ct=60"
 ```
 
-| Param | Meaning             | Global flag |
-| ----- | ------------------- | ----------- |
-| `mc`  | Max connections     | `--mc`      |
-| `ct`  | Connection timeout  | `--ct`      |
-| `ka`  | Idle keep-alive TTL | `--ka`      |
+| Param | Meaning              | Global flag |
+| ----- | -------------------- | ----------- |
+| `mc`  | Max SFTP connections | `--mc`      |
+| `ct`  | Connection timeout   | `--ct`      |
+| `ka`  | Idle keep-alive TTL  | `--ka`      |
 
 Query-string parameters are stripped during URL normalization — they are not part of the URL's identity.
 
 ### Global Options
 
-| Flag   | Default | Meaning                             |
-| ------ | ------- | ----------------------------------- |
-| `--mc` | 10      | Max concurrent connections per URL  |
-| `--ct` | 30      | Seconds for SSH handshake timeout   |
-| `--ka` | 30      | SFTP idle keep-alive TTL (seconds)  |
+| Flag   | Default | Meaning                                |
+| ------ | ------- | -------------------------------------- |
+| `--mc` | 10      | Max SFTP connections per user+host+port |
+| `--ct` | 30      | Seconds for SSH handshake timeout      |
+| `--ka` | 30      | SFTP idle keep-alive TTL (seconds)     |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
-| `--xd` | 2       | Delete stale TMP staging after N days |
+| `--xd` | 2       | Delete stale TMP staging after N days  |
 | `--bd` | 90      | Delete displaced files (BAK/) after N days |
-| `--td` | 180     | Forget deletion records after N days |
+| `--td` | 180     | Forget deletion records after N days   |
 
 ### URL Schemes
 
@@ -97,12 +97,12 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 
 ## Startup
 
-1. Parse command line. Validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--ka`, `--xd`, `--bd`, and `--td` are positive integers; `-vl` is one of `error`/`info`/`debug`/`trace`). On any validation error, print the error message followed by the help text and exit 1.
-2. Connect to all peers in parallel. Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. Skip unreachable peers with a warning. If directory creation fails, treat the peer as unreachable (try next fallback URL).
+1. Parse command line. Help invocations are handled before validation. For non-help invocations, validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--ka`, `--xd`, `--bd`, and `--td` are positive integers; `-vl` is one of `error`/`info`/`debug`/`trace`). On any validation error, print the error message followed by the help text and exit 1.
+2. Connect to all peers in parallel. Auto-create the peer's root directory (and any missing parents) if it does not exist — for both `file://` and `sftp://` URLs. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. Skip unreachable peers with an error-level diagnostic. If directory creation fails, treat the peer as unreachable (try next fallback URL).
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
-5. Download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). If a peer has no `snapshot.db` (transport returns 'not found'), create a new empty one locally. If the download fails with any other error (I/O error, permission denied), treat the peer as unreachable: warn and exclude it from the reachable set, then re-evaluate steps 3–4 against the updated set and exit with the corresponding error if either check now fails.
-6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new empty database was created in step 5) are automatically treated as subordinate. If no peer has any snapshot data and no canon peer (`+`) is designated, print `First sync? Mark the authoritative peer with a leading +` and exit 1.
+5. Download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). If a peer has no `snapshot.db` (transport returns 'not found'), create a new empty one locally. If the download fails with any other error (I/O error, permission denied), treat the peer as unreachable: log an error-level diagnostic and exclude it from the reachable set, then re-evaluate steps 3–4 against the updated set and exit with the corresponding error if either check now fails.
+6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new empty database was created in step 5) are automatically treated as subordinate unless they are the canon peer (`+`). If no peer has any snapshot data and no canon peer (`+`) is designated, print `First sync? Mark the authoritative peer with a leading +` and exit 1.
 7. If no contributing (non-subordinate) peer is reachable after auto-subordination, exit with error: `No contributing peer reachable — cannot make sync decisions`
 
 ## Run
@@ -124,7 +124,7 @@ File copies are enqueued during the combined-tree walk and executed concurrently
 
 ### File Copy
 
-Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting (see concurrency.md for pool semantics — SFTP pools are keyed by user+host, so two SFTP peers that share user+host share a pool; `file://` peers have no pool).
+Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting (see concurrency.md for pool semantics — SFTP pools are keyed by user+host+port, so two SFTP peers that share user+host+port share a pool; `file://` peers have no pool).
 
 1. **Transfer** to TMP staging on destination: `<target-parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>`
 2. **If** the destination already has a file at the target path, **displace** it to `<file-parent>/.kitchensync/BAK/<timestamp>/<basename>`
@@ -149,7 +149,7 @@ Every file copy and every deletion (displacement to BAK/) is logged at `info` le
 
 Logged once per decision, not per peer. This gives the user visible progress output.
 
-Verbosity levels (`-vl`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative — each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in §Errors below, and listing errors described in multi-tree-sync.md §Algorithm), `info` (the `C`/`X` progress lines above), and `trace` (pool acquire/release events, see concurrency.md §Trace Logging). No debug-specific messages are defined; `-vl debug` is observationally identical to `-vl info` until debug-only messages are specified.
+Verbosity levels (`-vl`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative — each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in §Errors below, nonfatal diagnostics for skipped peers and recoverable operation failures, and listing errors described in multi-tree-sync.md §Algorithm), `info` (the `C`/`X` progress lines above), and `trace` (pool acquire/release events, see concurrency.md §Trace Logging). No debug-specific messages are defined; `-vl debug` is observationally identical to `-vl info` until debug-only messages are specified.
 
 ## TMP Staging
 
@@ -197,16 +197,16 @@ Each transport is independently testable via its own component-level interface (
 
 ## Errors
 
-- **Argument errors** (fewer than two peers, multiple `+` peers, invalid settings) → print to stdout, exit 1
+- **Argument errors** on non-help invocations (too few peers, multiple `+` peers, invalid settings) → print to stdout, exit 1
 - **No snapshots and no canon** → print suggestion (`+`), exit 1
-- **Unreachable peer** → skip, log warning, continue with others
+- **Unreachable peer** → skip, log at error level, continue with others
 - **Canon peer unreachable** → exit 1
 - **Fewer than two reachable peers** → exit 1
 - **No contributing peer reachable** (all reachable peers are subordinate after auto-subordination) → print `No contributing peer reachable — cannot make sync decisions`, exit 1
 - **Transfer failure** → log, skip file (re-discovered next run)
 - **Displacement failure** (cannot rename to BAK/) → log error, skip the displacement (file remains in place). If the displacement was part of a file copy sequence, the copy is also skipped (TMP staging file is cleaned up)
 - **TMP staging failure** (cannot create staging directory or write staging file) → treat as transfer failure
-- **`set_mod_time` failure** (after a completed copy — file is already in place) → log warning; the copy is not undone. The destination snapshot row already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
+- **`set_mod_time` failure** (after a completed copy — file is already in place) → log at error level; the copy is not undone. The destination snapshot row already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
 - **Snapshot upload failure** → log error, leave TMP staging file for `--xd` cleanup (peer's snapshot will be stale on next run, leading to redundant but correct copies)
 
 ## Case Sensitivity

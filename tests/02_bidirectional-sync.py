@@ -1,85 +1,110 @@
-#!/usr/bin/env uvrun
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""02.6: Bidirectional sync (no + peer) completes and exits 0 when all peers have snapshots."""
 
 from __future__ import annotations
 
-import os, shutil, subprocess, sys
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
 
-TMP = Path(PROJECT) / "tmp" / "testks" / "02_bidirectional-sync"
-PEER1 = TMP / "peer1"
-PEER2 = TMP / "peer2"
+PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
+JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
+JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
+WORK_DIR = PROJECT_DIR / "tests" / ".tmp" / "02_bidirectional_sync"
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(JAVA), "-jar", str(JAR), *args],
+        cwd=PROJECT_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+
+
+def prepare_peers() -> tuple[Path, Path]:
+    if WORK_DIR.exists():
+        shutil.rmtree(WORK_DIR)
+
+    peer_a = WORK_DIR / "peer-a"
+    peer_b = WORK_DIR / "peer-b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    write_text(peer_a / "recipe.txt", "salt\npepper\n")
+    write_text(peer_a / "nested" / "notes.txt", "prep list\n")
+    return peer_a, peer_b
+
+
+def snapshot_path(peer: Path) -> Path:
+    return peer / ".kitchensync" / "snapshot.db"
+
+
+def describe_result(result: subprocess.CompletedProcess[str]) -> str:
+    return (
+        f"exit={result.returncode} "
+        f"stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
 
 
 def main() -> int:
-    # Idempotent cleanup at start
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    PEER1.mkdir(parents=True)
-    PEER2.mkdir(parents=True)
-
-    (PEER1 / "alpha.txt").write_text("alpha")
-    (PEER2 / "beta.txt").write_text("beta")
-
-    failures = []
+    failures: list[str] = []
+    peer_a, peer_b = prepare_peers()
 
     try:
-        url1 = PEER1.resolve().as_uri()
-        url2 = PEER2.resolve().as_uri()
-
-        # Establish snapshots on both peers via a first sync with a canon peer.
-        setup = subprocess.run(
-            [str(UV), "run", "--script", str(BUILD_PY),
-             "invoke-cli", PROJECT, "+" + url1, url2],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8",
-            timeout=60,
-        )
-        if setup.returncode != 0:
-            print(f"[setup] first sync (with +) failed: exit {setup.returncode}")
-            print(f"  stdout: {setup.stdout!r}")
-            print(f"  stderr: {setup.stderr!r}")
-            failures.append("setup: first sync with + failed; cannot test 02.6")
-            print("\nFAILURES:")
-            for f in failures:
-                print(f"  - {f}")
-            return 1
-        print("[setup] first sync with + succeeded (exit 0), snapshots established")
-
-        # 02.6 — second sync with no + peer must exit 0
-        proc = subprocess.run(
-            [str(UV), "run", "--script", str(BUILD_PY),
-             "invoke-cli", PROJECT, url1, url2],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8",
-            timeout=60,
-        )
-
-        print(f"[02.6] bidirectional sync (no +) exit code: {proc.returncode}")
-        if proc.returncode != 0:
+        initial = run_cli(f"+{peer_a}", str(peer_b))
+    except Exception as exc:
+        failures.append(f"02.6 setup: initial canon sync did not run: {exc!r}")
+    else:
+        if initial.returncode != 0:
             failures.append(
-                f"02.6: expected exit 0, got {proc.returncode}\n"
-                f"  stdout: {proc.stdout!r}\n"
-                f"  stderr: {proc.stderr!r}"
+                "02.6 setup: initial canon sync should establish peer snapshots; "
+                f"{describe_result(initial)}"
             )
 
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)
+    snapshots_ready = True
+    for peer in (peer_a, peer_b):
+        if not snapshot_path(peer).is_file():
+            snapshots_ready = False
+            failures.append(
+                f"02.6 setup: expected existing snapshot at {snapshot_path(peer)} before no-canon sync"
+            )
+
+    if snapshots_ready:
+        try:
+            bidirectional = run_cli(str(peer_a), str(peer_b))
+        except Exception as exc:
+            failures.append(f"02.6: no-canon sync with existing snapshots did not run: {exc!r}")
+        else:
+            if bidirectional.returncode != 0:
+                failures.append(
+                    "02.6: expected sync with existing snapshots and no + peer to exit 0; "
+                    f"{describe_result(bidirectional)}"
+                )
 
     if failures:
-        print("\nFAILURES:")
-        for f in failures:
-            print(f"  - {f}")
+        print("FAIL tests/02_bidirectional-sync.py")
+        for failure in failures:
+            print(f"- {failure}")
         return 1
-    print("\nAll assertions passed.")
+
+    print("PASS tests/02_bidirectional-sync.py (02.6)")
     return 0
 
 

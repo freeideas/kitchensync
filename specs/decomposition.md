@@ -1,47 +1,49 @@
-# Suggested Decomposition
+# Decomposition
 
-This file lists standalone components to carve out of kitchensync. The list is a **minimum**, not a maximum — additional standalone components are welcome whenever a piece of functionality can be specified using only spec terminology and external standards (RFCs, well-known abstractions). When in doubt, prefer to carve.
+These are component boundaries that make sense for kitchensync from an
+architectural point of view. They are suggestions about useful library seams in
+this project, not construction rules.
 
-The goal: standalone components do as much of the heavy lifting as possible, so the kitchensync glue mostly orchestrates them. Each component below has a clear external anchor and a self-contained API surface. The detailed contracts (operations, semantics, error cases) live in the spec sections each component implements; this file just names the components and points at their anchors.
+## SFTP protocol
 
-## Minimum Suggested Components
+A component for the SFTP protocol over SSH, including authentication, sessions,
+directory listing, file reads and writes, and the connection pooling behavior
+described in `concurrency.md`.
 
-### sftp-protocol
+This component is anchored in the SFTP draft, RFC 4253, RFC 4254, `sync.md`
+"Peer Transports" and "Authentication", and `concurrency.md` "Connection Pool
+(SFTP)".
 
-The SFTP wire protocol over SSH, with the connection pool described in `concurrency.md`.
+## Gitignore matcher
 
-**Anchored in:** `draft-ietf-secsh-filexfer` (SFTP), RFC 4253 / 4254 (SSH transport and authentication), `sync.md` §"Peer Transports" (the operation surface), `sync.md` §"Authentication", `concurrency.md` §"Connection Pool (SFTP)".
+A component for compiling gitignore-style pattern text into path matchers.
 
-### gitignore-matcher
+This component is anchored in gitignore pattern syntax and `ignore.md` "Pattern
+Format" and "Hierarchy".
 
-Compiles gitignore-style pattern text into a path matcher; pure function, no I/O.
+## URL parser
 
-**Anchored in:** the gitignore pattern syntax (well-documented external standard at git-scm.com), `ignore.md` §"Pattern Format" and §"Hierarchy".
+A component for parsing peer URL operands, including peer prefixes, fallback
+groups, per-URL query settings, supported schemes, and canonical URL identity.
 
-### url-parser
+This component is anchored in RFC 3986, RFC 8089, `sync.md` "Peers", "Fallback
+URLs", "Per-URL Settings", and "URL Schemes", and `database.md` "URL
+Normalization".
 
-Parses kitchensync's URL grammar (peer prefixes, fallback brackets, per-URL query settings, scheme dispatch) into a structured peer description, and normalizes URLs into the canonical identity used everywhere else.
+## Decision engine
 
-**Anchored in:** RFC 3986 (URI Generic Syntax), `sync.md` §"Peers" / §"Fallback URLs" / §"Per-URL Settings" / §"URL Schemes", `database.md` §"URL Normalization".
+A component for the pure per-entry decision logic: classifying peer state
+against snapshots, choosing the authoritative state for a path, and returning
+the actions each active peer should take.
 
-**Implement url-parser as a single unit. Do not carve inside it.** RFC 3986 parsing, RFC 8089 file URI handling, percent-encoding, normalization, and the kitchensync-specific URL grammar are all internal helpers of url-parser — not separate carve-outs. They are the substance of url-parser itself.
+This component is anchored in `multi-tree-sync.md` "Entry Classification",
+"Decision Rules", "Directory Decisions", and "Type Conflicts".
 
-### decision-engine
+## Snapshot database
 
-The entry-classification and per-entry decision logic — pure function over peer states and snapshot rows, no filesystem, no networking, no SQL.
+A component for the per-peer snapshot database: schema, path identifiers,
+timestamp storage, row lookup, presence updates, tombstones, and descendant
+cascade behavior.
 
-**Anchored in:** `multi-tree-sync.md` §"Entry Classification", §"Decision Rules", §"Directory Decisions", §"Type Conflicts".
-
-### snapshot-db
-
-The per-peer snapshot database — schema, path hashing, timestamp formatting, and the descendant-cascade tombstone mechanic.
-
-**Anchored in:** SQLite (external standard), xxHash64 (external standard), `database.md` (schema, path hashing, timestamp format, tombstones), `multi-tree-sync.md` §"Snapshot Updates" and §"Orphaned Snapshot Rows".
-
-## Glue
-
-Glue is whatever the kitchensync spec asks for that isn't done by the components above. See `aitc/DESIGN.md` §2.8 for what glue legitimately does (orchestration, transport branching, streaming pumps, type marshaling, error mapping) and what it shouldn't (reimplement work that should have been a carve).
-
-## Adding More Components
-
-If during construction it becomes clear that another piece of functionality is amenable to standalone extraction — its contract anchors cleanly in the spec or an external standard, and it can be specified without reference to siblings — carve it out, even if not listed above.
+This component is anchored in SQLite, xxHash64, `database.md`, and
+`multi-tree-sync.md` "Snapshot Updates" and "Orphaned Snapshot Rows".
