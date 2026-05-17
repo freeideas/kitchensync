@@ -1,4 +1,4 @@
-# Help Screen
+﻿# Help Screen
 
 `-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the JAR at build time.
 
@@ -17,8 +17,8 @@ Peers:
   sftp://user:password@host/path   Inline password (prefer SSH keys)
 
 Prefix modifiers:
-  +<peer>                          Canon — this peer's state wins all conflicts
-  -<peer>                          Subordinate — overwritten to match the group
+  +<peer>                          Canon - this peer's state wins all conflicts
+  -<peer>                          Subordinate - overwritten to match the group
 
 Fallback URLs (multiple paths to the same data):
   [url1,url2,...]                  Try in order, first that connects wins
@@ -37,6 +37,7 @@ Options:
   --ct N             SSH handshake timeout in seconds (default: 30)
   --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
+  --dir-status N     Seconds of quiet stdout before ? DIR status; 0 disables (default: 10)
   --xd N             Delete stale TMP staging after N days (default: 2)
   --bd N             Delete displaced files (BAK/) after N days (default: 90)
   --td N             Forget deletion records after N days (default: 180)

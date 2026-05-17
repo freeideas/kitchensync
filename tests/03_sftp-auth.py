@@ -1,17 +1,17 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["paramiko==3.5.1"]
+# dependencies = ["paramiko==3.5.1", "pywin32==310; sys_platform == 'win32'"]
 # ///
 
 from __future__ import annotations
 
 import errno
 import os
-import re
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -27,9 +27,9 @@ from paramiko import SFTPAttributes, SFTPHandle, SFTPServerInterface
 from paramiko.sftp import SFTP_FAILURE, SFTP_NO_SUCH_FILE, SFTP_OK
 
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
-JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
 WORK_DIR = PROJECT_DIR / "tests" / ".tmp" / "03_sftp_auth"
 USER = "ace"
 PASSWORD = "p@ss:word"
@@ -55,6 +55,12 @@ class AuthLog:
     def snapshot(self) -> list[AuthAttempt]:
         with self._lock:
             return list(self._attempts)
+
+
+def errno_to_sftp(error: int) -> int:
+    if error == errno.ENOENT:
+        return SFTP_NO_SUCH_FILE
+    return SFTP_FAILURE
 
 
 class RootedSFTPHandle(SFTPHandle):
@@ -83,10 +89,9 @@ class RootedSFTPServer(SFTPServerInterface):
 
     def list_folder(self, path: str):
         try:
-            local = self._local(path)
             entries = []
-            for name in os.listdir(local):
-                attrs = SFTPAttributes.from_stat(os.stat(local / name))
+            for name in os.listdir(self._local(path)):
+                attrs = SFTPAttributes.from_stat(os.stat(self._local(path) / name))
                 attrs.filename = name
                 entries.append(attrs)
             return entries
@@ -109,15 +114,14 @@ class RootedSFTPServer(SFTPServerInterface):
         try:
             local = self._local(path)
             local.parent.mkdir(parents=True, exist_ok=True)
-            mode = getattr(attr, "st_mode", None) or 0o666
-            fd = os.open(local, flags, mode)
+            fd = os.open(local, flags, getattr(attr, "st_mode", None) or 0o666)
             handle = RootedSFTPHandle(flags)
-            if flags & os.O_WRONLY:
-                handle.writefile = os.fdopen(fd, "wb", buffering=0)
-            elif flags & os.O_RDWR:
+            if flags & os.O_RDWR:
                 file_obj = os.fdopen(fd, "r+b", buffering=0)
                 handle.readfile = file_obj
                 handle.writefile = file_obj
+            elif flags & os.O_WRONLY:
+                handle.writefile = os.fdopen(fd, "wb", buffering=0)
             else:
                 handle.readfile = os.fdopen(fd, "rb", buffering=0)
             return handle
@@ -143,8 +147,7 @@ class RootedSFTPServer(SFTPServerInterface):
 
     def mkdir(self, path: str, attr):
         try:
-            mode = getattr(attr, "st_mode", None) or 0o777
-            os.mkdir(self._local(path), mode)
+            os.mkdir(self._local(path), getattr(attr, "st_mode", None) or 0o777)
             return SFTP_OK
         except OSError as exc:
             return errno_to_sftp(exc.errno)
@@ -169,10 +172,6 @@ class RootedSFTPServer(SFTPServerInterface):
             local = self._local(path)
             if attr.st_mode is not None:
                 os.chmod(local, stat.S_IMODE(attr.st_mode))
-            if attr.st_uid is not None or attr.st_gid is not None:
-                uid = attr.st_uid if attr.st_uid is not None else -1
-                gid = attr.st_gid if attr.st_gid is not None else -1
-                os.chown(local, uid, gid)
             if attr.st_atime is not None and attr.st_mtime is not None:
                 os.utime(local, (attr.st_atime, attr.st_mtime))
             return SFTP_OK
@@ -185,12 +184,6 @@ class RootedSFTPServer(SFTPServerInterface):
             return SFTP_OK
         except OSError as exc:
             return errno_to_sftp(exc.errno)
-
-
-def errno_to_sftp(error: int) -> int:
-    if error == errno.ENOENT:
-        return SFTP_NO_SUCH_FILE
-    return SFTP_FAILURE
 
 
 class AuthServer(paramiko.ServerInterface):
@@ -275,15 +268,8 @@ class SFTPFixture:
         transport = paramiko.Transport(client)
         try:
             transport.add_server_key(self.host_key)
-            transport.set_subsystem_handler(
-                "sftp",
-                paramiko.SFTPServer,
-                RootedSFTPServer,
-                self.root,
-            )
-            transport.start_server(
-                server=AuthServer(self.log, self.accepted_password, self.accepted_keys)
-            )
+            transport.set_subsystem_handler("sftp", paramiko.SFTPServer, RootedSFTPServer, self.root)
+            transport.start_server(server=AuthServer(self.log, self.accepted_password, self.accepted_keys))
             while not self._stop.is_set() and transport.is_active():
                 time.sleep(0.05)
         except Exception:
@@ -292,58 +278,211 @@ class SFTPFixture:
             transport.close()
 
 
-class SshAgent:
-    def __init__(self, key_path: Path):
-        self.key_path = key_path
+class SshAgentFixture:
+    def __init__(self, sock_path: Path, key: paramiko.PKey):
+        self.sock_path = sock_path
+        self.key = key
+        self.key_blob = key.asbytes()
         self.env: dict[str, str] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._sock: socket.socket | None = None
+        self._pipe_name: str | None = None
 
-    def __enter__(self) -> SshAgent:
-        result = subprocess.run(
-            ["ssh-agent", "-s"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ssh-agent failed: {result.stderr or result.stdout}")
-        for name in ("SSH_AUTH_SOCK", "SSH_AGENT_PID"):
-            match = re.search(rf"{name}=([^;]+);", result.stdout)
-            if not match:
-                raise RuntimeError(f"ssh-agent output did not include {name}: {result.stdout!r}")
-            self.env[name] = match.group(1)
+    def __enter__(self) -> SshAgentFixture:
+        if hasattr(socket, "AF_UNIX"):
+            return self._enter_unix_socket()
+        if sys.platform == "win32":
+            return self._enter_windows_pipe()
+        raise RuntimeError("this Python runtime cannot create an SSH_AUTH_SOCK agent endpoint")
 
-        add = subprocess.run(
-            ["ssh-add", str(self.key_path)],
-            env={**os.environ, **self.env},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            check=False,
-        )
-        if add.returncode != 0:
-            raise RuntimeError(f"ssh-add failed: {add.stderr or add.stdout}")
+    def _enter_unix_socket(self) -> SshAgentFixture:
+        if self.sock_path.exists():
+            self.sock_path.unlink()
+        self.sock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(str(self.sock_path))
+        self._sock.listen(20)
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        self.env = {"SSH_AUTH_SOCK": str(self.sock_path)}
+        return self
+
+    def _enter_windows_pipe(self) -> SshAgentFixture:
+        self._pipe_name = rf"\\.\pipe\kitchensync-test-agent-{os.getpid()}-{time.time_ns()}"
+        self._thread = threading.Thread(target=self._accept_pipe_loop, daemon=True)
+        self._thread.start()
+        self.env = {"SSH_AUTH_SOCK": self._pipe_name}
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self.env:
-            subprocess.run(
-                ["ssh-agent", "-k"],
-                env={**os.environ, **self.env},
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._pipe_name is not None:
+            self._unblock_pipe_accept()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        try:
+            self.sock_path.unlink()
+        except OSError:
+            pass
+
+    def _accept_loop(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                client, _addr = self._sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._serve_client, args=(client,), daemon=True).start()
+
+    def _accept_pipe_loop(self) -> None:
+        import pywintypes
+        import win32con
+        import win32file
+        import win32pipe
+
+        assert self._pipe_name is not None
+        while not self._stop.is_set():
+            pipe = win32pipe.CreateNamedPipe(
+                self._pipe_name,
+                win32con.PIPE_ACCESS_DUPLEX,
+                win32con.PIPE_TYPE_BYTE | win32con.PIPE_READMODE_BYTE | win32con.PIPE_WAIT,
+                20,
+                65536,
+                65536,
+                0,
+                None,
             )
+            try:
+                win32pipe.ConnectNamedPipe(pipe, None)
+            except pywintypes.error as exc:
+                if exc.winerror != 535:
+                    win32file.CloseHandle(pipe)
+                    if self._stop.is_set():
+                        return
+                    continue
+            if self._stop.is_set():
+                win32file.CloseHandle(pipe)
+                return
+            threading.Thread(target=self._serve_pipe, args=(pipe,), daemon=True).start()
+
+    def _unblock_pipe_accept(self) -> None:
+        import pywintypes
+        import win32con
+        import win32file
+
+        assert self._pipe_name is not None
+        try:
+            handle = win32file.CreateFile(
+                self._pipe_name,
+                win32con.GENERIC_READ | win32con.GENERIC_WRITE,
+                0,
+                None,
+                win32con.OPEN_EXISTING,
+                0,
+                None,
+            )
+            win32file.CloseHandle(handle)
+        except pywintypes.error:
+            pass
+
+    def _serve_client(self, client: socket.socket) -> None:
+        with client:
+            while not self._stop.is_set():
+                header = self._recv_exact(client, 4)
+                if not header:
+                    return
+                length = struct.unpack(">I", header)[0]
+                body = self._recv_exact(client, length)
+                if len(body) != length:
+                    return
+                response = self._handle_message(body)
+                client.sendall(struct.pack(">I", len(response)) + response)
+
+    def _serve_pipe(self, pipe) -> None:
+        import pywintypes
+        import win32file
+        import win32pipe
+
+        try:
+            while not self._stop.is_set():
+                header = self._read_pipe_exact(pipe, 4)
+                if not header:
+                    return
+                length = struct.unpack(">I", header)[0]
+                body = self._read_pipe_exact(pipe, length)
+                if len(body) != length:
+                    return
+                response = self._handle_message(body)
+                win32file.WriteFile(pipe, struct.pack(">I", len(response)) + response)
+        except pywintypes.error:
+            pass
+        finally:
+            try:
+                win32pipe.DisconnectNamedPipe(pipe)
+            except pywintypes.error:
+                pass
+            win32file.CloseHandle(pipe)
+
+    def _handle_message(self, body: bytes) -> bytes:
+        message_type = body[0]
+        if message_type == 11:
+            return b"\x0c" + struct.pack(">I", 1) + self._string(self.key_blob) + self._string(b"kitchensync-test-agent")
+        if message_type == 13:
+            key_blob, offset = self._read_string(body, 1)
+            data, offset = self._read_string(body, offset)
+            flags = struct.unpack(">I", body[offset : offset + 4])[0]
+            if key_blob != self.key_blob:
+                return b"\x05"
+            algorithm = None
+            if flags & 4:
+                algorithm = "rsa-sha2-512"
+            elif flags & 2:
+                algorithm = "rsa-sha2-256"
+            signature = self.key.sign_ssh_data(data, algorithm=algorithm).asbytes()
+            return b"\x0e" + self._string(signature)
+        return b"\x05"
+
+    @staticmethod
+    def _recv_exact(client: socket.socket, length: int) -> bytes:
+        data = b""
+        while len(data) < length:
+            chunk = client.recv(length - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    @staticmethod
+    def _read_pipe_exact(pipe, length: int) -> bytes:
+        import pywintypes
+        import win32file
+
+        data = b""
+        while len(data) < length:
+            try:
+                _err, chunk = win32file.ReadFile(pipe, length - len(data), None)
+            except pywintypes.error:
+                break
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    @staticmethod
+    def _string(value: bytes) -> bytes:
+        return struct.pack(">I", len(value)) + value
+
+    @staticmethod
+    def _read_string(body: bytes, offset: int) -> tuple[bytes, int]:
+        length = struct.unpack(">I", body[offset : offset + 4])[0]
+        offset += 4
+        return body[offset : offset + length], offset + length
 
 
 def write_text(path: Path, text: str) -> None:
@@ -381,14 +520,16 @@ def write_known_hosts(home: Path, fixture: SFTPFixture | None) -> None:
     ssh_dir = home / ".ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
     known_hosts = ssh_dir / "known_hosts"
-    if fixture is None:
-        known_hosts.write_text("", encoding="utf-8", newline="\n")
-    else:
-        known_hosts.write_text(fixture.known_hosts_line(), encoding="utf-8", newline="\n")
+    known_hosts.write_text("" if fixture is None else fixture.known_hosts_line(), encoding="utf-8", newline="\n")
     known_hosts.chmod(0o600)
 
 
-def run_cli(home: Path, source: Path, url: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    home: Path,
+    source: Path,
+    url: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "HOME": str(home),
@@ -462,20 +603,40 @@ def check_inline_password_and_decoding(root: Path) -> list[str]:
     return failures
 
 
-def check_password_then_agent(root: Path) -> list[str]:
+def check_ssh_agent_after_no_password_or_failed_password(root: Path) -> list[str]:
     failures: list[str] = []
-    scenario = root / "password_then_agent"
+    scenario = root / "ssh_agent"
     source = scenario / "source"
     remote = scenario / "remote"
     home = scenario / "home"
     agent_key = paramiko.RSAKey.generate(2048)
-    key_path = scenario / "agent_key"
     prepare_source(source)
-    write_key(key_path, agent_key)
 
     with SFTPFixture(remote, None, {agent_key.get_base64()}) as fixture:
         write_known_hosts(home, fixture)
-        with SshAgent(key_path) as agent:
+        with SshAgentFixture(scenario / "agent.sock", agent_key) as agent:
+            result = run_cli(home, source, fixture.url(), agent.env)
+        attempts = fixture.log.snapshot()
+
+    require_success(failures, "03.66", result)
+    if not payload_synced(remote):
+        failures.append("03.66: SSH agent authentication without an inline password did not transfer payload")
+    if not attempts:
+        failures.append("03.66: expected SSH agent authentication attempt when no inline password is present")
+    elif attempts[0].method != "publickey" or not attempts[0].accepted or attempts[0].value != agent_key.get_base64():
+        failures.append(
+            "03.66: expected SSH agent public key to be accepted when no inline password is present; "
+            f"attempts={attempt_summary(attempts)}"
+        )
+
+    source = scenario / "source_after_password_failure"
+    remote = scenario / "remote_after_password_failure"
+    home = scenario / "home_after_password_failure"
+    prepare_source(source)
+
+    with SFTPFixture(remote, None, {agent_key.get_base64()}) as fixture:
+        write_known_hosts(home, fixture)
+        with SshAgentFixture(scenario / "agent_after_password_failure.sock", agent_key) as agent:
             result = run_cli(home, source, fixture.url(WRONG_PASSWORD), agent.env)
         attempts = fixture.log.snapshot()
 
@@ -485,8 +646,7 @@ def check_password_then_agent(root: Path) -> list[str]:
     if len(attempts) < 2:
         failures.append(f"03.66: expected password failure followed by agent public key; attempts={attempt_summary(attempts)}")
     else:
-        first = attempts[0]
-        if first != AuthAttempt("password", False, WRONG_PASSWORD):
+        if attempts[0] != AuthAttempt("password", False, WRONG_PASSWORD):
             failures.append(
                 "03.66: expected failed inline password before agent auth; "
                 f"attempts={attempt_summary(attempts)}"
@@ -538,8 +698,61 @@ def check_identity_file_order(root: Path) -> list[str]:
             "03.67: expected identity files to be tried in id_ed25519, id_ecdsa, id_rsa order; "
             f"attempts={attempt_summary(attempts)}"
         )
-    if attempts and attempts[-1].value != rsa_file_key.get_base64():
+    if not any(attempt.accepted and attempt.value == rsa_file_key.get_base64() for attempt in attempts):
         failures.append(f"03.67: expected id_rsa to be the accepted fallback identity; attempts={attempt_summary(attempts)}")
+
+    source = scenario / "source_after_agent_failure"
+    remote = scenario / "remote_after_agent_failure"
+    home = scenario / "home_after_agent_failure"
+    ssh_dir = home / ".ssh"
+    rejected_agent_key = paramiko.RSAKey.generate(2048)
+    prepare_source(source)
+
+    ed25519_file_key = write_ed25519_key(ssh_dir / "id_ed25519")
+    ecdsa_file_key = paramiko.ECDSAKey.generate(bits=256)
+    rsa_file_key = paramiko.RSAKey.generate(2048)
+    write_key(ssh_dir / "id_ecdsa", ecdsa_file_key)
+    write_key(ssh_dir / "id_rsa", rsa_file_key)
+
+    with SFTPFixture(remote, None, {rsa_file_key.get_base64()}) as fixture:
+        write_known_hosts(home, fixture)
+        with SshAgentFixture(scenario / "rejected-agent.sock", rejected_agent_key) as agent:
+            result = run_cli(home, source, fixture.url(), agent.env)
+        attempts = fixture.log.snapshot()
+
+    require_success(failures, "03.67", result)
+    if not payload_synced(remote):
+        failures.append("03.67: identity file fallback after failed agent authentication did not transfer payload")
+    rejected_agent_indexes = [
+        i
+        for i, attempt in enumerate(attempts)
+        if attempt.method == "publickey" and not attempt.accepted and attempt.value == rejected_agent_key.get_base64()
+    ]
+    accepted_identity_indexes = [
+        i for i, attempt in enumerate(attempts) if attempt.accepted and attempt.value == rsa_file_key.get_base64()
+    ]
+    if not rejected_agent_indexes:
+        failures.append(f"03.67: expected rejected SSH agent key before identity fallback; attempts={attempt_summary(attempts)}")
+    elif not accepted_identity_indexes or rejected_agent_indexes[0] > accepted_identity_indexes[0]:
+        failures.append(f"03.67: expected rejected SSH agent key before accepted identity file; attempts={attempt_summary(attempts)}")
+    if not accepted_identity_indexes:
+        failures.append(f"03.67: expected identity file to be accepted after failed agent authentication; attempts={attempt_summary(attempts)}")
+
+    public_keys = [attempt.value for attempt in attempts if attempt.method == "publickey"]
+    expected = [
+        ed25519_file_key.get_base64(),
+        ecdsa_file_key.get_base64(),
+        rsa_file_key.get_base64(),
+    ]
+    cursor = 0
+    for key in public_keys:
+        if cursor < len(expected) and key == expected[cursor]:
+            cursor += 1
+    if cursor != len(expected):
+        failures.append(
+            "03.67: expected identity files to be tried in order after failed agent authentication; "
+            f"attempts={attempt_summary(attempts)}"
+        )
     return failures
 
 
@@ -582,7 +795,7 @@ def main() -> int:
 
     checks = [
         ("inline password and percent decoding", check_inline_password_and_decoding),
-        ("password failure then SSH agent", check_password_then_agent),
+        ("SSH agent after no password or failed password", check_ssh_agent_after_no_password_or_failed_password),
         ("identity file order", check_identity_file_order),
         ("unknown host rejection", check_unknown_host_rejected),
     ]

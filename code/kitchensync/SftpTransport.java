@@ -3,6 +3,11 @@ package kitchensync;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import sftp.protocol.AuthConfig;
 import sftp.protocol.Entry;
@@ -13,29 +18,30 @@ import sftp.protocol.SftpError;
 import sftp.protocol.SftpException;
 import sftp.protocol.SftpFilesystem;
 import sftp.protocol.SftpLocation;
-import sftp.protocol.SftpPoolListener;
 import sftp.protocol.SftpPoolRegistry;
 import sftp.protocol.SftpSettings;
 import sftp.protocol.SftpTransferPool;
 import sftp.protocol.WriteHandle;
 
 final class SftpTransport implements Transport {
+    private static final Map<String, Object> STARTUP_LOCKS = new ConcurrentHashMap<>();
+
     private final SftpLocation location;
     private final SftpSettings settings;
     private final AuthConfig authConfig;
     private final SftpPoolRegistry poolRegistry;
-    private final SftpPoolListener listener;
+    private final SftpPoolTrace poolTrace;
     private final boolean pooled;
     private final SftpFilesystem fixed;
     private boolean closed;
 
     private SftpTransport(SftpLocation location, SftpSettings settings, AuthConfig authConfig,
-            SftpPoolRegistry poolRegistry, SftpPoolListener listener, boolean pooled, SftpFilesystem fixed) {
+            SftpPoolRegistry poolRegistry, SftpPoolTrace poolTrace, boolean pooled, SftpFilesystem fixed) {
         this.location = location;
         this.settings = settings;
         this.authConfig = authConfig;
         this.poolRegistry = poolRegistry;
-        this.listener = listener;
+        this.poolTrace = poolTrace;
         this.pooled = pooled;
         this.fixed = fixed;
     }
@@ -46,56 +52,121 @@ final class SftpTransport implements Transport {
         SftpSettings settings = new SftpSettings(config.maxConnections(), Duration.ofSeconds(config.connectTimeoutSeconds()),
                 Duration.ofSeconds(config.keepAliveSeconds()));
         AuthConfig auth = AuthConfig.defaults();
-        ensureRoot(location, settings, auth);
-        return new SftpTransport(location, settings, auth, pools, poolTrace::event, false, null);
-    }
-
-    private static void ensureRoot(SftpLocation location, SftpSettings settings, AuthConfig auth)
-            throws TransportException {
-        try (SftpFilesystem fs = SftpConnector.open_unpooled(location, settings, auth)) {
-            fs.create_dir("");
-            return;
-        } catch (SftpException ex) {
-            if (ex.category() != SftpError.not_found || location.root_path().equals("/")) {
-                throw map(ex);
-            }
-        }
         SftpLocation root = new SftpLocation(location.user(), location.password(), location.host(), location.port(), "/");
-        try (SftpFilesystem fs = SftpConnector.open_unpooled(root, settings, auth)) {
-            fs.create_dir(location.root_path().substring(1));
+        SftpFilesystem fs;
+        try {
+            fs = openUnpooled(root, settings, auth);
         } catch (SftpException ex) {
-            if (rootIsUsable(location, settings, auth)) {
-                return;
-            }
             throw map(ex);
         }
+        if (!location.root_path().equals("/")) {
+            synchronized (STARTUP_LOCKS.computeIfAbsent(location.endpointKey(), ignored -> new Object())) {
+                try {
+                    createRootPath(fs, location.root_path().substring(1));
+                } catch (SftpException ex) {
+                    fs.close();
+                    throw map(ex);
+                }
+            }
+        }
+        return new SftpTransport(location, settings, auth, pools, poolTrace, false, fs);
     }
 
-    private static boolean rootIsUsable(SftpLocation location, SftpSettings settings, AuthConfig auth) {
-        try (SftpFilesystem fs = SftpConnector.open_unpooled(location, settings, auth)) {
-            fs.create_dir("");
-            return true;
+    private static void createRootPath(SftpFilesystem fs, String path) throws SftpException {
+        String current = "";
+        for (String segment : path.split("/")) {
+            if (segment.isEmpty()) {
+                continue;
+            }
+            current = current.isEmpty() ? segment : current + "/" + segment;
+            try {
+                fs.create_dir(current);
+            } catch (SftpException ex) {
+                if (!isDirectory(fs, current)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    private static boolean isDirectory(SftpFilesystem fs, String path) {
+        try {
+            return fs.stat(path).is_dir();
         } catch (SftpException ex) {
             return false;
         }
     }
 
     SftpTransport pooledLease() throws TransportException {
+        String endpoint = location.endpointKey();
+        int maximum = settings.max_connections();
+        boolean acquiredPermit = false;
         try {
+            poolTrace.acquire(endpoint, maximum);
+            acquiredPermit = true;
             SftpLocation poolLocation = new SftpLocation(location.user(), location.password(), location.host(),
                     location.port(), "/");
-            SftpTransferPool pool = poolRegistry.pool_for(poolLocation, settings, authConfig, listener);
-            PooledSftpFilesystem fs = pool.acquire();
-            return new SftpTransport(location, settings, authConfig, poolRegistry, listener, true, fs);
+            SftpTransferPool pool = poolRegistry.pool_for(poolLocation, settings, authConfig, event -> {
+            });
+            PooledSftpFilesystem fs = pooledAcquire(pool, Math.max(1, settings.connect_timeout().toMillis()));
+            return new SftpTransport(location, settings, authConfig, poolRegistry, poolTrace, true, fs);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            if (acquiredPermit) {
+                poolTrace.release(endpoint, maximum);
+            }
+            throw new TransportException(TransportException.Category.IO_ERROR, "interrupted while waiting for SFTP pool", ex);
         } catch (SftpException ex) {
+            if (acquiredPermit) {
+                poolTrace.release(endpoint, maximum);
+            }
             throw map(ex);
         }
     }
 
+    private static PooledSftpFilesystem pooledAcquire(SftpTransferPool pool, long timeoutMillis)
+            throws SftpException, InterruptedException {
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicBoolean timedOut = new AtomicBoolean(false);
+        PooledSftpFilesystem[] result = new PooledSftpFilesystem[1];
+        SftpException[] failure = new SftpException[1];
+        Thread acquirer = new Thread(() -> {
+            try {
+                PooledSftpFilesystem fs = pool.acquire();
+                if (timedOut.get()) {
+                    fs.close();
+                } else {
+                    result[0] = fs;
+                }
+            } catch (SftpException ex) {
+                if (!timedOut.get()) {
+                    failure[0] = ex;
+                }
+            } finally {
+                done.countDown();
+            }
+        }, "kitchensync-sftp-pool-acquire");
+        acquirer.setDaemon(true);
+        acquirer.start();
+        try {
+            if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
+                timedOut.set(true);
+                throw new SftpException(SftpError.io_error, "connection timeout");
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw ex;
+        }
+        if (failure[0] != null) {
+            throw failure[0];
+        }
+        return result[0];
+    }
+
     @Override
     public List<EntryInfo> listDir(String relativePath) throws TransportException {
-        try (SftpFilesystem fs = open()) {
-            List<Entry> entries = fs.list_dir(relativePath(relativePath));
+        try {
+            List<Entry> entries = get(fs -> fs.list_dir(relativePath(relativePath)));
             if (entries == null) {
                 return List.of();
             }
@@ -109,8 +180,8 @@ final class SftpTransport implements Transport {
 
     @Override
     public EntryInfo stat(String relativePath) throws TransportException {
-        try (SftpFilesystem fs = open()) {
-            return entry(fs.stat(relativePath(relativePath)));
+        try {
+            return entry(get(fs -> fs.stat(relativePath(relativePath))));
         } catch (SftpException ex) {
             throw map(ex);
         }
@@ -119,9 +190,11 @@ final class SftpTransport implements Transport {
     @Override
     public ReadToken openRead(String relativePath) throws TransportException {
         try {
+            if (fixed != null) {
+                return new SftpReadToken(fixed, fixed.open_read(relativePath(relativePath)), false);
+            }
             SftpFilesystem fs = open();
-            ReadHandle handle = fs.open_read(relativePath(relativePath));
-            return new SftpReadToken(fs, handle);
+            return new SftpReadToken(fs, fs.open_read(relativePath(relativePath)), true);
         } catch (SftpException ex) {
             throw map(ex);
         }
@@ -141,9 +214,11 @@ final class SftpTransport implements Transport {
     @Override
     public WriteToken openWrite(String relativePath) throws TransportException {
         try {
+            if (fixed != null) {
+                return new SftpWriteToken(fixed, fixed.open_write(relativePath(relativePath)), false);
+            }
             SftpFilesystem fs = open();
-            WriteHandle handle = fs.open_write(relativePath(relativePath));
-            return new SftpWriteToken(fs, handle);
+            return new SftpWriteToken(fs, fs.open_write(relativePath(relativePath)), true);
         } catch (SftpException ex) {
             throw map(ex);
         }
@@ -171,7 +246,8 @@ final class SftpTransport implements Transport {
 
     @Override
     public void createDir(String relativePath) throws TransportException {
-        with(fs -> fs.create_dir(relativePath(relativePath)));
+        String path = relativePath(relativePath);
+        with(fs -> createRootPath(fs, path));
     }
 
     @Override
@@ -189,6 +265,9 @@ final class SftpTransport implements Transport {
         if (fixed != null && !closed) {
             closed = true;
             fixed.close();
+            if (pooled) {
+                poolTrace.release(location.endpointKey(), settings.max_connections());
+            }
         }
     }
 
@@ -199,14 +278,61 @@ final class SftpTransport implements Transport {
     SftpTransport withPoolSettingsFrom(SftpTransport first) {
         SftpSettings poolSettings = new SftpSettings(first.settings.max_connections(), settings.connect_timeout(),
                 first.settings.idle_keep_alive_ttl());
-        return new SftpTransport(location, poolSettings, authConfig, poolRegistry, listener, false, null);
+        return new SftpTransport(location, poolSettings, authConfig, poolRegistry, poolTrace, false, null);
     }
 
     private SftpFilesystem open() throws SftpException {
         if (fixed != null) {
             return fixed;
         }
-        return SftpConnector.open_unpooled(location, settings, authConfig);
+        SftpLocation root = new SftpLocation(location.user(), location.password(), location.host(), location.port(), "/");
+        return openUnpooled(root, settings, authConfig);
+    }
+
+    private static SftpFilesystem openUnpooled(SftpLocation location, SftpSettings settings, AuthConfig auth)
+            throws SftpException {
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicBoolean timedOut = new AtomicBoolean(false);
+        SftpFilesystem[] result = new SftpFilesystem[1];
+        SftpException[] failure = new SftpException[1];
+        Thread connector = new Thread(() -> {
+            try {
+                SftpFilesystem fs = SftpConnector.open_unpooled(location, settings, auth);
+                if (timedOut.get()) {
+                    fs.close();
+                } else {
+                    result[0] = fs;
+                }
+            } catch (SftpException ex) {
+                failure[0] = ex;
+            } finally {
+                done.countDown();
+            }
+        }, "kitchensync-sftp-connect");
+        connector.setDaemon(true);
+        connector.start();
+        try {
+            if (!done.await(Math.max(1, settings.connect_timeout().toMillis()), TimeUnit.MILLISECONDS)) {
+                timedOut.set(true);
+                throw new SftpException(SftpError.io_error, "connection timeout");
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new SftpException(SftpError.io_error, "connection interrupted", ex);
+        }
+        if (failure[0] != null) {
+            throw failure[0];
+        }
+        return result[0];
+    }
+
+    private <T> T get(SftpGetter<T> op) throws SftpException {
+        if (fixed != null) {
+            return op.run(fixed);
+        }
+        try (SftpFilesystem fs = open()) {
+            return op.run(fs);
+        }
     }
 
     private void with(SftpOperation operation) throws TransportException {
@@ -227,12 +353,9 @@ final class SftpTransport implements Transport {
 
     private String relativePath(String relativePath) {
         if (relativePath == null || relativePath.isEmpty()) {
-            return pooled ? location.root_path().substring(1) : "";
+            return location.root_path().substring(1);
         }
-        if (pooled) {
-            return PathUtil.child(location.root_path().substring(1), relativePath);
-        }
-        return relativePath;
+        return PathUtil.child(location.root_path().substring(1), relativePath);
     }
 
     private static EntryInfo entry(Entry entry) {
@@ -252,15 +375,21 @@ final class SftpTransport implements Transport {
         void run(SftpFilesystem fs) throws SftpException;
     }
 
-    private record SftpReadToken(SftpFilesystem fs, ReadHandle handle) implements ReadToken {
+    private interface SftpGetter<T> {
+        T run(SftpFilesystem fs) throws SftpException;
+    }
+
+    private record SftpReadToken(SftpFilesystem fs, ReadHandle handle, boolean ownsFs) implements ReadToken {
         @Override
         public void close() {
             fs.close_read(handle);
-            fs.close();
+            if (ownsFs) {
+                fs.close();
+            }
         }
     }
 
-    private record SftpWriteToken(SftpFilesystem fs, WriteHandle handle) implements WriteToken {
+    private record SftpWriteToken(SftpFilesystem fs, WriteHandle handle, boolean ownsFs) implements WriteToken {
         @Override
         public void close() throws TransportException {
             try {
@@ -268,7 +397,7 @@ final class SftpTransport implements Transport {
             } catch (SftpException ex) {
                 throw map(ex);
             } finally {
-                if (!(fs instanceof PooledSftpFilesystem)) {
+                if (ownsFs) {
                     fs.close();
                 }
             }

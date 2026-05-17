@@ -124,6 +124,10 @@ The library does not implement a complete file-copy operation. Callers compose
 `open_read`, `read`, `open_write`, `write`, and close operations into whatever
 copy pipeline they require.
 
+The subproject MCP wrapper is part of the release boundary. It must expose the
+public operations needed by black-box tests, including a way to acquire pooled
+filesystems and retrieve captured pool events for a pool.
+
 ### Transfer Pool
 
 `SftpPoolRegistry`

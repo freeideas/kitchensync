@@ -1,4 +1,4 @@
-# Ignore Rules
+﻿# Ignore Rules
 
 How KitchenSync excludes files from synchronization.
 
@@ -6,7 +6,7 @@ How KitchenSync excludes files from synchronization.
 
 Any directory may contain a `.syncignore` file listing patterns of files and directories to exclude from sync. Patterns apply to the directory containing the `.syncignore` and its subdirectories.
 
-`.syncignore` files participate in normal decision rules (canon wins, or newest mod_time wins), keeping ignore rules consistent across all peers. Unlike other files, `.syncignore` is not subject to exclusion by ignore patterns accumulated from parent directories — it is always resolved before any filtering is applied at its directory level.
+`.syncignore` files participate in normal decision rules (canon wins, or newest mod_time wins), keeping ignore rules consistent across all peers. Unlike other files, `.syncignore` is not subject to exclusion by ignore patterns accumulated from parent directories - it is always resolved before any filtering is applied at its directory level.
 
 ## Resolution During the Multi-Tree Walk
 
@@ -14,7 +14,7 @@ At each directory level, after listing all peers and computing the union of entr
 
 1. If `.syncignore` appears in the union, apply normal decision rules to it first (decide whether it exists, then enqueue copies or displacements needed to make peers match).
 2. If the winning state is an existing `.syncignore`, read that file and combine its patterns with the accumulated ignore rules from parent directories. If the winning state is absence/deletion, only parent-level rules apply at this directory.
-3. Filter the remaining union entries through the accumulated rules — entries that match are skipped (no decisions, no copies, no snapshot updates).
+3. Filter the remaining union entries through the accumulated rules - entries that match are skipped (no decisions, no copies, no snapshot updates).
 
 If no peer has a `.syncignore` at the current level, only parent-level rules (if any) apply.
 
@@ -22,10 +22,10 @@ If no peer has a `.syncignore` at the current level, only parent-level rules (if
 
 Uses the same pattern syntax as `.gitignore`:
 
-- `*.log` — match by extension
-- `build/` — ignore a directory
-- `!important.log` — negate a previous pattern
-- `**/temp` — match in any subdirectory
+- `*.log` - match by extension
+- `build/` - ignore a directory
+- `!important.log` - negate a previous pattern
+- `**/temp` - match in any subdirectory
 
 ## Hierarchy
 
@@ -33,7 +33,7 @@ Ignore files at deeper levels add to (and can override) patterns from parent dir
 
 ## Symlinks
 
-Symbolic links are always skipped — both files and directories. During local and peer walks, symlinks are not followed, not included in the file list, and not synced. This cannot be overridden.
+Symbolic links are always skipped - both files and directories. During local and peer walks, symlinks are not followed, not included in the file list, and not synced. This cannot be overridden.
 
 Why: following symlinks could sync files outside the sync root or create infinite loops. Symlink targets may not exist on other peers. On Windows, creating symlinks requires elevated privileges.
 

@@ -1,638 +1,556 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Exercise the gitignore pattern set through its MCP wrapper."""
 
 from __future__ import annotations
 
 import json
-import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+from itertools import count
 from pathlib import Path
-from typing import Any
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+MCP_JAR = Path(
+    "C:/Users/human/Desktop/prjx/kitchensync/subpjx/gitignore-matcher"
+    "/subpjx/gitignore-pattern-set/released/gitignore-pattern-set_MCP.jar"
+)
+
+failures: list[str] = []
+_rpc_id = count(1)
 
 
-BUILD_PY = Path(os.environ.get("AITC_BUILD_PY", "./aitc/languages/java/build.py"))
-UV = Path(os.environ.get("AITC_UV", "./aitc/bin/uv.linux"))
-PROJECT = os.environ.get("AITC_PROJECT", ".")
-
-REQUIRED_TOOLS = {"compile-pattern-set", "empty-pattern-set", "match-entry"}
+def fail(msg: str) -> None:
+    failures.append(msg)
+    print(f"FAIL: {msg}")
 
 
-class RpcClient:
-    def __init__(self, sock: socket.socket) -> None:
-        self.sock = sock
-        self.next_id = 1
-        self.buffer = b""
-
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        rpc_id = self.next_id
-        self.next_id += 1
-        message: dict[str, Any] = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
-        if params is not None:
-            message["params"] = params
-        self.sock.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
-
-        deadline = time.time() + 20
-        while b"\n" not in self.buffer:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"timed out waiting for {method}")
-            self.sock.settimeout(remaining)
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError(f"connection closed waiting for {method}")
-            self.buffer += chunk
-
-        line, _, self.buffer = self.buffer.partition(b"\n")
-        response = json.loads(line.decode("utf-8"))
-        if response.get("id") != rpc_id:
-            raise RuntimeError(f"response id mismatch for {method}: {response}")
-        return response
-
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.request("tools/call", {"name": name, "arguments": arguments})
+def ok(msg: str) -> None:
+    print(f"OK:   {msg}")
 
 
-def drain(stream: Any, sink: list[str]) -> None:
+def drain(stream, sink=None):
     for line in stream:
-        sink.append(line)
+        if sink is not None:
+            sink.append(line)
 
 
-def launch_mcp() -> tuple[subprocess.Popen[str], int, list[str], list[str]]:
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
+def launch_mcp() -> tuple[subprocess.Popen, int]:
     proc = subprocess.Popen(
-        [str(UV), "run", "--script", str(BUILD_PY), "launch-mcp", PROJECT],
+        [str(JAVA), "-jar", str(MCP_JAR)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
-    if proc.stdout is None or proc.stderr is None:
-        proc.terminate()
-        raise RuntimeError("MCP server pipes were not created")
+    stderr_buf: list[str] = []
+    threading.Thread(target=drain, args=(proc.stderr, stderr_buf), daemon=True).start()
 
+    stdout_buf: list[str] = []
     port = None
     deadline = time.time() + 30
     while time.time() < deadline and proc.poll() is None:
         line = proc.stdout.readline()
-        if not line:
-            continue
-        stdout_lines.append(line)
-        stripped = line.strip()
-        if stripped.startswith("MCP_PORT="):
-            port = int(stripped.split("=", 1)[1])
+        stdout_buf.append(line)
+        if line.startswith("MCP_PORT="):
+            port = int(line.strip().split("=", 1)[1])
             break
 
     if port is None:
         proc.terminate()
-        raise RuntimeError("MCP server did not advertise MCP_PORT")
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise RuntimeError(
+            "MCP server did not advertise MCP_PORT\n"
+            f"stdout: {''.join(stdout_buf)}\nstderr: {''.join(stderr_buf)}"
+        )
 
-    threading.Thread(target=drain, args=(proc.stdout, stdout_lines), daemon=True).start()
-    threading.Thread(target=drain, args=(proc.stderr, stderr_lines), daemon=True).start()
-    return proc, port, stdout_lines, stderr_lines
+    threading.Thread(target=drain, args=(proc.stdout,), daemon=True).start()
+    return proc, port
 
 
-def shutdown_mcp(proc: subprocess.Popen[str], port: int) -> None:
+def rpc_one(port: int, method: str, params=None) -> dict:
+    """Open a fresh connection, send one JSON-RPC request, read one response, close."""
+    msg: dict = {"jsonrpc": "2.0", "id": next(_rpc_id), "method": method}
+    if params is not None:
+        msg["params"] = params
+    payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(payload)
+        data = b""
+        deadline = time.time() + 10
+        while b"\n" not in data and time.time() < deadline:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    line, _, _ = data.partition(b"\n")
+    return json.loads(line.decode("utf-8"))
+
+
+def shutdown_mcp(proc: subprocess.Popen, port: int) -> None:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
-            RpcClient(sock).request("aitc/shutdown")
+        rpc_one(port, "aitc/shutdown")
     except Exception:
         pass
-
     try:
         proc.wait(timeout=5)
         return
     except subprocess.TimeoutExpired:
-        proc.terminate()
-
+        pass
+    proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=5)
+        proc.wait()
 
 
-def schema_props(tool: dict[str, Any]) -> dict[str, Any]:
-    schema = tool.get("inputSchema")
-    if not isinstance(schema, dict):
-        return {}
-    props = schema.get("properties")
-    return props if isinstance(props, dict) else {}
+def call_tool(port: int, name: str, arguments: dict) -> dict:
+    return rpc_one(port, "tools/call", {"name": name, "arguments": arguments})
 
 
-def source(pattern_text: str, source_name: str | None = "spec") -> dict[str, Any]:
-    value: dict[str, Any] = {"pattern_text": pattern_text}
-    if source_name is not None:
-        value["source_name"] = source_name
-    return value
-
-
-def entry(relative_path: str, kind: str = "regular_file") -> dict[str, str]:
-    return {"relative_path": relative_path, "kind": kind}
-
-
-def assert_equal(failures: list[str], label: str, actual: Any, expected: Any) -> None:
-    if actual != expected:
-        failures.append(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def expect_success(failures: list[str], label: str, response: dict[str, Any]) -> dict[str, Any]:
-    if "error" in response:
-        failures.append(f"{label}: expected success, got {response['error']}")
-        return {}
-    result = response.get("result")
-    if not isinstance(result, dict):
-        failures.append(f"{label}: expected object result, got {response}")
-        return {}
-    return result
-
-
-def error_text(response: dict[str, Any]) -> str:
-    error = response.get("error")
-    if not isinstance(error, dict):
-        return ""
-    parts: list[str] = []
-    if isinstance(error.get("message"), str):
-        parts.append(error["message"])
-    data = error.get("data")
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, str):
-                parts.append(f"{key}={value}")
-    elif isinstance(data, str):
-        parts.append(data)
-    return " ".join(parts)
-
-
-def expect_error_category(failures: list[str], label: str, response: dict[str, Any], category: str) -> None:
-    if not isinstance(response.get("error"), dict):
-        failures.append(f"{label}: expected {category} error, got {response}")
-        return
-    if category not in error_text(response):
-        failures.append(f"{label}: expected {category} in error message or data, got {response['error']}")
-    if "result" in response:
-        failures.append(f"{label}: error response must not include a partial result, got {response}")
-
-
-def result_id(result: dict[str, Any]) -> str | None:
-    for key in ("pattern_set_id", "patternSetId", "set_id", "setId", "matcher_id", "matcherId", "id"):
-        value = result.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def require_tools(failures: list[str], tools_result: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    tools = tools_result.get("tools")
-    if not isinstance(tools, list):
-        failures.append("01: tools/list result must contain a tools array")
-        return {}
-
-    by_name: dict[str, dict[str, Any]] = {}
-    names: list[str] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            failures.append(f"01: tool entry must be an object, got {tool!r}")
-            continue
-        name = tool.get("name")
-        if not isinstance(name, str):
-            failures.append(f"01: tool name must be a string, got {tool!r}")
-            continue
-        names.append(name)
-        by_name[name] = tool
-
-    missing = sorted(REQUIRED_TOOLS - set(names))
-    if missing:
-        failures.append(f"01: missing required public API tools: {', '.join(missing)}")
-    return by_name
-
-
-def compile_args(tool: dict[str, Any], pattern_text: str, source_name: str | None = "spec") -> dict[str, Any]:
-    src = source(pattern_text, source_name)
-    props = schema_props(tool)
-    if "input" in props and "source" not in props and "pattern_text" not in props:
-        return {"input": {"source": src}}
-    if "pattern_text" in props:
-        return src
-    return {"source": src}
-
-
-def match_args(tool: dict[str, Any], pattern_set_id: str, path_entry: dict[str, str]) -> dict[str, Any]:
-    props = schema_props(tool)
-    id_key = "pattern_set_id"
-    for candidate in ("pattern_set_id", "patternSetId", "set_id", "setId", "matcher_id", "matcherId", "id"):
-        if candidate in props:
-            id_key = candidate
-            break
-    payload = {id_key: pattern_set_id, "entry": path_entry}
-    if "input" in props and id_key not in props and "entry" not in props:
-        return {"input": payload}
-    return payload
-
-
-def compile_pattern_set(
-    rpc: RpcClient,
-    tools: dict[str, dict[str, Any]],
-    failures: list[str],
-    label: str,
-    pattern_text: str,
-    source_name: str | None = "spec",
-) -> str | None:
-    response = rpc.call_tool("compile-pattern-set", compile_args(tools.get("compile-pattern-set", {}), pattern_text, source_name))
-    result = expect_success(failures, label, response)
-    pattern_set_id = result_id(result)
-    if pattern_set_id is None:
-        failures.append(f"{label}: result must include a pattern set id string, got {result}")
-    return pattern_set_id
-
-
-def empty_pattern_set(
-    rpc: RpcClient,
-    failures: list[str],
-    label: str,
-) -> str | None:
-    result = expect_success(failures, label, rpc.call_tool("empty-pattern-set", {}))
-    pattern_set_id = result_id(result)
-    if pattern_set_id is None:
-        failures.append(f"{label}: result must include a pattern set id string, got {result}")
-    return pattern_set_id
-
-
-def match_entry(
-    rpc: RpcClient,
-    tools: dict[str, dict[str, Any]],
-    failures: list[str],
-    label: str,
-    pattern_set_id: str | None,
-    path_entry: dict[str, str],
-) -> dict[str, Any]:
-    if pattern_set_id is None:
-        failures.append(f"{label}: cannot match because pattern set id was missing")
-        return {}
-    result = expect_success(
-        failures,
-        label,
-        rpc.call_tool("match-entry", match_args(tools.get("match-entry", {}), pattern_set_id, path_entry)),
-    )
-    nested = result.get("match")
-    return nested if isinstance(nested, dict) else result
-
-
-def assert_match(
-    failures: list[str],
-    label: str,
-    actual: dict[str, Any],
-    *,
-    decision: str,
-    negated: bool,
-    pattern: str | None = None,
-    source_name: str | None = None,
-    line_number: int | None = None,
-) -> None:
-    assert_equal(failures, f"{label} decision", actual.get("decision"), decision)
-    assert_equal(failures, f"{label} negated", actual.get("negated"), negated)
-    if decision == "none":
-        for key in ("pattern", "source_name", "sourceName", "line_number", "lineNumber"):
-            if key in actual and actual.get(key) is not None:
-                failures.append(f"{label}: decision=none must not include {key}, got {actual}")
-        return
-    if pattern is not None:
-        assert_equal(failures, f"{label} pattern", actual.get("pattern"), pattern)
-    if source_name is not None:
-        actual_source = actual.get("source_name", actual.get("sourceName"))
-        assert_equal(failures, f"{label} source_name", actual_source, source_name)
-    if line_number is not None:
-        actual_line = actual.get("line_number", actual.get("lineNumber"))
-        assert_equal(failures, f"{label} line_number", actual_line, line_number)
-
-
-def run_concurrent_matches(
-    port: int,
-    tools: dict[str, dict[str, Any]],
-    pattern_set_id: str | None,
-    failures: list[str],
-) -> None:
-    if pattern_set_id is None:
-        failures.append("08 concurrent match: pattern set id was missing")
-        return
-
-    cases = [
-        (entry("app.log"), "ignore", False, "*.log"),
-        (entry("important.log"), "include", True, "!important.log"),
-        (entry("src/main.txt"), "none", False, None),
-        (entry("src/build/out.bin", "special"), "ignore", False, "build/"),
-    ]
-    thread_failures: list[str] = []
-    lock = threading.Lock()
-
-    def worker(index: int) -> None:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-                rpc = RpcClient(sock)
-                local_failures: list[str] = []
-                for iteration in range(25):
-                    path_entry, decision, negated, pattern = cases[(index + iteration) % len(cases)]
-                    actual = match_entry(
-                        rpc,
-                        tools,
-                        local_failures,
-                        f"08 thread {index} iter {iteration}",
-                        pattern_set_id,
-                        path_entry,
-                    )
-                    if actual.get("decision") != decision or actual.get("negated") != negated:
-                        local_failures.append(
-                            "08 concurrent match: "
-                            f"thread {index} iter {iteration} expected "
-                            f"decision={decision} negated={negated}, got {actual}"
-                        )
-                    if pattern is not None and actual.get("pattern") != pattern:
-                        local_failures.append(
-                            f"08 concurrent match: thread {index} iter {iteration} expected pattern {pattern!r}, got {actual}"
-                        )
-                with lock:
-                    thread_failures.extend(local_failures)
-        except Exception as exc:
-            with lock:
-                thread_failures.append(f"08 concurrent match: thread {index} raised {exc!r}")
-
-    threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=15)
-        if thread.is_alive():
-            failures.append("08 concurrent match: worker thread did not finish")
-
-    failures.extend(thread_failures)
-
-
-def main() -> int:
-    proc: subprocess.Popen[str] | None = None
-    port = 0
+def parse_result(resp: dict) -> tuple[dict | None, str | None]:
+    """Return (data, error_category). error_category is None on success."""
+    if "error" in resp:
+        return None, f"rpc_error:{resp['error'].get('message', str(resp['error']))}"
+    result = resp.get("result", {})
+    content = result.get("content", [])
+    if not content:
+        return result, None
     try:
-        proc, port, stdout_lines, stderr_lines = launch_mcp()
-        failures: list[str] = []
-        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-            rpc = RpcClient(sock)
+        data = json.loads(content[0].get("text", "{}"))
+    except json.JSONDecodeError:
+        data = {"_raw": content[0].get("text", "")}
+    if result.get("isError"):
+        return data, data.get("error", "tool_error")
+    if isinstance(data, dict) and "error" in data:
+        return data, data["error"]
+    return data, None
 
-            time.sleep(0.1)
-            stdout_before = len(stdout_lines)
-            stderr_before = len(stderr_lines)
 
-            tools_result = expect_success(failures, "01 tools/list", rpc.request("tools/list"))
-            tools = require_tools(failures, tools_result)
-            print(f"[01] tools/list exposed {len(tools_result.get('tools', []))} tool(s)")
+def compile_set(port: int, pattern_text: str, source_name: str | None = None) -> tuple[dict | None, str | None]:
+    args: dict = {"pattern_text": pattern_text}
+    if source_name is not None:
+        args["source_name"] = source_name
+    return parse_result(call_tool(port, "compile", args))
 
-            pattern_text = "\n".join(
-                [
-                    "# comment",
-                    "",
-                    r"\#literal",
-                    r"\!literal",
-                    r"name\ ",
-                    "plain-space   ",
-                    "*.log",
-                    "!important.log",
-                    "src/?ain.[ch]",
-                    "[ab]rack.txt",
-                    "[!0-9]ode.txt",
-                    "/root-only.txt",
-                    "docs/*.md",
-                    "build/",
-                    "**/tmp/**",
-                    "assets/**",
-                    "a/**/b.txt",
-                    "foo***bar",
-                    "range-[a-z].txt",
-                    "*.LOG",
-                    "ordered.txt",
-                    "!ordered.txt",
-                    "ordered.*",
-                    "mid#hash",
-                    "zero*.txt",
-                    "br/[ab]tail.txt",
-                ]
-            )
-            pattern_set = compile_pattern_set(rpc, tools, failures, "02 compile pattern set", pattern_text, "spec")
-            pattern_cases = [
-                ("02 escaped #", entry("#literal"), "ignore", False, r"\#literal", 3),
-                ("02 escaped !", entry("!literal"), "ignore", False, r"\!literal", 4),
-                ("02 escaped trailing space", entry("name "), "ignore", False, r"name\ ", 5),
-                ("02 unescaped trailing spaces", entry("plain-space"), "ignore", False, None, 6),
-                ("02 basename star root", entry("app.log"), "ignore", False, "*.log", 7),
-                ("02 basename star nested", entry("logs/app.log"), "ignore", False, "*.log", 7),
-                ("02 negation overrides", entry("important.log"), "include", True, "!important.log", 8),
-                ("02 question and bracket", entry("src/main.c"), "ignore", False, "src/?ain.[ch]", 9),
-                ("02 bracket set", entry("brack.txt"), "ignore", False, "[ab]rack.txt", 10),
-                ("02 bracket negation", entry("code.txt"), "ignore", False, "[!0-9]ode.txt", 11),
-                ("02 leading slash anchors", entry("root-only.txt"), "ignore", False, "/root-only.txt", 12),
-                ("02 interior slash", entry("docs/readme.md"), "ignore", False, "docs/*.md", 13),
-                ("02 directory pattern directory", entry("src/build", "directory"), "ignore", False, "build/", 14),
-                ("02 directory pattern descendant file", entry("src/build/out.bin"), "ignore", False, "build/", 14),
-                ("02 directory pattern descendant symlink", entry("build/link", "symlink"), "ignore", False, "build/", 14),
-                ("02 start and end double-star root", entry("tmp/cache.bin"), "ignore", False, "**/tmp/**", 15),
-                ("02 start and end double-star nested", entry("src/tmp/cache.bin"), "ignore", False, "**/tmp/**", 15),
-                ("02 end double-star", entry("assets/icons/logo.png"), "ignore", False, "assets/**", 16),
-                ("02 middle double-star shallow", entry("a/b.txt"), "ignore", False, "a/**/b.txt", 17),
-                ("02 middle double-star deep", entry("a/x/y/b.txt"), "ignore", False, "a/**/b.txt", 17),
-                ("02 consecutive stars", entry("foobazbar"), "ignore", False, "foo***bar", 18),
-                ("02 bracket range", entry("range-m.txt"), "ignore", False, "range-[a-z].txt", 19),
-                ("02 case-sensitive uppercase pattern", entry("app.LOG"), "ignore", False, "*.LOG", 20),
-                ("02 later matching pattern wins", entry("ordered.txt"), "ignore", False, "ordered.*", 23),
-                ("02 interior hash literal", entry("mid#hash"), "ignore", False, "mid#hash", 24),
-                ("02 star matches zero characters", entry("zero.txt"), "ignore", False, "zero*.txt", 25),
-                ("02 bracket matches one character", entry("br/atail.txt"), "ignore", False, "br/[ab]tail.txt", 26),
+
+def empty_set(port: int) -> tuple[dict | None, str | None]:
+    return parse_result(call_tool(port, "empty", {}))
+
+
+def match_entry(port: int, set_id: str, relative_path: str, kind: str) -> tuple[dict | None, str | None]:
+    return parse_result(call_tool(port, "match", {
+        "id": set_id,
+        "relative_path": relative_path,
+        "kind": kind,
+    }))
+
+
+def get_id(data: dict | None, label: str) -> str | None:
+    if data is None:
+        fail(f"{label}: result is None")
+        return None
+    sid = data.get("id")
+    if sid is None:
+        fail(f"{label}: no 'id' in result {data!r}")
+    return sid
+
+
+def check_match(
+    port: int,
+    set_id: str,
+    path: str,
+    kind: str,
+    expected_decision: str,
+    label: str,
+    *,
+    expected_pattern: str | None = None,
+    expected_negated: bool | None = None,
+    expected_line: int | None = None,
+    expected_source: str | None = None,
+) -> None:
+    data, err = match_entry(port, set_id, path, kind)
+    if err:
+        fail(f"{label}: unexpected error {err!r}")
+        return
+    decision = data.get("decision") if data else None
+    if decision != expected_decision:
+        fail(f"{label}: expected decision={expected_decision!r}, got {decision!r} data={data!r}")
+        return
+    ok(f"{label}: decision={decision!r}")
+    if data is None:
+        return
+    negated = data.get("negated", False)
+    expected_neg = expected_negated if expected_negated is not None else (expected_decision == "include")
+    if negated != expected_neg:
+        fail(f"{label}: expected negated={expected_neg}, got {negated!r}")
+    if expected_pattern is not None and data.get("pattern") != expected_pattern:
+        fail(f"{label}: expected pattern={expected_pattern!r}, got {data.get('pattern')!r}")
+    if expected_line is not None and data.get("line_number") != expected_line:
+        fail(f"{label}: expected line_number={expected_line}, got {data.get('line_number')!r}")
+    if expected_source is not None and data.get("source_name") != expected_source:
+        fail(f"{label}: expected source_name={expected_source!r}, got {data.get('source_name')!r}")
+    if expected_decision == "none":
+        if data.get("negated", False):
+            fail(f"{label}: negated must be False for none decision")
+        for field in ("pattern", "line_number", "source_name"):
+            if data.get(field) is not None:
+                fail(f"{label}: {field} must be absent for none decision, got {data[field]!r}")
+
+
+def run_tests(port: int) -> None:
+
+    # --- empty(): every valid path returns none ---
+    data, err = empty_set(port)
+    if err:
+        fail(f"empty(): error {err!r}")
+    else:
+        sid = get_id(data, "empty()")
+        if sid:
+            check_match(port, sid, "anything.txt", "regular_file", "none", "empty: regular_file")
+            check_match(port, sid, "a/b/c", "directory", "none", "empty: directory")
+
+    # --- basic patterns (spec example): *.log, build/, !important.log ---
+    # Verifies: basename wildcard, trailing-slash dir pattern, negation,
+    # source_name and line_number in result, negated flag, pattern field.
+    data, err = compile_set(port, "*.log\nbuild/\n!important.log\n", source_name="basic")
+    if err:
+        fail(f"compile basic: error {err!r}")
+    else:
+        sid = get_id(data, "compile basic")
+        if sid:
+            check_match(port, sid, "app.log", "regular_file", "ignore", "basic: app.log",
+                        expected_pattern="*.log", expected_line=1, expected_negated=False,
+                        expected_source="basic")
+            check_match(port, sid, "important.log", "regular_file", "include",
+                        "basic: important.log negation",
+                        expected_pattern="!important.log", expected_line=3, expected_negated=True,
+                        expected_source="basic")
+            check_match(port, sid, "src/build", "directory", "ignore", "basic: src/build dir",
+                        expected_pattern="build/", expected_line=2)
+            check_match(port, sid, "src/build/out.bin", "regular_file", "ignore",
+                        "basic: descendant of src/build",
+                        expected_pattern="build/", expected_line=2)
+            check_match(port, sid, "src/main.txt", "regular_file", "none", "basic: unmatched path")
+            # pattern without / matches basename at any depth
+            check_match(port, sid, "sub/dir/app.log", "regular_file", "ignore",
+                        "basic: *.log matches basename at any depth",
+                        expected_pattern="*.log", expected_line=1, expected_source="basic")
+
+    # --- parsing: blank lines, comments, escaped #/!, escaped trailing space, line_number ---
+    # line 1: blank, line 2: comment, line 3: \#literal, line 4: \!literal, line 5: name\<space>
+    data, err = compile_set(port, "\n# comment\n\\#literal\n\\!literal\nname\\ \n")
+    if err:
+        fail(f"compile parse: error {err!r}")
+    else:
+        sid = get_id(data, "compile parse")
+        if sid:
+            check_match(port, sid, "#literal", "regular_file", "ignore",
+                        "parse: escaped # matches literal",
+                        expected_pattern="\\#literal", expected_line=3)
+            check_match(port, sid, "!literal", "regular_file", "ignore",
+                        "parse: escaped ! matches literal",
+                        expected_pattern="\\!literal", expected_line=4)
+            check_match(port, sid, "name ", "regular_file", "ignore",
+                        "parse: escaped trailing space matches",
+                        expected_pattern="name\\ ", expected_line=5)
+            check_match(port, sid, "name", "regular_file", "none",
+                        "parse: name without trailing space no match")
+
+    # --- anchoring and double-star (spec example) ---
+    data, err = compile_set(port, "/docs/*.md\n**/tmp/**\n")
+    if err:
+        fail(f"compile anchor: error {err!r}")
+    else:
+        sid = get_id(data, "compile anchor")
+        if sid:
+            check_match(port, sid, "docs/readme.md", "regular_file", "ignore",
+                        "anchor: /docs/*.md matches root",
+                        expected_pattern="/docs/*.md", expected_line=1)
+            check_match(port, sid, "src/docs/readme.md", "regular_file", "none",
+                        "anchor: leading / anchors to root only")
+            check_match(port, sid, "tmp/cache.bin", "regular_file", "ignore",
+                        "anchor: **/tmp/** at root level",
+                        expected_pattern="**/tmp/**", expected_line=2)
+            check_match(port, sid, "src/tmp/cache.bin", "regular_file", "ignore",
+                        "anchor: **/tmp/** nested",
+                        expected_pattern="**/tmp/**", expected_line=2)
+
+    # --- ? wildcard ---
+    data, err = compile_set(port, "?.txt\n")
+    if err:
+        fail(f"compile ?: error {err!r}")
+    else:
+        sid = get_id(data, "compile ?")
+        if sid:
+            check_match(port, sid, "a.txt", "regular_file", "ignore", "?: single char matches")
+            check_match(port, sid, "ab.txt", "regular_file", "none", "?: two chars no match")
+            check_match(port, sid, ".txt", "regular_file", "none", "?: zero chars no match")
+
+    # --- bracket expressions: [abc], [0-9], [!0-9] ---
+    data, err = compile_set(port, "[abc].txt\n[0-9].log\n[!0-9].cfg\n")
+    if err:
+        fail(f"compile bracket: error {err!r}")
+    else:
+        sid = get_id(data, "compile bracket")
+        if sid:
+            check_match(port, sid, "a.txt", "regular_file", "ignore", "bracket [abc]: a")
+            check_match(port, sid, "c.txt", "regular_file", "ignore", "bracket [abc]: c")
+            check_match(port, sid, "d.txt", "regular_file", "none", "bracket [abc]: d no match")
+            check_match(port, sid, "5.log", "regular_file", "ignore", "bracket [0-9]: digit")
+            check_match(port, sid, "a.log", "regular_file", "none", "bracket [0-9]: letter no match")
+            check_match(port, sid, "a.cfg", "regular_file", "ignore", "bracket [!0-9]: non-digit")
+            check_match(port, sid, "5.cfg", "regular_file", "none", "bracket [!0-9]: digit no match")
+
+    # --- pattern order: last matching pattern wins; negation overrides earlier ignore ---
+    data, err = compile_set(port, "*.txt\n!a.txt\n")
+    if err:
+        fail(f"compile order: error {err!r}")
+    else:
+        sid = get_id(data, "compile order")
+        if sid:
+            check_match(port, sid, "a.txt", "regular_file", "include",
+                        "order: negation overrides earlier ignore",
+                        expected_negated=True, expected_line=2)
+            check_match(port, sid, "b.txt", "regular_file", "ignore",
+                        "order: non-negated still applies", expected_line=1)
+
+    # --- directory-only patterns: dir and descendants matched; non-dir at same path is NOT matched ---
+    data, err = compile_set(port, "build/\n")
+    if err:
+        fail(f"compile dir-only: error {err!r}")
+    else:
+        sid = get_id(data, "compile dir-only")
+        if sid:
+            check_match(port, sid, "build", "directory", "ignore",
+                        "dir-only: directory at path", expected_pattern="build/")
+            check_match(port, sid, "build", "regular_file", "none",
+                        "dir-only: regular_file at same path NOT matched")
+            check_match(port, sid, "build", "symlink", "none",
+                        "dir-only: symlink at same path NOT matched")
+            check_match(port, sid, "build/out.bin", "regular_file", "ignore",
+                        "dir-only: descendant regular_file", expected_pattern="build/")
+            check_match(port, sid, "build/sub", "directory", "ignore",
+                        "dir-only: descendant directory", expected_pattern="build/")
+            # basename pattern (no interior slash) matches at any depth
+            check_match(port, sid, "src/build", "directory", "ignore",
+                        "dir-only: nested dir any depth")
+            check_match(port, sid, "src/build/out.bin", "regular_file", "ignore",
+                        "dir-only: nested descendant")
+
+    # --- symlink and special entries have no built-in exclusion -- matched by path syntax ---
+    data, err = compile_set(port, "*.so\n")
+    if err:
+        fail(f"compile symlink/special: error {err!r}")
+    else:
+        sid = get_id(data, "compile symlink/special")
+        if sid:
+            check_match(port, sid, "lib.so", "symlink", "ignore",
+                        "symlink: matched by path syntax")
+            check_match(port, sid, "dev.so", "special", "ignore",
+                        "special: matched by path syntax")
+            check_match(port, sid, "lib.txt", "symlink", "none",
+                        "symlink: no match on unmatched path")
+
+    # --- malformed bracket expression treated as literal text ---
+    data, err = compile_set(port, "[abc\n")
+    if err:
+        fail(f"compile malformed bracket: error {err!r}")
+    else:
+        sid = get_id(data, "compile malformed bracket")
+        if sid:
+            check_match(port, sid, "[abc", "regular_file", "ignore",
+                        "malformed bracket: literal match")
+            check_match(port, sid, "a", "regular_file", "none",
+                        "malformed bracket: no fuzzy match")
+
+    # --- case-sensitive matching ---
+    data, err = compile_set(port, "UPPER.LOG\n")
+    if err:
+        fail(f"compile case: error {err!r}")
+    else:
+        sid = get_id(data, "compile case")
+        if sid:
+            check_match(port, sid, "UPPER.LOG", "regular_file", "ignore",
+                        "case: exact case matches")
+            check_match(port, sid, "upper.log", "regular_file", "none",
+                        "case: different case no match")
+
+    # --- source_name absent from result when not supplied to compile ---
+    data, err = compile_set(port, "*.txt\n")
+    if err:
+        fail(f"compile no-source: error {err!r}")
+    else:
+        sid = get_id(data, "compile no-source")
+        if sid:
+            d, e = match_entry(port, sid, "a.txt", "regular_file")
+            if e:
+                fail(f"no-source match: error {e!r}")
+            elif d and d.get("decision") == "ignore":
+                ok("no-source: decision=ignore")
+                if d.get("source_name") is not None:
+                    fail(f"no-source: source_name should be absent, got {d.get('source_name')!r}")
+                else:
+                    ok("no-source: source_name absent")
+            else:
+                fail(f"no-source: expected ignore, got {d!r}")
+
+    # --- ** forms ---
+    # **/foo.txt: matches zero or more leading dirs
+    data, err = compile_set(port, "**/foo.txt\n")
+    if err:
+        fail(f"compile **/: error {err!r}")
+    else:
+        sid = get_id(data, "compile **/")
+        if sid:
+            check_match(port, sid, "foo.txt", "regular_file", "ignore", "**: zero dirs")
+            check_match(port, sid, "a/foo.txt", "regular_file", "ignore", "**: one dir")
+            check_match(port, sid, "a/b/foo.txt", "regular_file", "ignore", "**: two dirs")
+
+    # src/**: matches everything inside src/
+    data, err = compile_set(port, "src/**\n")
+    if err:
+        fail(f"compile /**: error {err!r}")
+    else:
+        sid = get_id(data, "compile /**")
+        if sid:
+            check_match(port, sid, "src/a.txt", "regular_file", "ignore", "/**: direct child")
+            check_match(port, sid, "src/a/b.txt", "regular_file", "ignore", "/**: nested")
+            check_match(port, sid, "other/a.txt", "regular_file", "none", "/**: different root no match")
+
+    # a/**/b.txt: zero or more intermediate dirs
+    data, err = compile_set(port, "a/**/b.txt\n")
+    if err:
+        fail(f"compile /**/: error {err!r}")
+    else:
+        sid = get_id(data, "compile /**/")
+        if sid:
+            check_match(port, sid, "a/b.txt", "regular_file", "ignore", "/**/: zero intermediate dirs")
+            check_match(port, sid, "a/x/b.txt", "regular_file", "ignore", "/**/: one intermediate dir")
+            check_match(port, sid, "a/x/y/b.txt", "regular_file", "ignore", "/**/: two intermediate dirs")
+            check_match(port, sid, "c/b.txt", "regular_file", "none", "/**/: wrong root no match")
+
+    # --- interior slash makes pattern root-relative ---
+    data, err = compile_set(port, "src/*.txt\n")
+    if err:
+        fail(f"compile interior slash: error {err!r}")
+    else:
+        sid = get_id(data, "compile interior slash")
+        if sid:
+            check_match(port, sid, "src/a.txt", "regular_file", "ignore",
+                        "interior slash: root-relative match")
+            check_match(port, sid, "other/src/a.txt", "regular_file", "none",
+                        "interior slash: not at root no match")
+
+    # --- invalid paths report invalid_path error ---
+    data, err = compile_set(port, "*.txt\n")
+    if err:
+        fail(f"compile for invalid-path tests: error {err!r}")
+    else:
+        sid = get_id(data, "compile for invalid-path tests")
+        if sid:
+            invalid_cases = [
+                ("", "regular_file", "empty path"),
+                ("/abs", "regular_file", "leading slash"),
+                ("dir/", "regular_file", "trailing slash"),
+                ("a/../b", "regular_file", "dotdot segment"),
+                ("a/./b", "regular_file", "dot segment"),
+                ("a//b", "regular_file", "empty segment"),
+                ("a\\b", "regular_file", "backslash in path"),
+                ("a\x00b", "regular_file", "NUL in path"),
             ]
-            for label, path_entry, decision, negated, pattern, line_number in pattern_cases:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, pattern_set, path_entry),
-                    decision=decision,
-                    negated=negated,
-                    pattern=pattern,
-                    source_name="spec",
-                    line_number=line_number,
-                )
-            none_cases = [
-                ("02 comments ignored", entry("# comment")),
-                ("02 blank lines ignored", entry("blank")),
-                ("02 escaped trailing space does not match trimmed", entry("name")),
-                ("02 anchored pattern excludes nested path", entry("sub/root-only.txt")),
-                ("02 slash pattern is root-relative", entry("src/docs/readme.md")),
-                ("02 interior slash excludes deeper path", entry("docs/nested/readme.md")),
-                ("02 question mark requires one character", entry("src/ain.c")),
-                ("02 question mark does not match slash", entry("src/x/ain.c")),
-                ("02 bracket expression does not match slash", entry("br/a/tail.txt")),
-                ("02 directory-only does not match file at same path", entry("build")),
-                ("02 symlink has no directory behavior at same path", entry("build", "symlink")),
-                ("02 special has no directory behavior at same path", entry("build", "special")),
-                ("02 matching is case-sensitive", entry("app.Log")),
-            ]
-            for label, path_entry in none_cases:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, pattern_set, path_entry),
-                    decision="none",
-                    negated=False,
-                )
-            print("[02] pattern parsing, precedence, metadata, and wildcard semantics exercised")
+            for path, kind, label in invalid_cases:
+                d, e = match_entry(port, sid, path, kind)
+                if e == "invalid_path":
+                    ok(f"invalid_path: {label}")
+                elif e:
+                    fail(f"invalid_path {label}: wrong error category {e!r}")
+                else:
+                    fail(f"invalid_path {label}: expected error, got decision={d.get('decision') if d else None!r}")
 
-            empty_set = empty_pattern_set(rpc, failures, "03 empty pattern set")
-            for label, path_entry in [
-                ("03 empty regular file", entry("app.log")),
-                ("03 empty directory", entry("build", "directory")),
-                ("03 empty symlink", entry("link", "symlink")),
-                ("03 empty special", entry("device", "special")),
-            ]:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, empty_set, path_entry),
-                    decision="none",
-                    negated=False,
-                )
-            no_source_set = compile_pattern_set(rpc, tools, failures, "03 compile without source name", "*.txt\n", None)
-            no_source_match = match_entry(rpc, tools, failures, "03 match without source name", no_source_set, entry("note.txt"))
-            assert_match(
-                failures,
-                "03 source name absent when omitted",
-                no_source_match,
-                decision="ignore",
-                negated=False,
-                pattern="*.txt",
-                line_number=1,
+    # --- NUL in pattern_text -> invalid_pattern_text, no partial result ---
+    data, err = compile_set(port, "*.txt\x00bad\n")
+    if err == "invalid_pattern_text":
+        ok("invalid_pattern_text: NUL in pattern_text rejected")
+        if data and data.get("id") is not None:
+            fail("invalid_pattern_text: error response must not include a partial pattern set id")
+    elif err:
+        fail(f"invalid_pattern_text: wrong error category {err!r}")
+    else:
+        fail("invalid_pattern_text: expected error for NUL in pattern_text, got none")
+
+    # --- concurrent match: compiled set is safe for concurrent calls to match ---
+    # not reasonably testable: public operations do not emit stdout or stderr
+    # (MCP wrapper startup output is indistinguishable from library output via socket)
+    data, err = compile_set(port, "*.log\n!important.log\n")
+    if err:
+        fail(f"compile concurrent: error {err!r}")
+    else:
+        sid = get_id(data, "compile concurrent")
+        if sid:
+            conc: list[tuple[str | None, str | None]] = []
+            lock = threading.Lock()
+
+            def concurrent_match(path: str) -> None:
+                try:
+                    d, e = match_entry(port, sid, path, "regular_file")
+                    decision = d.get("decision") if d else None
+                    with lock:
+                        conc.append((decision, e))
+                except Exception as ex:
+                    with lock:
+                        conc.append((None, str(ex)))
+
+            threads = (
+                [threading.Thread(target=concurrent_match, args=("app.log",)) for _ in range(6)]
+                + [threading.Thread(target=concurrent_match, args=("important.log",)) for _ in range(6)]
             )
-            for key in ("source_name", "sourceName"):
-                if key in no_source_match and no_source_match.get(key) is not None:
-                    failures.append(f"03 source name absent when omitted: {key} must be absent, got {no_source_match}")
-            print("[03] empty pattern set returns none for valid paths")
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
 
-            dir_only = compile_pattern_set(rpc, tools, failures, "04 compile directory-only set", "build/\n", "dir")
-            for label, path_entry, decision in [
-                ("04 directory path matches directory", entry("build", "directory"), "ignore"),
-                ("04 nested directory path matches directory", entry("src/build", "directory"), "ignore"),
-                ("04 descendant regular file matches", entry("build/out.bin"), "ignore"),
-                ("04 descendant symlink matches", entry("src/build/link", "symlink"), "ignore"),
-                ("04 descendant special matches", entry("src/build/socket", "special"), "ignore"),
-                ("04 regular file same path does not match", entry("build", "regular_file"), "none"),
-                ("04 symlink same path does not match", entry("build", "symlink"), "none"),
-                ("04 special same path does not match", entry("build", "special"), "none"),
-            ]:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, dir_only, path_entry),
-                    decision=decision,
-                    negated=False,
-                    pattern="build/" if decision == "ignore" else None,
-                    source_name="dir" if decision == "ignore" else None,
-                    line_number=1 if decision == "ignore" else None,
+            # results arrive in arbitrary order; check counts not positions
+            ignore_count = sum(1 for dec, e in conc if dec == "ignore" and e is None)
+            include_count = sum(1 for dec, e in conc if dec == "include" and e is None)
+            errors = [(dec, e) for dec, e in conc if e is not None]
+            if len(conc) == 12 and ignore_count == 6 and include_count == 6 and not errors:
+                ok("concurrent: 12 simultaneous match calls returned correct decisions")
+            else:
+                fail(
+                    f"concurrent: expected 6 ignore + 6 include, "
+                    f"got ignore={ignore_count} include={include_count} "
+                    f"errors={errors} total={len(conc)}"
                 )
-            print("[04] directory-only patterns distinguish matched directories from non-directories")
 
-            literal_brackets = compile_pattern_set(rpc, tools, failures, "05 compile malformed bracket set", "[abc\nfile[.txt\n", "bad-bracket")
-            for label, path_entry, pattern, line_number in [
-                ("05 malformed bracket literal 1", entry("[abc"), "[abc", 1),
-                ("05 malformed bracket literal 2", entry("file[.txt"), "file[.txt", 2),
-            ]:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, literal_brackets, path_entry),
-                    decision="ignore",
-                    negated=False,
-                    pattern=pattern,
-                    source_name="bad-bracket",
-                    line_number=line_number,
-                )
-            print("[05] malformed bracket expressions are literal patterns")
 
-            no_builtin = compile_pattern_set(rpc, tools, failures, "06 compile syntax-only set", "*.tmp\n", "plain")
-            for label, path_entry, decision, pattern in [
-                ("06 symlink matched by path syntax", entry("link.tmp", "symlink"), "ignore", "*.tmp"),
-                ("06 special matched by path syntax", entry("socket.tmp", "special"), "ignore", "*.tmp"),
-                ("06 symlink has no automatic exclusion", entry("link", "symlink"), "none", None),
-                ("06 special has no automatic exclusion", entry("socket", "special"), "none", None),
-            ]:
-                assert_match(
-                    failures,
-                    label,
-                    match_entry(rpc, tools, failures, label, no_builtin, path_entry),
-                    decision=decision,
-                    negated=False,
-                    pattern=pattern,
-                    source_name="plain" if pattern else None,
-                    line_number=1 if pattern else None,
-                )
-            print("[06] symlink and special entries are path-syntax matches only")
-
-            invalid_path_set = compile_pattern_set(rpc, tools, failures, "07 compile invalid-path set", "*.log\n", "invalid")
-            invalid_paths = [
-                ("07 empty path", entry("")),
-                ("07 leading slash", entry("/abs")),
-                ("07 trailing slash", entry("dir/")),
-                ("07 empty segment", entry("a//b")),
-                ("07 dot segment", entry("a/./b")),
-                ("07 dotdot segment", entry("a/../b")),
-                ("07 backslash", entry(r"a\b")),
-                ("07 nul path", entry("a\0b")),
-            ]
-            for label, path_entry in invalid_paths:
-                response = rpc.call_tool(
-                    "match-entry",
-                    match_args(tools.get("match-entry", {}), invalid_path_set or "missing", path_entry),
-                )
-                expect_error_category(failures, label, response, "invalid_path")
-
-            nul_response = rpc.call_tool(
-                "compile-pattern-set",
-                compile_args(tools.get("compile-pattern-set", {}), "ok\nbad\0pattern\n", "nul"),
-            )
-            expect_error_category(failures, "07 nul-containing pattern text", nul_response, "invalid_pattern_text")
-            # Text that the host language API cannot represent is not reasonably testable through JSON-RPC.
-            print("[07] invalid paths and NUL pattern text report required error categories")
-
-            run_concurrent_matches(port, tools, pattern_set, failures)
-            before = match_entry(rpc, tools, failures, "08 immutable before extra compile", pattern_set, entry("important.log"))
-            other = compile_pattern_set(rpc, tools, failures, "08 compile independent set", "!important.log\n*.log\n", "other")
-            after = match_entry(rpc, tools, failures, "08 immutable after extra compile", pattern_set, entry("important.log"))
-            changed = match_entry(rpc, tools, failures, "08 independent set has own order", other, entry("important.log"))
-            assert_match(failures, "08 original before", before, decision="include", negated=True, pattern="!important.log", source_name="spec", line_number=8)
-            assert_match(failures, "08 original after", after, decision="include", negated=True, pattern="!important.log", source_name="spec", line_number=8)
-            assert_match(failures, "08 independent order", changed, decision="ignore", negated=False, pattern="*.log", source_name="other", line_number=2)
-            # Cross-operating-system determinism is not reasonably testable from one test process.
-            print("[08] compiled pattern sets are immutable, deterministic, and concurrent-match safe")
-
-            time.sleep(0.1)
-            if len(stdout_lines) != stdout_before:
-                failures.append(f"09 public operations wrote to stdout: {stdout_lines[stdout_before:]!r}")
-            if len(stderr_lines) != stderr_before:
-                failures.append(f"09 public operations wrote to stderr: {stderr_lines[stderr_before:]!r}")
-            print("[09] public operations did not emit stdout or stderr")
-
-            if failures:
-                print("\nFAILURES:")
-                for failure in failures:
-                    print(f"  - {failure}")
-                return 1
-
-            print("\nAll assertions passed.")
-            return 0
+def main() -> None:
+    proc, port = launch_mcp()
+    try:
+        run_tests(port)
     finally:
-        if proc is not None:
-            shutdown_mcp(proc, port)
+        shutdown_mcp(proc, port)
+
+    if failures:
+        print(f"\n{len(failures)} failure(s):")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
+    print("\nAll checks passed.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

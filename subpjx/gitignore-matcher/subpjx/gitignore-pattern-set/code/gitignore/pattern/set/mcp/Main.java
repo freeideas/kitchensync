@@ -127,13 +127,13 @@ public final class Main {
         }
         try {
             return switch (name) {
-                case "compile-pattern-set" -> result(id, compilePatternSet(arguments));
-                case "empty-pattern-set" -> result(id, emptyPatternSet(arguments));
-                case "match-entry" -> result(id, matchEntry(arguments));
+                case "compile" -> result(id, compilePatternSet(arguments));
+                case "empty" -> result(id, emptyPatternSet(arguments));
+                case "match" -> result(id, matchEntry(arguments));
                 default -> error(id, -32000, "unknown tool: " + name);
             };
         } catch (GitignorePatternSetException ex) {
-            return error(id, -32000, ex.category() + ": " + ex.getMessage());
+            return toolError(id, ex.category().name());
         } catch (IllegalArgumentException ex) {
             return error(id, -32000, "invalid argument: " + ex.getMessage());
         } catch (Exception ex) {
@@ -143,17 +143,13 @@ public final class Main {
 
     private static Map<String, Object> compilePatternSet(Map<?, ?> arguments) {
         for (Object key : arguments.keySet()) {
-            if (!"source".equals(key)) {
+            if (!"pattern_text".equals(key) && !"source_name".equals(key)) {
                 throw new IllegalArgumentException(key + " is not allowed");
             }
         }
-        Object value = arguments.get("source");
-        if (!(value instanceof Map<?, ?> source)) {
-            throw new IllegalArgumentException("source is required");
-        }
         GitignorePatternSet set = GitignorePatternSet.compile(new PatternSetSource(
-                requiredString(source, "pattern_text"),
-                optionalString(source, "source_name")
+                requiredString(arguments, "pattern_text"),
+                optionalString(arguments, "source_name")
         ));
         return storePatternSet(set);
     }
@@ -167,22 +163,18 @@ public final class Main {
 
     private static Map<String, Object> matchEntry(Map<?, ?> arguments) {
         for (Object key : arguments.keySet()) {
-            if (!"pattern_set_id".equals(key) && !"entry".equals(key)) {
+            if (!"id".equals(key) && !"relative_path".equals(key) && !"kind".equals(key)) {
                 throw new IllegalArgumentException(key + " is not allowed");
             }
         }
-        String patternSetId = requiredString(arguments, "pattern_set_id");
-        GitignorePatternSet set = PATTERN_SETS.get(patternSetId);
+        String id = requiredString(arguments, "id");
+        GitignorePatternSet set = PATTERN_SETS.get(id);
         if (set == null) {
-            throw new IllegalArgumentException("pattern_set_id is unknown");
-        }
-        Object value = arguments.get("entry");
-        if (!(value instanceof Map<?, ?> entry)) {
-            throw new IllegalArgumentException("entry is required");
+            throw new IllegalArgumentException("id is unknown");
         }
         PatternMatch match = set.match(new PathEntry(
-                requiredString(entry, "relative_path"),
-                entryKind(requiredString(entry, "kind"))
+                requiredString(arguments, "relative_path"),
+                entryKind(requiredString(arguments, "kind"))
         ));
         return matchOutput(match);
     }
@@ -190,7 +182,7 @@ public final class Main {
     private static Map<String, Object> storePatternSet(GitignorePatternSet set) {
         String id = "pattern-set-" + NEXT_SET_ID.getAndIncrement();
         PATTERN_SETS.put(id, set);
-        return Map.of("pattern_set_id", id);
+        return Map.of("id", id);
     }
 
     private static EntryKind entryKind(String value) {
@@ -260,6 +252,20 @@ public final class Main {
         return response;
     }
 
+    private static Map<String, Object> toolError(Object id, String errorCategory) {
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put("type", "text");
+        content.put("text", Json.write(Map.of("error", errorCategory)));
+        Map<String, Object> resultMap = new LinkedHashMap<>();
+        resultMap.put("content", List.of(content));
+        resultMap.put("isError", true);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("jsonrpc", "2.0");
+        response.put("id", id);
+        response.put("result", resultMap);
+        return response;
+    }
+
     private static Map<String, Object> error(Object id, int code, String message) {
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", code);
@@ -273,42 +279,38 @@ public final class Main {
 
     private static Map<String, Object> compilePatternSetToolSchema() {
         Map<String, Object> tool = new LinkedHashMap<>();
-        tool.put("name", "compile-pattern-set");
+        tool.put("name", "compile");
         tool.put("description", "Compile gitignore pattern text into an immutable pattern set.");
         tool.put("inputSchema", objectSchema(Map.of(
-                "source", objectSchema(Map.of(
-                        "pattern_text", Map.of("type", "string"),
-                        "source_name", Map.of("type", "string")
-                ), List.of("pattern_text"))
-        ), List.of("source")));
+                "pattern_text", Map.of("type", "string"),
+                "source_name", Map.of("type", "string")
+        ), List.of("pattern_text")));
         tool.put("outputSchema", objectSchema(Map.of(
-                "pattern_set_id", Map.of("type", "string")
-        ), List.of("pattern_set_id")));
+                "id", Map.of("type", "string")
+        ), List.of("id")));
         return tool;
     }
 
     private static Map<String, Object> emptyPatternSetToolSchema() {
         Map<String, Object> tool = new LinkedHashMap<>();
-        tool.put("name", "empty-pattern-set");
+        tool.put("name", "empty");
         tool.put("description", "Create an immutable pattern set with no patterns.");
         tool.put("inputSchema", objectSchema(Map.of(), List.of()));
         tool.put("outputSchema", objectSchema(Map.of(
-                "pattern_set_id", Map.of("type", "string")
-        ), List.of("pattern_set_id")));
+                "id", Map.of("type", "string")
+        ), List.of("id")));
         return tool;
     }
 
     private static Map<String, Object> matchEntryToolSchema() {
         Map<String, Object> tool = new LinkedHashMap<>();
-        tool.put("name", "match-entry");
+        tool.put("name", "match");
         tool.put("description", "Match one normalized relative path against a compiled pattern set.");
         tool.put("inputSchema", objectSchema(Map.of(
-                "entry", objectSchema(Map.of(
-                        "kind", enumString("regular_file", "directory", "symlink", "special"),
-                        "relative_path", Map.of("type", "string")
-                ), List.of("kind", "relative_path")),
-                "pattern_set_id", Map.of("type", "string")
-        ), List.of("entry", "pattern_set_id")));
+                "id", Map.of("type", "string"),
+                "kind", enumString("regular_file", "directory", "symlink", "special"),
+                "relative_path", Map.of("type", "string")
+        ), List.of("id", "kind", "relative_path")));
         tool.put("outputSchema", objectSchema(Map.of(
                 "decision", enumString("ignore", "include", "none"),
                 "line_number", Map.of("type", "integer", "minimum", 1),

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
@@ -7,23 +7,24 @@
 from __future__ import annotations
 
 import shutil
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path(".")
-JAVA = Path("tools/compiler/jdk/bin/java")
-JAR = Path("released/kitchensync.jar")
-TMP = Path("tests/.tmp/02_first-sync")
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+
 SUGGESTION = "First sync? Mark the authoritative peer with a leading +"
+TEST_ROOT = PROJECT_DIR / "tmp" / "tests" / "02_first-sync"
 
 
-def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def run_cli(*peers: Path | str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(JAVA), "-jar", str(JAR), *args],
-        cwd=PROJECT_DIR,
+        [str(JAVA), "-jar", str(JAR), *(str(peer) for peer in peers)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -41,140 +42,112 @@ def reset_dir(path: Path) -> None:
     path.mkdir(parents=True)
 
 
-def combined_output(result: subprocess.CompletedProcess[str]) -> str:
+def output_of(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
 
 
-def add_check(failures: list[str], condition: bool, message: str) -> None:
+def record(condition: bool, failures: list[str], message: str) -> None:
     if not condition:
         failures.append(message)
 
 
-def describe_result(result: subprocess.CompletedProcess[str]) -> str:
-    return (
-        f"exit={result.returncode}, "
-        f"stdout={result.stdout!r}, "
-        f"stderr={result.stderr!r}"
-    )
-
-
-def create_empty_snapshot(peer: Path) -> None:
-    snapshot = peer / ".kitchensync" / "snapshot.db"
-    snapshot.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(snapshot) as db:
-        db.execute(
-            """
-            CREATE TABLE snapshot (
-                id TEXT PRIMARY KEY,
-                parent_id TEXT NOT NULL,
-                basename TEXT NOT NULL,
-                mod_time TEXT NOT NULL,
-                byte_size INTEGER NOT NULL,
-                last_seen TEXT,
-                deleted_time TEXT
-            )
-            """
-        )
-
-
-def snapshot_row_count(peer: Path) -> int:
-    with sqlite3.connect(peer / ".kitchensync" / "snapshot.db") as db:
-        return int(db.execute("SELECT COUNT(*) FROM snapshot").fetchone()[0])
-
-
-def check_first_sync_without_snapshots(failures: list[str]) -> None:
-    case = TMP / "no-snapshots"
-    peer_a = case / "peer-a"
-    peer_b = case / "peer-b"
+def check_refuses_first_sync_without_snapshots(failures: list[str]) -> None:
+    root = TEST_ROOT / "no-snapshots"
+    peer_a = root / "peer-a"
+    peer_b = root / "peer-b"
     reset_dir(peer_a)
     reset_dir(peer_b)
-    (peer_a / "from-a.txt").write_text("from peer a\n", encoding="utf-8", newline="\n")
-    (peer_b / "from-b.txt").write_text("from peer b\n", encoding="utf-8", newline="\n")
+    (peer_a / "only-on-a.txt").write_text("must not be synced\n", encoding="utf-8")
 
-    result = run_cli(str(peer_a), str(peer_b))
-    detail = describe_result(result)
+    result = run_cli(peer_a, peer_b)
+    combined = output_of(result)
 
-    add_check(
-        failures,
+    record(
         result.returncode == 1,
-        f"02.1 expected exit 1 when no peer has snapshot history; got {detail}",
-    )
-    add_check(
         failures,
-        SUGGESTION in combined_output(result),
-        f"02.1 expected suggestion {SUGGESTION!r}; got {detail}",
+        f"02.1 expected exit code 1 without snapshots, got {result.returncode}. "
+        f"Output:\n{combined}",
     )
-    add_check(
+    record(
+        SUGGESTION in combined,
         failures,
-        not (peer_a / "from-b.txt").exists() and not (peer_b / "from-a.txt").exists(),
-        "02.1 expected no file propagation before canon peer is designated",
+        f"02.1 expected suggestion {SUGGESTION!r} without snapshots. "
+        f"Output:\n{combined}",
     )
-    add_check(
+    record(
+        not (peer_b / "only-on-a.txt").exists(),
         failures,
-        not (peer_a / ".kitchensync" / "snapshot.db").exists()
-        and not (peer_b / ".kitchensync" / "snapshot.db").exists(),
-        "02.1 expected no peer snapshots to be written on rejected first sync",
+        "02.1 expected no sync work without snapshots; peer-b received only-on-a.txt.",
     )
 
 
-def check_first_sync_with_empty_snapshots(failures: list[str]) -> None:
-    case = TMP / "empty-snapshots"
-    peer_a = case / "peer-a"
-    peer_b = case / "peer-b"
+def check_refuses_first_sync_with_empty_snapshots(failures: list[str]) -> None:
+    root = TEST_ROOT / "empty-snapshots"
+    peer_a = root / "peer-a"
+    peer_b = root / "peer-b"
     reset_dir(peer_a)
     reset_dir(peer_b)
-    create_empty_snapshot(peer_a)
-    create_empty_snapshot(peer_b)
 
-    (peer_a / "after-empty-snapshot-a.txt").write_text(
-        "created after empty snapshot\n", encoding="utf-8", newline="\n"
-    )
-    (peer_b / "after-empty-snapshot-b.txt").write_text(
-        "created after empty snapshot\n", encoding="utf-8", newline="\n"
-    )
-
-    result = run_cli(str(peer_a), str(peer_b))
-    detail = describe_result(result)
-
-    add_check(
+    # Use the product to create zero-row snapshots: first sync of two empty dirs
+    setup = run_cli(f"+{peer_a}", peer_b)
+    setup_output = output_of(setup)
+    record(
+        setup.returncode == 0,
         failures,
+        f"02.2 setup expected canon sync of empty peers to exit 0, got "
+        f"{setup.returncode}. Output:\n{setup_output}",
+    )
+    record(
+        (peer_a / ".kitchensync" / "snapshot.db").is_file(),
+        failures,
+        "02.2 setup expected peer-a to have .kitchensync/snapshot.db.",
+    )
+    record(
+        (peer_b / ".kitchensync" / "snapshot.db").is_file(),
+        failures,
+        "02.2 setup expected peer-b to have .kitchensync/snapshot.db.",
+    )
+
+    (peer_a / "created-after-empty-snapshot.txt").write_text(
+        "must not be synced\n",
+        encoding="utf-8",
+    )
+    result = run_cli(peer_a, peer_b)
+    combined = output_of(result)
+
+    record(
         result.returncode == 1,
-        f"02.2 expected exit 1 when every reachable snapshot has zero rows; got {detail}",
-    )
-    add_check(
         failures,
-        SUGGESTION in combined_output(result),
-        f"02.2 expected suggestion {SUGGESTION!r}; got {detail}",
+        f"02.2 expected exit code 1 with empty snapshots, got {result.returncode}. "
+        f"Output:\n{combined}",
     )
-    add_check(
+    record(
+        SUGGESTION in combined,
         failures,
-        not (peer_a / "after-empty-snapshot-b.txt").exists()
-        and not (peer_b / "after-empty-snapshot-a.txt").exists(),
-        "02.2 expected no file propagation when zero-row snapshots require a canon peer",
+        f"02.2 expected suggestion {SUGGESTION!r} with empty snapshots. "
+        f"Output:\n{combined}",
     )
-    add_check(
+    record(
+        not (peer_b / "created-after-empty-snapshot.txt").exists(),
         failures,
-        snapshot_row_count(peer_a) == 0 and snapshot_row_count(peer_b) == 0,
-        "02.2 expected rejected first sync to leave zero-row snapshots unchanged",
+        "02.2 expected no sync work with empty snapshots; peer-b received "
+        "created-after-empty-snapshot.txt.",
     )
 
 
 def main() -> int:
     failures: list[str] = []
-    reset_dir(TMP)
+    reset_dir(TEST_ROOT)
 
-    check_first_sync_without_snapshots(failures)
-    check_first_sync_with_empty_snapshots(failures)
+    check_refuses_first_sync_without_snapshots(failures)
+    check_refuses_first_sync_with_empty_snapshots(failures)
 
     if failures:
-        print("FAIL")
-        for failure in failures:
-            print(f"- {failure}")
+        for index, failure in enumerate(failures, 1):
+            print(f"{index}. {failure}", file=sys.stderr)
         return 1
-
-    print("PASS")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -23,6 +23,21 @@ final class PeerConnector {
     }
 
     List<ConnectedPeer> connectAll(ExecutorService executor) {
+        Map<String, Integer> identityToArgIndex = new LinkedHashMap<>();
+        for (PeerArgument argument : options.peers) {
+            for (String raw : argument.urls()) {
+                try {
+                    String identity = UrlParser.parse(raw, options).normalized();
+                    Integer prior = identityToArgIndex.get(identity);
+                    if (prior != null && !prior.equals(argument.index())) {
+                        return List.of();
+                    }
+                    identityToArgIndex.put(identity, argument.index());
+                } catch (RuntimeException ex) {
+                    // parse errors surface during connect
+                }
+            }
+        }
         List<CompletableFuture<ConnectedPeer>> futures = new ArrayList<>();
         for (PeerArgument argument : options.peers) {
             futures.add(CompletableFuture.supplyAsync(() -> connect(argument), executor));
@@ -69,7 +84,7 @@ final class PeerConnector {
                 }
                 return new ConnectedPeer(argument, url, transport);
             } catch (RuntimeException | TransportException ex) {
-                logger.error("unreachable peer URL: " + raw);
+                logger.error("unreachable peer URL: " + raw + " (" + ex.getMessage() + ")");
             }
         }
         logger.error("unreachable peer: " + String.join(",", argument.urls()));

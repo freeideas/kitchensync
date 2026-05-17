@@ -1,10 +1,11 @@
 {
   "schema": "aitc.hash.v1",
   "job": "Build",
-  "taken_at_utc": "2026-05-15T16:39:14Z",
+  "taken_at_utc": "2026-05-17T20:44:24Z",
   "hashes": {
-    "authoring_marker": "1bcc422e6ed7d13e6bc7f39879809347689658b41242b6af01871a7e564dd52f",
-    "code": "fa2b8753918b3e80681dce61ed12757f4b0562d31bb81283321f6d67520e407e",
-    "toolchain_marker": "a2213e582d2365805f57877148b773230103ead30088f1029b554859dd5f11a5"
+    "AggregateLib_marker": "17e14e7ea24a13c67d74addaaa6b92ef33b7189895c5bda33439f29e1467019a",
+    "authoring_marker": "6e2a5e4ff08403a290ba6d32935f262f9b950e8c9392ded4fc0704985436408c",
+    "code": "1b8988ebb7c8ea96434b30f71cdab6e7dcec8572b7c8100802c344ddf44aa5e8",
+    "toolchain_marker": "520ef13291d40528baebd12071b71af278b65dee10b65146482c5961a7cd7ace"
   }
 }

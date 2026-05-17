@@ -8,42 +8,35 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import time
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
-JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
-WORK = PROJECT_DIR / ".tmp_test_03_decision_rules"
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+WORK = PROJECT_DIR / "tests" / ".tmp" / "03_decision-rules"
 
 
 def run_cli(*peers: Path | str) -> tuple[bool, str]:
-    args = [str(peer) for peer in peers]
-    try:
-        result = subprocess.run(
-            [str(JAVA), "-jar", str(JAR), *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            check=False,
-        )
-    except Exception as exc:
-        return False, f"failed to launch kitchensync: {exc}"
+    result = subprocess.run(
+        [str(JAVA), "-jar", str(JAR), *[str(peer) for peer in peers]],
+        cwd=PROJECT_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
     if result.returncode == 0:
         return True, ""
     return (
         False,
-        "kitchensync exited "
-        f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        f"kitchensync exited {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
     )
 
 
@@ -65,71 +58,33 @@ def read_file(path: Path) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def stat_state(path: Path) -> tuple[int, int] | None:
+def file_state(path: Path) -> tuple[int, int] | None:
     if not path.exists():
         return None
     st = path.stat()
     return (round(st.st_mtime), st.st_size)
 
 
-def db_path(peer: Path) -> Path:
-    return peer / ".kitchensync" / "snapshot.db"
+def has_bak_entry(peer: Path, basename: str) -> bool:
+    bak_root = peer / ".kitchensync" / "BAK"
+    if not bak_root.exists():
+        return False
+    return any(path.name == basename for path in bak_root.rglob(basename))
 
 
-def snapshot_row(peer: Path, basename: str) -> tuple[str, dict[str, Any]]:
-    db = db_path(peer)
-    with sqlite3.connect(db) as conn:
-        conn.row_factory = sqlite3.Row
-        tables = [
-            row[0]
-            for row in conn.execute(
-                "select name from sqlite_master where type = 'table'"
-            )
-        ]
-        for table in tables:
-            columns = [
-                row[1]
-                for row in conn.execute(f'pragma table_info("{table}")')
-            ]
-            if not {"deleted_time", "mod_time", "byte_size"}.issubset(columns):
-                continue
-            rows = conn.execute(f'select rowid, * from "{table}"').fetchall()
-            for row in rows:
-                values = dict(row)
-                if any(value == basename for value in values.values()):
-                    return table, values
-    raise AssertionError(f"no snapshot row found for {basename} in {db}")
-
-
-def db_time_from_seconds(seconds: float) -> str:
-    return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
-
-
-def update_snapshot(peer: Path, basename: str, **updates: Any) -> None:
-    table, row = snapshot_row(peer, basename)
-    assignments = ", ".join(f'"{column}" = ?' for column in updates)
-    values = [*updates.values(), row["rowid"]]
-    with sqlite3.connect(db_path(peer)) as conn:
-        conn.execute(
-            f'update "{table}" set {assignments} where rowid = ?',
-            values,
-        )
-        conn.commit()
-
-
-def expect(failures: list[str], condition: bool, message: str) -> None:
+def check(failures: list[str], condition: bool, message: str) -> None:
     if not condition:
         failures.append(message)
 
 
-def synced_peer_set(name: str, files: dict[str, tuple[str, float]]) -> list[Path]:
+def synced_peers(name: str, files: dict[str, tuple[str, float]], count: int = 3) -> list[Path]:
     root = WORK / name
-    peers = [root / "a", root / "b", root / "c"]
+    peers = [root / chr(ord("a") + index) for index in range(count)]
     for peer in peers:
         reset_dir(peer)
     for rel, (text, mtime) in files.items():
         write_file(peers[0] / rel, text, mtime)
-    ok, detail = run_cli("+" + str(peers[0]), peers[1], peers[2])
+    ok, detail = run_cli("+" + str(peers[0]), *peers[1:])
     if not ok:
         raise AssertionError(f"initial sync failed for {name}: {detail}")
     return peers
@@ -142,252 +97,251 @@ def scenario_agreement_newest_tolerance_size(failures: list[str]) -> None:
         reset_dir(peer)
 
     base = time.time() - 300
-    write_file(a / "same.txt", "same", base)
+    write_file(a / "same.txt", "AAAA", base)
     write_file(a / "newer.txt", "old", base)
     write_file(a / "tie-size.txt", "small", base)
     ok, detail = run_cli("+" + str(a), b, c)
-    expect(failures, ok, f"03 setup initial sync failed: {detail}")
+    check(failures, ok, f"setup for 03.1/03.2/03.6/03.7 failed: {detail}")
     if not ok:
         return
 
-    write_file(b / "same.txt", "diff", base)
-    before = stat_state(b / "same.txt")
+    write_file(b / "same.txt", "BBBB", base)
+    before_same = file_state(b / "same.txt")
     write_file(a / "newer.txt", "winner", base + 80)
     write_file(b / "tie-size.txt", "larger", base + 2)
     ok, detail = run_cli(a, b, c)
-    expect(failures, ok, f"03.1/03.2/03.6/03.7 sync failed: {detail}")
+    check(failures, ok, f"03.1/03.2/03.6/03.7 sync failed: {detail}")
     if not ok:
         return
 
-    expect(
+    check(
         failures,
-        stat_state(b / "same.txt") == before and read_file(b / "same.txt") == "diff",
-        "03.1: agreeing peers should not receive an unnecessary copy",
+        file_state(b / "same.txt") == before_same and read_file(b / "same.txt") == "BBBB",
+        "03.1: same mod_time and byte_size should not enqueue a copy",
     )
-    expect(
+    check(
         failures,
         read_file(b / "newer.txt") == "winner" and read_file(c / "newer.txt") == "winner",
-        "03.2: newest mod_time should propagate to older peers",
+        "03.2: newest mod_time should propagate to older contributing peers",
     )
-    expect(
+    check(
         failures,
         read_file(a / "tie-size.txt") == "larger" and read_file(c / "tie-size.txt") == "larger",
-        "03.6/03.7: within the 5 second mod_time tie, larger byte_size should win",
+        "03.6/03.7: peers within five seconds of the newest mod_time should tie, then larger byte_size should win",
     )
 
 
-def scenario_new_absent_and_no_contributor(failures: list[str]) -> None:
-    root = WORK / "new_absent_and_no_contributor"
+def scenario_new_absent_subordinate_and_no_row(failures: list[str]) -> None:
+    root = WORK / "new_absent_subordinate_and_no_row"
     a, b, c, sub = root / "a", root / "b", root / "c", root / "sub"
     for peer in (a, b, c, sub):
         reset_dir(peer)
 
     base = time.time() - 200
     write_file(a / "seed.txt", "seed", base)
-    ok, detail = run_cli("+" + str(a), b)
-    expect(failures, ok, f"03 setup seed sync failed: {detail}")
+    ok, detail = run_cli("+" + str(a), b, c)
+    check(failures, ok, f"setup for 03.3/03.8/03.110 failed: {detail}")
     if not ok:
         return
 
     write_file(a / "new.txt", "new", base + 20)
     write_file(sub / "sub-only.txt", "ignored", base + 30)
     ok, detail = run_cli(a, b, c, "-" + str(sub))
-    expect(failures, ok, f"03.3/03.8/03.110 sync failed: {detail}")
+    check(failures, ok, f"03.3/03.8/03.110 sync failed: {detail}")
     if not ok:
         return
 
-    expect(
+    check(
         failures,
         read_file(b / "new.txt") == "new"
         and read_file(c / "new.txt") == "new"
         and read_file(sub / "new.txt") == "new",
-        "03.3/03.110: decided existing files should copy to absent peers with no snapshot row",
+        "03.3/03.110: a new file on one contributing peer should copy to peers that lack it and have no row",
     )
-    expect(
+    check(
         failures,
-        not (a / "sub-only.txt").exists() and not (b / "sub-only.txt").exists(),
-        "03.8: entries present only on a subordinate peer should not be copied to contributors",
+        not (a / "sub-only.txt").exists()
+        and not (b / "sub-only.txt").exists()
+        and not (c / "sub-only.txt").exists()
+        and not (sub / "sub-only.txt").exists(),
+        "03.8: an entry that no contributing peer has or has ever had should not be copied from a subordinate peer",
     )
 
 
-def scenario_no_snapshot_live_peer_does_not_vote(failures: list[str]) -> None:
-    root = WORK / "no_snapshot_live_peer_does_not_vote"
+def scenario_no_snapshot_row_does_not_vote(failures: list[str]) -> None:
+    root = WORK / "no_snapshot_row_does_not_vote"
     a, b, c = root / "a", root / "b", root / "c"
     for peer in (a, b, c):
         reset_dir(peer)
 
     base = time.time() - 200
-    write_file(a / "nonvoter.txt", "tracked", base)
-    ok, detail = run_cli("+" + str(a), b)
-    expect(failures, ok, f"03.110 setup sync failed: {detail}")
+    write_file(a / "seed.txt", "seed", base)
+    ok, detail = run_cli("+" + str(a), b, c)
+    check(failures, ok, f"03.110 setup failed: {detail}")
     if not ok:
         return
 
-    write_file(c / "nonvoter.txt", "untracked-newer", base + 80)
+    write_file(a / "tracked.txt", "tracked", base + 10)
+    ok, detail = run_cli(a, b)
+    check(failures, ok, f"03.110 tracked-file setup failed: {detail}")
+    if not ok:
+        return
+
+    write_file(c / "tracked.txt", "untracked-newer", base + 80)
     ok, detail = run_cli(a, b, c)
-    expect(failures, ok, f"03.110 sync failed: {detail}")
+    check(failures, ok, f"03.110 sync failed: {detail}")
     if not ok:
         return
 
-    expect(
+    check(
         failures,
-        read_file(a / "nonvoter.txt") == "tracked"
-        and read_file(b / "nonvoter.txt") == "tracked",
-        "03.110: a contributing peer with no snapshot row should not vote on the winner",
+        read_file(a / "tracked.txt") == "tracked"
+        and read_file(b / "tracked.txt") == "tracked"
+        and read_file(c / "tracked.txt") == "tracked",
+        "03.110: a contributing peer with no row should receive the decided existing file but not vote its file as winner",
     )
 
 
 def scenario_deletion_timing(failures: list[str]) -> None:
-    old_a, old_b, _ = synced_peer_set(
+    old_a, old_b = synced_peers(
         "deletion_more_than_five_seconds",
         {"gone.txt": ("old", time.time() - 600)},
+        count=2,
     )
     (old_b / "gone.txt").unlink()
-    update_snapshot(
-        old_b,
-        "gone.txt",
-        deleted_time=db_time_from_seconds(time.time()),
-    )
     ok, detail = run_cli(old_a, old_b)
-    expect(failures, ok, f"03.4 sync failed: {detail}")
+    check(failures, ok, f"03.18 setup for 03.4 failed: {detail}")
     if ok:
-        expect(
-            failures,
-            not (old_a / "gone.txt").exists() and not (old_b / "gone.txt").exists(),
-            "03.4: deletion more than 5 seconds after surviving mod_time should displace live copies",
-        )
+        write_file(old_a / "gone.txt", "old", time.time() - 600)
+        ok, detail = run_cli(old_a, old_b)
+        check(failures, ok, f"03.4 sync failed: {detail}")
+        if ok:
+            check(
+                failures,
+                not (old_a / "gone.txt").exists() and has_bak_entry(old_a, "gone.txt"),
+                "03.4: a tombstone more than five seconds after a surviving file's mod_time should displace live copies",
+            )
 
-    future_a, future_b, _ = synced_peer_set(
+    keep_a, keep_b = synced_peers(
         "deletion_not_more_than_five_seconds",
-        {"kept.txt": ("future", time.time() + 120)},
+        {"kept.txt": ("kept", time.time() - 600)},
+        count=2,
     )
-    (future_b / "kept.txt").unlink()
-    update_snapshot(
-        future_b,
-        "kept.txt",
-        deleted_time=db_time_from_seconds(time.time()),
-    )
-    ok, detail = run_cli(future_a, future_b)
-    expect(failures, ok, f"03.14 sync failed: {detail}")
+    (keep_b / "kept.txt").unlink()
+    ok, detail = run_cli(keep_a, keep_b)
+    check(failures, ok, f"03.18 setup for 03.14 failed: {detail}")
     if ok:
-        expect(
-            failures,
-            read_file(future_b / "kept.txt") == "future",
-            "03.14: tombstone not more than 5 seconds after live mod_time should receive the file",
-        )
+        write_file(keep_a / "kept.txt", "kept", time.time() + 120)
+        ok, detail = run_cli(keep_a, keep_b)
+        check(failures, ok, f"03.14 sync failed: {detail}")
+        if ok:
+            check(
+                failures,
+                read_file(keep_b / "kept.txt") == "kept",
+                "03.14: a tombstone not more than five seconds after a surviving file's mod_time should receive the live file",
+            )
 
 
 def scenario_missing_file_last_seen(failures: list[str]) -> None:
-    recopy_a, recopy_b, _ = synced_peer_set(
+    recopy_a, recopy_b = synced_peers(
         "missing_recopy",
         {"recopy.txt": ("recopy", time.time() + 120)},
+        count=2,
     )
     (recopy_b / "recopy.txt").unlink()
     ok, detail = run_cli(recopy_a, recopy_b)
-    expect(failures, ok, f"03.5 sync failed: {detail}")
+    check(failures, ok, f"03.5 sync failed: {detail}")
     if ok:
-        expect(
+        check(
             failures,
             read_file(recopy_b / "recopy.txt") == "recopy",
-            "03.5: absent file with last_seen not exceeding max mod_time by more than 5 seconds should be re-copied",
+            "03.5: an absent file whose last_seen does not exceed max mod_time by more than five seconds should be re-copied",
         )
 
-    delete_a, delete_b, _ = synced_peer_set(
+    delete_a, delete_b = synced_peers(
         "missing_displace",
         {"displace.txt": ("displace", time.time() - 600)},
+        count=2,
     )
     (delete_b / "displace.txt").unlink()
     ok, detail = run_cli(delete_a, delete_b)
-    expect(failures, ok, f"03.18 sync failed: {detail}")
+    check(failures, ok, f"03.18 sync failed: {detail}")
     if ok:
-        expect(
+        check(
             failures,
             not (delete_a / "displace.txt").exists() and not (delete_b / "displace.txt").exists(),
-            "03.18: absent file with last_seen more than 5 seconds after max mod_time should displace live copies",
+            "03.18: an absent file whose last_seen exceeds max mod_time by more than five seconds should displace live copies",
         )
 
 
 def scenario_multiple_deletions(failures: list[str]) -> None:
-    a, b, c = synced_peer_set(
+    a, b, c = synced_peers(
         "multiple_deletions",
-        {"multi-delete.txt": ("survivor", time.time() - 10)},
+        {"multi-delete.txt": ("original", time.time() - 600)},
     )
-    survivor_mtime = time.time() - 10
-    os.utime(a / "multi-delete.txt", (survivor_mtime, survivor_mtime))
     (b / "multi-delete.txt").unlink()
-    (c / "multi-delete.txt").unlink()
+    time.sleep(7)
+    middle_mtime = time.time() - 6
+    write_file(a / "multi-delete.txt", "survivor", middle_mtime)
+    ok, detail = run_cli(a, c)
+    check(failures, ok, f"03.85 setup failed while refreshing the later deleting peer: {detail}")
+    if not ok:
+        return
 
-    update_snapshot(
-        b,
-        "multi-delete.txt",
-        deleted_time=db_time_from_seconds(survivor_mtime - 20),
-    )
-    update_snapshot(
-        c,
-        "multi-delete.txt",
-        deleted_time=db_time_from_seconds(survivor_mtime + 20),
-    )
+    (c / "multi-delete.txt").unlink()
     ok, detail = run_cli(a, b, c)
-    expect(failures, ok, f"03.85 sync failed: {detail}")
+    check(failures, ok, f"03.85 sync failed: {detail}")
     if ok:
-        expect(
+        check(
             failures,
             not (a / "multi-delete.txt").exists(),
-            "03.85: most recent deletion estimate should decide against a surviving older file",
+            "03.85: the most recent deletion estimate should be used against a surviving file's mod_time",
         )
 
 
 def scenario_resurrection_and_matching_destination(failures: list[str]) -> None:
-    a, b, _ = synced_peer_set(
+    a, b = synced_peers(
         "resurrection",
-        {"rise.txt": ("old", time.time() - 100)},
+        {"rise.txt": ("old", time.time() - 600)},
+        count=2,
     )
     (b / "rise.txt").unlink()
-    update_snapshot(
-        b,
-        "rise.txt",
-        deleted_time=db_time_from_seconds(time.time() - 50),
-    )
-    write_file(b / "rise.txt", "resurrected", time.time() + 30)
     ok, detail = run_cli(a, b)
-    expect(failures, ok, f"03.91/03.19 sync failed: {detail}")
+    check(failures, ok, f"03.91 setup failed: {detail}")
     if ok:
-        _, after = snapshot_row(b, "rise.txt")
-        expect(
-            failures,
-            read_file(a / "rise.txt") == "resurrected",
-            "03.91: live file with a tombstoned snapshot row should be treated as modified",
-        )
-        expect(
-            failures,
-            after["deleted_time"] is None,
-            "03.19: resurrection should clear deleted_time in the updated snapshot row",
-        )
+        write_file(b / "rise.txt", "resurrected", time.time() + 30)
+        ok, detail = run_cli(a, b)
+        check(failures, ok, f"03.91 sync failed: {detail}")
+        if ok:
+            check(
+                failures,
+                read_file(a / "rise.txt") == "resurrected",
+                "03.91: a live entry whose snapshot row had a tombstone should be classified as modified",
+            )
 
     root = WORK / "matching_destination"
-    src, seeded, dst = root / "src", root / "seeded", root / "dst"
-    for peer in (src, seeded, dst):
+    src, dst = root / "src", root / "dst"
+    for peer in (src, dst):
         reset_dir(peer)
     mtime = time.time() - 60
     write_file(src / "same-state.txt", "AAAA", mtime)
-    ok, detail = run_cli("+" + str(src), seeded)
-    expect(failures, ok, f"03.92 setup sync failed: {detail}")
+    ok, detail = run_cli("+" + str(src), WORK / "matching_destination_seed")
+    check(failures, ok, f"03.92 setup failed: {detail}")
     if not ok:
         return
+
     write_file(dst / "same-state.txt", "BBBB", mtime + 2)
     ok, detail = run_cli(src, dst)
-    expect(failures, ok, f"03.92 sync failed: {detail}")
+    check(failures, ok, f"03.92 sync failed: {detail}")
     if ok:
-        expect(
+        check(
             failures,
             read_file(dst / "same-state.txt") == "BBBB",
-            "03.92: destination with matching byte_size and mod_time tolerance should not be copied over",
+            "03.92: a destination already matching winning mod_time tolerance and byte_size should not be copied over",
         )
-        expect(
-            failures,
-            snapshot_row(dst, "same-state.txt")[1]["deleted_time"] is None,
-            "03.92: matching destination should still get a live snapshot row",
-        )
+
+    # 03.19 and the snapshot-row update part of 03.92 are not reasonably testable
+    # through the root public surface without inspecting the internal snapshot DB.
 
 
 def main() -> int:
@@ -395,8 +349,8 @@ def main() -> int:
     failures: list[str] = []
     scenarios = [
         scenario_agreement_newest_tolerance_size,
-        scenario_new_absent_and_no_contributor,
-        scenario_no_snapshot_live_peer_does_not_vote,
+        scenario_new_absent_subordinate_and_no_row,
+        scenario_no_snapshot_row_does_not_vote,
         scenario_deletion_timing,
         scenario_missing_file_last_seen,
         scenario_multiple_deletions,

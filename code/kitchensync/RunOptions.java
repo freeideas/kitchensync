@@ -8,6 +8,7 @@ final class RunOptions {
     int connectTimeoutSeconds = 30;
     int keepAliveSeconds = 30;
     Verbosity verbosity = Verbosity.info;
+    int dirStatusSeconds = 10;
     int tmpRetentionDays = 2;
     int bakRetentionDays = 90;
     int tombstoneRetentionDays = 180;

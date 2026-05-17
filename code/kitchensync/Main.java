@@ -15,6 +15,7 @@ public final class Main {
     }
 
     public static void main(String[] args) {
+        System.setOut(new PrintStream(System.out, true, StandardCharsets.UTF_8));
         System.setErr(new PrintStream(OutputStream.nullOutputStream(), true, StandardCharsets.UTF_8));
         int exit = run(args);
         System.exit(exit);
@@ -34,10 +35,12 @@ public final class Main {
             return 0;
         }
         RunOptions options = parsed.options();
-        Logger logger = new Logger(options.verbosity);
-        SftpPoolTrace poolTrace = new SftpPoolTrace(logger);
-        TimeUtil times = new TimeUtil();
-        try (ExecutorService executor = Executors.newCachedThreadPool(); SftpPoolRegistry pools = new SftpPoolRegistry()) {
+        try (Logger logger = new Logger(options.verbosity);
+                ExecutorService executor = Executors.newCachedThreadPool();
+                SftpPoolRegistry pools = new SftpPoolRegistry()) {
+            logger.startDirectoryStatus(options.dirStatusSeconds);
+            SftpPoolTrace poolTrace = new SftpPoolTrace(logger);
+            TimeUtil times = new TimeUtil();
             PeerConnector connector = new PeerConnector(options, pools, logger, poolTrace);
             List<ConnectedPeer> connected = connector.connectAll(executor);
             if (connected.size() < 2) {
@@ -51,7 +54,7 @@ public final class Main {
             SnapshotManager snapshots = new SnapshotManager(logger, times);
             List<Peer> peers;
             try {
-                peers = snapshots.openSnapshots(connected, options);
+                peers = snapshots.openSnapshots(connected, options, executor);
             } catch (IOException ex) {
                 logger.error("snapshot workspace failed");
                 return 1;
@@ -68,7 +71,7 @@ public final class Main {
                 return 1;
             }
             if (peers.stream().noneMatch(p -> !p.subordinate())) {
-                System.out.println("No contributing peer reachable — cannot make sync decisions");
+                System.out.println("No contributing peer reachable - cannot make sync decisions");
                 return 1;
             }
             TransferManager transfers = new TransferManager(executor, logger, times);

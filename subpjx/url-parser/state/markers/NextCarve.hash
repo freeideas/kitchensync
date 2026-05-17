@@ -1,8 +1,8 @@
 {
   "schema": "aitc.hash.v1",
   "job": "NextCarve",
-  "taken_at_utc": "2026-05-16T11:07:15Z",
+  "taken_at_utc": "2026-05-17T17:40:13Z",
   "hashes": {
-    "semantic_source": "112391e8bf66d889bd437850e3a38296a2895799aee08be488c4ec79ca72d286"
+    "semantic_source": "82a9bd2778c40eb088ab4e24ef0ee9c78df4d1414f5e7f980e515170b89672cf"
   }
 }

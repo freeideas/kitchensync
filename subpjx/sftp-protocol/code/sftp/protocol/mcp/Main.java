@@ -17,7 +17,6 @@ public final class Main {
     }
 
     public static void main(String[] args) throws Exception {
-        System.setProperty("slf4j.internal.verbosity", "ERROR");
         Path mcpJar = Path.of(Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         Path cleanMcpJar = cleanCopy(mcpJar);
         Path cleanLibJar = cleanCopy(mcpJar.resolveSibling("sftp-protocol.jar"));

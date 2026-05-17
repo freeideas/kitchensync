@@ -1,4 +1,4 @@
-# KitchenSync
+﻿# KitchenSync
 
 Synchronize file trees across multiple peers.
 
@@ -8,27 +8,27 @@ Synchronize file trees across multiple peers.
 
 **Recover overwritten and deleted files.** Old copies of overwritten or deleted files go to a `.kitchensync/BAK/` directory beside the affected path. Multiple previous versions are kept for 90 days (configurable).
 
-**Zero KitchenSync infrastructure on peers.** Only needs SSH access — no KitchenSync daemons, ports, or services. If you can `ssh user@host`, KitchenSync can sync with it.
+**Zero KitchenSync infrastructure on peers.** Only needs SSH access - no KitchenSync daemons, ports, or services. If you can `ssh user@host`, KitchenSync can sync with it.
 
-**Fully command-line driven.** Peer lists and run options come from the command line. No setup wizards, no JSON. Want a fancy saved command? Write a shell script. Or don't — it's up to you.
+**Fully command-line driven.** Peer lists and run options come from the command line. No setup wizards, no JSON. Want a fancy saved command? Write a shell script. Or don't - it's up to you.
 
-**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections — plug them in and KitchenSync brings them current. Each peer carries its own snapshot history, so it always knows what changed.
+**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections - plug them in and KitchenSync brings them current. Each peer carries its own snapshot history, so it always knows what changed.
 
-**Multiple paths to every peer.** Each peer can have several fallback URLs — local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the cloud drive over your LAN; at the office it goes through the VPN. One command, no switching.
+**Multiple paths to every peer.** Each peer can have several fallback URLs - local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the cloud drive over your LAN; at the office it goes through the VPN. One command, no switching.
 
-**Runs anywhere Java does.** A single JAR plus a Java 21 runtime — Windows, Linux, macOS. No Cygwin, no WSL, no MinGW. Paths like `c:\photos` work exactly as you'd expect.
+**Runs anywhere Java does.** A single JAR plus a Java 21 runtime - Windows, Linux, macOS. No Cygwin, no WSL, no MinGW. Paths like `c:\photos` work exactly as you'd expect.
 
 **No central server.** Every peer is equal (unless you say otherwise). No account, no cloud, no subscription.
 
 ## The `+` and `-` URL Prefixes
 
-- **`+`** — this peer wins every disagreement (canon)
-- **`-`** — this peer loses every disagreement (subordinate)
-- **(no prefix)** — bidirectional; newest wins
+- **`+`** - this peer wins every disagreement (canon)
+- **`-`** - this peer loses every disagreement (subordinate)
+- **(no prefix)** - bidirectional; newest wins
 
 ## Quick Start
 
-Any non-canon peer without a snapshot is automatically treated as `-` — it receives the group's state without influencing decisions.
+Any non-canon peer without a snapshot is automatically treated as `-` - it receives the group's state without influencing decisions.
 
 Sync your photos to a cloud drive. First time, use `+` so your local copy wins every disagreement:
 
@@ -40,7 +40,7 @@ That's it. Both directories are now in sync. No config file was created. No data
 
 ## Next Time
 
-Run the same thing without `+`. KitchenSync uses the snapshots from last time to sync bidirectionally — changes on either side propagate. You don't have to remember which files you changed on which device; KitchenSync knows what to update, copy, and/or archive.
+Run the same thing without `+`. KitchenSync uses the snapshots from last time to sync bidirectionally - changes on either side propagate. You don't have to remember which files you changed on which device; KitchenSync knows what to update, copy, and/or archive.
 
 ```
 java -jar kitchensync.jar c:/photos sftp://bilbo@cloud/volume1/photos
@@ -54,7 +54,7 @@ Just add them to the command:
 java -jar kitchensync.jar c:/photos sftp://bilbo@cloud/volume1/photos d:/backup/photos
 ```
 
-The new peer has no snapshot yet, so it's automatically subordinate — it receives the group's state without influencing decisions.
+The new peer has no snapshot yet, so it's automatically subordinate - it receives the group's state without influencing decisions.
 
 ## Add a USB Drive
 
@@ -68,7 +68,7 @@ Next time the USB is plugged in, drop the `-` and it participates as a full bidi
 
 ## Fallback URLs
 
-Your cloud drive has a local IP and a VPN address? Group them with brackets — KitchenSync tries each in order:
+Your cloud drive has a local IP and a VPN address? Group them with brackets - KitchenSync tries each in order:
 
 ```
 java -jar kitchensync.jar c:/photos [h:/office-share/photos,sftp://192.168.1.50:2222/photos,sftp://cloud.vpn/photos]
@@ -84,7 +84,7 @@ Slow VPN link? Limit its connections. Fast LAN? Crank them up. Use query-string 
 java -jar kitchensync.jar c:/photos "[sftp://192.168.1.50/photos?mc=20,sftp://cloud.vpn/photos?mc=3&ct=60]"
 ```
 
-(Quotes needed because of the `?` — your shell would glob it otherwise.)
+(Quotes needed because of the `?` - your shell would glob it otherwise.)
 
 ## Global Options
 

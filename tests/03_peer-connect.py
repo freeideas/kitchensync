@@ -1,43 +1,43 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["paramiko"]
 # ///
 
 from __future__ import annotations
 
+import os
 import shutil
-import shlex
+import socket
 import subprocess
-import tempfile
-import time
-from dataclasses import dataclass
+import sys
+import threading
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
-JAR = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.jar")
-TMP = Path(tempfile.gettempdir()) / "kitchensync_03_peer_connect"
-REMOTE_BASE = "/tmp/testks/03_peer_connect"
-REMOTE_RUN = f"{REMOTE_BASE}/run-{time.monotonic_ns()}"
+import paramiko
 
-
-@dataclass
-class RunResult:
-    returncode: int
-    stdout: str
-    stderr: str
-    seconds: float
-    timed_out: bool = False
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+TEST_ROOT = PROJECT_DIR / "tests" / ".tmp" / "03_peer-connect"
 
 
-def run_cli(*args: str, timeout: float = 60.0) -> RunResult:
-    started = time.monotonic()
+def peer_url(path: Path) -> str:
+    return path.resolve().as_uri()
+
+
+def run_cli(
+    *args: str,
+    extra_jvm: list[str] | None = None,
+    timeout: float = 60,
+) -> subprocess.CompletedProcess[str]:
+    jvm = extra_jvm or []
     try:
-        completed = subprocess.run(
-            [str(JAVA), "-jar", str(JAR), *args],
-            cwd=str(PROJECT_DIR),
+        return subprocess.run(
+            [str(JAVA), *jvm, "-jar", str(JAR), *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -47,214 +47,371 @@ def run_cli(*args: str, timeout: float = 60.0) -> RunResult:
             timeout=timeout,
             check=False,
         )
-        return RunResult(
-            completed.returncode,
-            completed.stdout,
-            completed.stderr,
-            time.monotonic() - started,
-        )
     except subprocess.TimeoutExpired as exc:
-        return RunResult(
+        return subprocess.CompletedProcess(
+            exc.cmd,
             124,
             exc.stdout or "",
-            exc.stderr or "",
-            time.monotonic() - started,
-            timed_out=True,
+            (exc.stderr or "") + f"\nTimed out after {timeout}s",
         )
 
 
-def ssh(*remote_commands: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "ace@ordinarydata.com",
-            " && ".join(remote_commands),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
+def describe(result: subprocess.CompletedProcess[str]) -> str:
+    return (
+        f"exit={result.returncode}\n"
+        f"stdout:\n{result.stdout[-2000:]}\n"
+        f"stderr:\n{result.stderr[-2000:]}"
     )
 
 
-def reset_state() -> None:
-    if TMP.exists():
-        shutil.rmtree(TMP)
-    TMP.mkdir(parents=True)
-    ssh(f"rm -rf -- {shlex.quote(REMOTE_BASE)}")
-
-
-def write_source(path: Path, name: str, body: str) -> None:
+def clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
-    path.mkdir(parents=True)
-    (path / name).write_text(body, encoding="utf-8", newline="\n")
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def add_check(failures: list[str], condition: bool, message: str, detail: str = "") -> None:
+def write_marker(root: Path, name: str, body: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    p = root / name
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def check(condition: bool, failures: list[str], message: str) -> None:
     if not condition:
-        failures.append(f"{message}{chr(10) + detail if detail else ''}")
+        failures.append(message)
 
 
-def result_detail(result: RunResult) -> str:
-    return (
-        f"exit={result.returncode} timed_out={result.timed_out} "
-        f"seconds={result.seconds:.2f}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+# ---------------------------------------------------------------------------
+# In-process SFTP server (paramiko)
+# ---------------------------------------------------------------------------
+
+class _ServerInterface(paramiko.ServerInterface):
+    def check_channel_request(self, kind, chanid):
+        return (
+            paramiko.OPEN_SUCCEEDED
+            if kind == "session"
+            else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        )
+
+    def check_auth_password(self, username, password):
+        return paramiko.AUTH_SUCCESSFUL
+
+    def check_auth_none(self, username):
+        return paramiko.AUTH_SUCCESSFUL
+
+    def get_allowed_auths(self, username):
+        return "none,password"
+
+
+def _sftp_class_for(root: Path, deny_mkdir: bool = False) -> type:
+    class _SFTP(paramiko.SFTPServerInterface):
+        def _rp(self, path: str) -> str:
+            rel = self.canonicalize(path).lstrip("/")
+            return str(root / rel) if rel else str(root)
+
+        def list_folder(self, path):
+            rp = self._rp(path)
+            try:
+                out = []
+                for name in os.listdir(rp):
+                    attr = paramiko.SFTPAttributes.from_stat(
+                        os.stat(os.path.join(rp, name))
+                    )
+                    attr.filename = name
+                    out.append(attr)
+                return out
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def stat(self, path):
+            try:
+                return paramiko.SFTPAttributes.from_stat(os.stat(self._rp(path)))
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def lstat(self, path):
+            try:
+                return paramiko.SFTPAttributes.from_stat(os.lstat(self._rp(path)))
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def open(self, path, flags, attr):
+            rp = self._rp(path)
+            try:
+                Path(rp).parent.mkdir(parents=True, exist_ok=True)
+                binary = getattr(os, "O_BINARY", 0)
+                fd = os.open(rp, flags | binary, 0o666)
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+            if flags & os.O_WRONLY:
+                fstr = "ab" if (flags & os.O_APPEND) else "wb"
+            elif flags & os.O_RDWR:
+                fstr = "a+b" if (flags & os.O_APPEND) else "r+b"
+            else:
+                fstr = "rb"
+            try:
+                f = os.fdopen(fd, fstr)
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+            fobj = paramiko.SFTPHandle(flags)
+            fobj.filename = rp
+            fobj.readfile = f
+            fobj.writefile = f
+            return fobj
+
+        def mkdir(self, path, attr):
+            if deny_mkdir:
+                return paramiko.SFTP_PERMISSION_DENIED
+            try:
+                os.makedirs(self._rp(path), exist_ok=True)
+                return paramiko.SFTP_OK
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def rmdir(self, path):
+            try:
+                os.rmdir(self._rp(path))
+                return paramiko.SFTP_OK
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def remove(self, path):
+            try:
+                os.unlink(self._rp(path))
+                return paramiko.SFTP_OK
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def rename(self, oldpath, newpath):
+            try:
+                os.rename(self._rp(oldpath), self._rp(newpath))
+                return paramiko.SFTP_OK
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+        def chattr(self, path, attr):
+            try:
+                paramiko.SFTPServer.set_file_attr(self._rp(path), attr)
+                return paramiko.SFTP_OK
+            except OSError as e:
+                return paramiko.SFTPServer.convert_errno(e.errno)
+
+    return _SFTP
+
+
+def start_sftp_server(
+    root: Path, deny_mkdir: bool = False
+) -> tuple[int, str, threading.Event]:
+    """Start SFTP server at root. Returns (port, known_hosts_line, stop_event)."""
+    host_key = paramiko.RSAKey.generate(2048)
+    stop = threading.Event()
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(10)
+    port = srv.getsockname()[1]
+
+    sftp_cls = _sftp_class_for(root, deny_mkdir=deny_mkdir)
+
+    def serve() -> None:
+        srv.settimeout(1.0)
+        transports: list[paramiko.Transport] = []
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            t = paramiko.Transport(conn)
+            t.add_server_key(host_key)
+            t.set_subsystem_handler("sftp", paramiko.SFTPServer, sftp_cls)
+            t.start_server(server=_ServerInterface())
+            transports.append(t)
+        for t in transports:
+            try:
+                t.close()
+            except Exception:
+                pass
+        srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    kh_line = f"[127.0.0.1]:{port} {host_key.get_name()} {host_key.get_base64()}"
+    return port, kh_line, stop
+
+
+def make_fake_home(base: Path, *kh_lines: str) -> Path:
+    fake_home = base / "home"
+    (fake_home / ".ssh").mkdir(parents=True, exist_ok=True)
+    (fake_home / ".ssh" / "known_hosts").write_text(
+        "\n".join(kh_lines) + "\n", encoding="utf-8"
     )
+    return fake_home
 
 
-def test_file_root_creation(failures: list[str]) -> None:
-    source = TMP / "file-source"
-    peer_root = TMP / "missing" / "parents" / "file-peer"
-    write_source(source, "alpha.txt", "file root creation\n")
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    result = run_cli(f"+{source}", peer_root.as_uri())
+def test_file_peer_root_creation(failures: list[str]) -> None:
+    """03.86 file://: missing root path and parents are created before connection succeeds"""
+    root = TEST_ROOT / "file-create"
+    clean_dir(root)
+    canon = root / "canon"
+    peer = root / "missing" / "parents" / "peer"
+    marker = write_marker(canon, "from-canon.txt", "file peer root creation\n")
 
-    add_check(
-        failures,
+    result = run_cli(f"+{peer_url(canon)}", peer_url(peer))
+    check(
         result.returncode == 0,
-        "03.86 file:// missing peer root should connect successfully after creation.",
-        result_detail(result),
-    )
-    add_check(
         failures,
-        peer_root.is_dir(),
-        "03.86 file:// peer root and missing parents were not created.",
-        str(peer_root),
+        "file:// peer with missing root should sync successfully after creating the root\n"
+        + describe(result),
     )
-    add_check(
+    check(peer.is_dir(), failures, f"file:// peer root was not created: {peer}")
+    copied = peer / marker.name
+    check(
+        copied.exists()
+        and copied.read_text(encoding="utf-8") == marker.read_text(encoding="utf-8"),
         failures,
-        (peer_root / "alpha.txt").is_file(),
-        "03.86 file:// peer did not receive synced content after root creation.",
-        str(peer_root / "alpha.txt"),
+        f"file:// peer root not usable after creation; missing copied marker: {copied}",
     )
 
 
-def test_failed_creation_falls_back_to_sftp(failures: list[str]) -> None:
-    source = TMP / "fallback-source"
-    blocked_parent = TMP / "not-a-directory"
-    bad_file_root = blocked_parent / "child"
-    remote_root = f"{REMOTE_RUN}/fallback-sftp/missing/peer"
-    write_source(source, "bravo.txt", "fallback to sftp\n")
-    blocked_parent.write_text("parent path is a file\n", encoding="utf-8", newline="\n")
+def test_sftp_peer_root_creation(failures: list[str]) -> None:
+    """03.86 sftp://: missing root path and parents are created on the SFTP peer before connection succeeds"""
+    root = TEST_ROOT / "sftp-create"
+    clean_dir(root)
+    sftp_root = root / "sftp_root"
+    sftp_root.mkdir()
+    canon = root / "canon"
+    marker = write_marker(canon, "sftp-marker.txt", "sftp root creation\n")
+
+    port, kh_line, stop = start_sftp_server(sftp_root)
+    try:
+        fake_home = make_fake_home(root, kh_line)
+        result = run_cli(
+            f"+{peer_url(canon)}",
+            f"sftp://ks_test:ks_test@127.0.0.1:{port}/sub/deep/peer",
+            extra_jvm=[f"-Duser.home={str(fake_home)}"],
+        )
+        expected = sftp_root / "sub" / "deep" / "peer"
+        check(
+            result.returncode == 0,
+            failures,
+            "sftp:// peer with missing root should sync successfully after creating the root\n"
+            + describe(result),
+        )
+        check(
+            expected.is_dir(),
+            failures,
+            f"sftp:// peer root was not created at {expected}",
+        )
+        copied = expected / marker.name
+        check(
+            copied.exists()
+            and copied.read_text(encoding="utf-8") == marker.read_text(encoding="utf-8"),
+            failures,
+            f"sftp:// peer root not usable after creation; missing marker: {copied}",
+        )
+    finally:
+        stop.set()
+
+
+def test_failed_root_creation_uses_fallback(failures: list[str]) -> None:
+    """03.87 file://: failed root-path creation marks the URL as failed; next fallback URL is tried"""
+    root = TEST_ROOT / "fallback"
+    clean_dir(root)
+    canon = root / "canon"
+    marker = write_marker(canon, "fallback-marker.txt", "fallback after mkdir failure\n")
+    blocked_parent = root / "blocked-parent"
+    blocked_parent.write_text("not a directory\n", encoding="utf-8")
+    bad_root = blocked_parent / "cannot-create"
+    fallback_root = root / "fallback-root" / "nested"
 
     result = run_cli(
-        f"+{source}",
-        f"[{bad_file_root.as_uri()},sftp://ace@ordinarydata.com{remote_root}]",
+        f"+{peer_url(canon)}", f"[{peer_url(bad_root)},{peer_url(fallback_root)}]"
     )
-    probe = ssh(
-        f"test -d {shlex.quote(remote_root)}",
-        f"test -f {shlex.quote(remote_root + '/bravo.txt')}",
-    )
-
-    add_check(
-        failures,
+    check(
         result.returncode == 0,
-        "03.87 failed file:// root creation should make KitchenSync try the fallback URL.",
-        result_detail(result),
-    )
-    add_check(
         failures,
-        probe.returncode == 0,
-        "03.86 sftp:// missing peer root should be created before the fallback URL is accepted.",
-        f"ssh exit={probe.returncode}\nstdout:\n{probe.stdout}\nstderr:\n{probe.stderr}",
+        "failed root-path creation should fail only that URL and try the fallback\n"
+        + describe(result),
     )
-
-
-def test_failed_creation_without_fallback_is_unreachable(failures: list[str]) -> None:
-    source = TMP / "unreachable-source"
-    blocked_parent = TMP / "blocked-alone"
-    bad_file_root = blocked_parent / "child"
-    write_source(source, "charlie.txt", "unreachable peer\n")
-    blocked_parent.write_text("parent path is a file\n", encoding="utf-8", newline="\n")
-
-    result = run_cli(f"+{source}", bad_file_root.as_uri())
-
-    add_check(
+    check(
+        fallback_root.is_dir(),
         failures,
-        result.returncode != 0,
-        "03.87 URL with uncreatable root and no fallback should make the peer unreachable.",
-        result_detail(result),
+        f"fallback file:// root was not created after first URL failed: {fallback_root}",
     )
-    add_check(
+    copied = fallback_root / marker.name
+    check(
+        copied.exists(),
         failures,
-        not bad_file_root.exists(),
-        "03.87 uncreatable peer root unexpectedly exists.",
-        str(bad_file_root),
+        f"fallback file:// URL was not used for sync; missing marker: {copied}",
     )
 
 
-def test_failed_sftp_creation_falls_back_to_file(failures: list[str]) -> None:
-    source = TMP / "sftp-fallback-source"
-    remote_blocked_parent = f"{REMOTE_RUN}/blocked-parent"
-    remote_bad_root = f"{remote_blocked_parent}/child"
-    file_fallback_root = TMP / "sftp-failure-file-fallback"
-    write_source(source, "delta.txt", "sftp creation fallback\n")
+def test_sftp_failed_root_creation_uses_fallback(failures: list[str]) -> None:
+    """03.87 sftp://: SFTP mkdir failure marks the URL as failed; next fallback URL is tried"""
+    root = TEST_ROOT / "sftp-fallback"
+    clean_dir(root)
+    sftp_root = root / "sftp_root"
+    sftp_root.mkdir()
+    canon = root / "canon"
+    marker = write_marker(canon, "sftp-fallback-marker.txt", "sftp fallback\n")
+    fallback_local = root / "fallback-local" / "nested"
 
-    setup = ssh(
-        f"mkdir -p -- {shlex.quote(str(Path(remote_blocked_parent).parent))}",
-        f"printf %s {shlex.quote('parent path is a file')} > {shlex.quote(remote_blocked_parent)}",
-    )
-    add_check(
-        failures,
-        setup.returncode == 0,
-        "Test setup could not create remote SFTP blocked parent.",
-        f"ssh exit={setup.returncode}\nstdout:\n{setup.stdout}\nstderr:\n{setup.stderr}",
-    )
-    if setup.returncode != 0:
-        return
-
-    result = run_cli(
-        f"+{source}",
-        f"[sftp://ace@ordinarydata.com{remote_bad_root},{file_fallback_root.as_uri()}]",
-    )
-
-    add_check(
-        failures,
-        result.returncode == 0,
-        "03.87 failed sftp:// root creation should make KitchenSync try the fallback URL.",
-        result_detail(result),
-    )
-    add_check(
-        failures,
-        (file_fallback_root / "delta.txt").is_file(),
-        "03.87 file:// fallback did not receive synced content after sftp:// creation failure.",
-        str(file_fallback_root / "delta.txt"),
-    )
+    port, kh_line, stop = start_sftp_server(sftp_root, deny_mkdir=True)
+    try:
+        fake_home = make_fake_home(root, kh_line)
+        result = run_cli(
+            f"+{peer_url(canon)}",
+            f"[sftp://ks_test:ks_test@127.0.0.1:{port}/bad/root,{peer_url(fallback_local)}]",
+            extra_jvm=[f"-Duser.home={str(fake_home)}"],
+        )
+        check(
+            result.returncode == 0,
+            failures,
+            "sftp:// mkdir failure should fail only that URL and try the fallback\n"
+            + describe(result),
+        )
+        check(
+            fallback_local.is_dir(),
+            failures,
+            f"fallback local root not created after sftp:// URL failed: {fallback_local}",
+        )
+        copied = fallback_local / marker.name
+        check(
+            copied.exists(),
+            failures,
+            f"fallback URL was not used for sync; missing marker: {copied}",
+        )
+    finally:
+        stop.set()
 
 
 def main() -> int:
     failures: list[str] = []
-    reset_state()
-    try:
-        test_file_root_creation(failures)
-        test_failed_creation_falls_back_to_sftp(failures)
-        test_failed_creation_without_fallback_is_unreachable(failures)
-        test_failed_sftp_creation_falls_back_to_file(failures)
-        # 03.93 is an implementation-structure requirement: startup peer connection
-        # attempts must be issued through a concurrent join/gather/parallel construct.
-        # That is not reasonably testable through the public CLI without inspecting
-        # source or relying on artificial timing, so this root behavior test does not
-        # assert it.
-    finally:
-        ssh(f"rm -rf -- {shlex.quote(REMOTE_BASE)}")
+    TEST_ROOT.mkdir(parents=True, exist_ok=True)
+
+    test_file_peer_root_creation(failures)
+    test_sftp_peer_root_creation(failures)
+    test_failed_root_creation_uses_fallback(failures)
+    test_sftp_failed_root_creation_uses_fallback(failures)
+    # 03.93 source-code concurrent join/gather/parallel construct:
+    # not reasonably testable through the root public CLI/artifact surface.
 
     if failures:
         print(f"{len(failures)} check(s) failed:")
         for index, failure in enumerate(failures, 1):
             print(f"\n[{index}] {failure}")
         return 1
-    print("03_peer-connect checks passed")
+
+    print("03_peer-connect: all checks passed")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

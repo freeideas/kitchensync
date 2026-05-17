@@ -6,27 +6,25 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
-import os
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
-JAR = PROJECT_DIR / "released/kitchensync.jar"
-WORK = PROJECT_DIR / ".test-work/03_subordinate-peer"
+
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+WORK = PROJECT_DIR / ".test-work" / "03_subordinate-peer"
 
 
 def write_file(path: Path, text: str, mtime: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
-    touch_tree(path, mtime)
-
-
-def touch_tree(path: Path, mtime: int) -> None:
-    path.touch(exist_ok=True)
     os.utime(path, (mtime, mtime))
 
 
@@ -57,18 +55,18 @@ def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
 
 
 def bak_matches(peer: Path, name: str) -> list[Path]:
-    bak_root = peer / ".kitchensync/BAK"
+    bak_root = peer / ".kitchensync" / "BAK"
     if not bak_root.exists():
         return []
-    return sorted(p for p in bak_root.rglob(name) if p.is_file())
+    return sorted(path for path in bak_root.rglob(name) if path.is_file())
 
 
-def check(condition: bool, message: str, failures: list[str]) -> None:
+def record(condition: bool, message: str, failures: list[str]) -> None:
     if not condition:
         failures.append(message)
 
 
-def check_file(path: Path, expected: str, message: str, failures: list[str]) -> None:
+def record_file(path: Path, expected: str, message: str, failures: list[str]) -> None:
     if not path.exists():
         failures.append(f"{message}: missing {path}")
         return
@@ -77,10 +75,12 @@ def check_file(path: Path, expected: str, message: str, failures: list[str]) -> 
         failures.append(f"{message}: expected {expected!r}, got {actual!r} at {path}")
 
 
-def check_run(name: str, result: subprocess.CompletedProcess[str], failures: list[str]) -> None:
+def record_run(name: str, result: subprocess.CompletedProcess[str], failures: list[str]) -> None:
     if result.returncode != 0:
         failures.append(
-            f"{name} exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            f"{name} exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
         )
 
 
@@ -95,13 +95,18 @@ def main() -> int:
     auto_subordinate = WORK / "auto-subordinate"
 
     write_file(alpha / "shared.txt", "alpha initial\n", 1_700_000_000)
-    write_file(alpha / "folder/group.txt", "group nested file\n", 1_700_000_000)
+    write_file(alpha / "folder" / "group.txt", "group nested file\n", 1_700_000_000)
     beta.mkdir(parents=True)
 
     initial = run_sync(f"+{alpha}", str(beta))
-    check_run("initial canon sync", initial, failures)
-    check_file(beta / "shared.txt", "alpha initial\n", "initial sync copied root file to beta", failures)
-    check_file(beta / "folder/group.txt", "group nested file\n", "initial sync copied nested file to beta", failures)
+    record_run("initial canon sync", initial, failures)
+    record_file(beta / "shared.txt", "alpha initial\n", "initial sync copied root file to beta", failures)
+    record_file(
+        beta / "folder" / "group.txt",
+        "group nested file\n",
+        "initial sync copied nested file to beta",
+        failures,
+    )
 
     write_file(alpha / "shared.txt", "alpha winner\n", 1_700_000_100)
     write_file(explicit_subordinate / "shared.txt", "explicit subordinate wrong newer\n", 1_700_000_200)
@@ -110,7 +115,7 @@ def main() -> int:
     write_file(auto_subordinate / "extra-auto.txt", "auto extra\n", 1_700_000_300)
 
     subordinate_run = run_sync(str(alpha), str(beta), f"-{explicit_subordinate}", str(auto_subordinate))
-    check_run("subordinate sync", subordinate_run, failures)
+    record_run("subordinate sync", subordinate_run, failures)
 
     for peer_name, peer in (
         ("alpha", alpha),
@@ -118,10 +123,10 @@ def main() -> int:
         ("explicit subordinate", explicit_subordinate),
         ("auto subordinate", auto_subordinate),
     ):
-        check_file(
+        record_file(
             peer / "shared.txt",
             "alpha winner\n",
-            f"{peer_name} uses the normal peers' decided state, not subordinate newer content",
+            f"{peer_name} used the normal peers' decision instead of newer subordinate content",
             failures,
         )
 
@@ -129,55 +134,59 @@ def main() -> int:
         ("explicit subordinate", explicit_subordinate),
         ("auto subordinate", auto_subordinate),
     ):
-        check_file(
-            peer / "folder/group.txt",
+        record_file(
+            peer / "folder" / "group.txt",
             "group nested file\n",
-            f"{peer_name} received file missing from subordinate peer",
+            f"{peer_name} received a group file it lacked",
             failures,
         )
-        snapshot = peer / ".kitchensync/snapshot.db"
-        check(
+        snapshot = peer / ".kitchensync" / "snapshot.db"
+        record(
             snapshot.exists() and snapshot.stat().st_size > 0,
-            f"{peer_name} snapshot.db was uploaded after subordinate sync",
+            f"{peer_name} received an updated snapshot.db after subordinate sync",
             failures,
         )
 
-    check(
+    record(
         not (explicit_subordinate / "extra-only.txt").exists(),
-        "explicit subordinate extra file was removed from live tree",
+        "explicit subordinate extra file was removed from the live tree",
         failures,
     )
     explicit_bak = bak_matches(explicit_subordinate, "extra-only.txt")
-    check(
+    record(
         bool(explicit_bak),
         "explicit subordinate extra file was displaced to .kitchensync/BAK",
         failures,
     )
     if explicit_bak:
-        check_file(explicit_bak[-1], "explicit extra\n", "explicit subordinate BAK kept displaced content", failures)
+        record_file(explicit_bak[-1], "explicit extra\n", "explicit subordinate BAK preserved displaced content", failures)
 
-    check(
+    record(
         not (auto_subordinate / "extra-auto.txt").exists(),
-        "auto-subordinate extra file was removed from live tree",
+        "auto-subordinate extra file was removed from the live tree",
         failures,
     )
     auto_bak = bak_matches(auto_subordinate, "extra-auto.txt")
-    check(
+    record(
         bool(auto_bak),
         "auto-subordinate extra file was displaced to .kitchensync/BAK",
         failures,
     )
     if auto_bak:
-        check_file(auto_bak[-1], "auto extra\n", "auto-subordinate BAK kept displaced content", failures)
+        record_file(auto_bak[-1], "auto extra\n", "auto-subordinate BAK preserved displaced content", failures)
 
     write_file(explicit_subordinate / "shared.txt", "explicit later normal winner\n", 1_700_000_400)
     later_normal_run = run_sync(str(alpha), str(beta), str(explicit_subordinate))
-    check_run("later normal sync", later_normal_run, failures)
-    for peer_name, peer in (("alpha", alpha), ("beta", beta), ("former subordinate", explicit_subordinate)):
-        check_file(
+    record_run("later normal sync", later_normal_run, failures)
+    for peer_name, peer in (
+        ("alpha", alpha),
+        ("beta", beta),
+        ("former subordinate", explicit_subordinate),
+    ):
+        record_file(
             peer / "shared.txt",
             "explicit later normal winner\n",
-            f"{peer_name} accepted former subordinate as a normal peer on later run",
+            f"{peer_name} accepted the former subordinate as a normal peer on a later run",
             failures,
         )
 

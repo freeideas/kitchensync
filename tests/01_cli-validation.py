@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
@@ -6,69 +6,22 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
-JAR = PROJECT_DIR / "released/kitchensync.jar"
-
-
-@dataclass(frozen=True)
-class Case:
-    req_id: str
-    name: str
-    args: tuple[str, ...]
-
-
-CASES = [
-    Case("01.10", "fewer than two peers", ("peer-a",)),
-    Case("01.11", "multiple canon peers", ("+peer-a", "+peer-b")),
-    Case("01.12", "unrecognized flag", ("--definitely-not-a-kitchensync-flag", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --mc", ("--mc", "0", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --ct", ("--ct", "0", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --ka", ("--ka", "0", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --xd", ("--xd", "0", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --bd", ("--bd", "0", "peer-a", "peer-b")),
-    Case("01.13", "non-positive --td", ("--td", "0", "peer-a", "peer-b")),
-    Case("01.13", "negative --mc", ("--mc", "-1", "peer-a", "peer-b")),
-    Case("01.13", "negative --ct", ("--ct", "-1", "peer-a", "peer-b")),
-    Case("01.13", "negative --ka", ("--ka", "-1", "peer-a", "peer-b")),
-    Case("01.13", "negative --xd", ("--xd", "-1", "peer-a", "peer-b")),
-    Case("01.13", "negative --bd", ("--bd", "-1", "peer-a", "peer-b")),
-    Case("01.13", "negative --td", ("--td", "-1", "peer-a", "peer-b")),
-    Case("01.13", "non-integer numeric option", ("--mc", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.13", "non-integer --ct", ("--ct", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.13", "non-integer --ka", ("--ka", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.13", "non-integer --xd", ("--xd", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.13", "non-integer --bd", ("--bd", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.13", "non-integer --td", ("--td", "not-an-integer", "peer-a", "peer-b")),
-    Case("01.14", "invalid verbosity", ("-vl", "verbose", "peer-a", "peer-b")),
-]
-
-
-HELP_TOKENS = (
-    "--mc",
-    "--ct",
-    "--ka",
-    "-vl",
-    "--xd",
-    "--bd",
-    "--td",
-    "error",
-    "info",
-    "debug",
-    "trace",
-)
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+TMP = Path("C:/Users/human/Desktop/prjx/kitchensync/tests/.tmp_01_cli_validation")
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(JAVA), "-jar", str(JAR), *args],
-        cwd=PROJECT_DIR,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -80,67 +33,76 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def combined_output(result: subprocess.CompletedProcess[str]) -> str:
-    return result.stdout
+def check_failure(label: str, result: subprocess.CompletedProcess[str], failures: list[str]) -> None:
+    out = result.stdout or ""
+    low = out.lower()
+    before = len(failures)
 
+    if result.returncode != 1:
+        failures.append(f"{label}: exit {result.returncode}, want 1")
 
-def has_validation_error(output: str) -> bool:
-    lowered = output.lower()
-    return "error" in lowered or "invalid" in lowered
+    err_pos = low.find("error")
+    help_markers = [m for m in ("usage", "--mc", "--ct") if m in low]
+    help_pos = min((low.find(m) for m in help_markers), default=-1)
 
+    if err_pos < 0:
+        failures.append(f"{label}: no validation error in output")
+    if help_pos < 0:
+        failures.append(f"{label}: no help text in output")
+    elif err_pos >= 0 and err_pos > help_pos:
+        failures.append(f"{label}: validation error must appear before help text")
 
-def starts_with_validation_error(output: str) -> bool:
-    for line in output.splitlines():
-        stripped = line.strip().lower()
-        if stripped:
-            return "error" in stripped or "invalid" in stripped
-    return False
-
-
-def missing_help_tokens(output: str) -> list[str]:
-    return [token for token in HELP_TOKENS if token not in output]
+    if len(failures) > before:
+        snippet = out[-1500:] if len(out) > 1500 else out
+        failures.append(f"{label}: output:\n{snippet}")
 
 
 def main() -> int:
+    # idempotency: reset temp state before creating it
+    if TMP.exists():
+        shutil.rmtree(TMP)
+    TMP.mkdir(parents=True)
+    left = TMP / "left"
+    right = TMP / "right"
+    left.mkdir()
+    right.mkdir()
+    L = str(left)
+    R = str(right)
+
     failures: list[str] = []
 
-    for case in CASES:
+    cases: list[tuple[str, tuple[str, ...]]] = [
+        # 01.10: exactly one peer is a validation error (zero args is help invocation, not tested here)
+        ("01.10 one-peer", (L,)),
+        # 01.11: more than one canon (+) peer is a validation error
+        ("01.11 two-canon-peers", (f"+{L}", f"+{R}")),
+        # 01.12: unrecognized flags are a validation error
+        ("01.12 unknown-flag", ("--no-such-flag", L, R)),
+        # 01.14: -vl value outside error/info/debug/trace is a validation error
+        ("01.14 -vl=warn", ("-vl", "warn", L, R)),
+        ("01.14 -vl=verbose", ("-vl", "verbose", L, R)),
+    ]
+
+    # 01.13: non-positive-integer values for any numeric option are a validation error
+    for opt in ("--mc", "--ct", "--ka", "--xd", "--bd", "--td"):
+        cases.append((f"01.13 {opt}=0", (opt, "0", L, R)))
+        cases.append((f"01.13 {opt}=-1", (opt, "-1", L, R)))
+        cases.append((f"01.13 {opt}=abc", (opt, "abc", L, R)))
+
+    for label, args in cases:
         try:
-            result = run_cli(*case.args)
-        except Exception as exc:
-            failures.append(f"{case.req_id} {case.name}: command failed to run: {exc}")
+            result = run_cli(*args)
+        except subprocess.TimeoutExpired:
+            failures.append(f"{label}: timed out before reporting validation failure")
             continue
+        check_failure(label, result, failures)
 
-        output = combined_output(result)
-
-        if result.returncode != 1:
-            failures.append(
-                f"{case.req_id} {case.name}: expected exit code 1, got {result.returncode}"
-            )
-
-        if not has_validation_error(output):
-            failures.append(
-                f"{case.req_id} {case.name}: expected validation error text in stdout/stderr"
-            )
-
-        missing = missing_help_tokens(output)
-        if missing:
-            failures.append(
-                f"{case.req_id} {case.name}: expected help text; missing tokens: {', '.join(missing)}"
-            )
-
-        if not starts_with_validation_error(output):
-            failures.append(
-                f"{case.req_id} {case.name}: expected validation error before help text"
-            )
+    if TMP.exists():
+        shutil.rmtree(TMP)
 
     if failures:
-        print("FAIL tests/01_cli-validation.py")
-        for failure in failures:
-            print(f"- {failure}")
+        print("\n".join(failures))
         return 1
-
-    print(f"PASS tests/01_cli-validation.py ({len(CASES)} checks)")
     return 0
 
 

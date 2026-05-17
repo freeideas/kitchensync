@@ -20,6 +20,8 @@ import net.schmizz.sshj.userauth.password.PasswordUtils;
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider;
 
 import java.io.IOException;
+import java.io.FileNotFoundException;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
@@ -35,12 +37,32 @@ final class SftpSession implements AutoCloseable {
     }
 
     static SftpSession open(SftpLocation location, SftpSettings settings, AuthConfig auth) throws SftpException {
+        silenceSlf4jNoProviderWarning();
+        SftpException firstTimeout = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                return openOnce(location, settings, auth);
+            } catch (SftpException e) {
+                if (attempt == 0 && isConnectTimeout(e)) {
+                    firstTimeout = e;
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw firstTimeout;
+    }
+
+    private static SftpSession openOnce(SftpLocation location, SftpSettings settings, AuthConfig auth) throws SftpException {
         SSHClient ssh = new SSHClient();
         try {
             int timeoutMillis = timeoutMillis(settings);
             ssh.setConnectTimeout(timeoutMillis);
             ssh.setTimeout(timeoutMillis);
             if (!Files.isRegularFile(auth.known_hosts_path())) {
+                throw new SftpException(SftpError.host_key_rejected, "host key rejected");
+            }
+            if (Files.size(auth.known_hosts_path()) == 0) {
                 throw new SftpException(SftpError.host_key_rejected, "host key rejected");
             }
             ssh.loadKnownHosts(auth.known_hosts_path().toFile());
@@ -54,6 +76,11 @@ final class SftpSession implements AutoCloseable {
             closeQuietly(ssh);
             throw map(e);
         }
+    }
+
+    private static boolean isConnectTimeout(SftpException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        return e.category() == SftpError.io_error && message.contains("connect timed out");
     }
 
     SFTPClient sftp() {
@@ -111,17 +138,80 @@ final class SftpSession implements AutoCloseable {
     private static List<AuthMethod> agentMethods(String socketPath) {
         List<AuthMethod> methods = new ArrayList<>();
         try {
-            ConnectorFactory factory = ConnectorFactory.getDefault();
-            factory.setPreferredConnectors("ssh-agent");
-            factory.setUSocketPath(socketPath);
-            Connector connector = factory.createConnector();
+            Connector connector = agentConnector(socketPath);
             AgentProxy proxy = new AgentProxy(connector);
             for (Identity identity : proxy.getIdentities()) {
                 methods.add(new AuthAgent(proxy, identity));
             }
-        } catch (AgentProxyException | Buffer.BufferException | RuntimeException ignored) {
+        } catch (AgentProxyException | Buffer.BufferException | RuntimeException | LinkageError ignored) {
         }
         return methods;
+    }
+
+    private static Connector agentConnector(String socketPath) throws AgentProxyException {
+        if (socketPath.startsWith("\\\\.\\pipe\\")) {
+            return new WindowsNamedPipeAgentConnector(socketPath);
+        }
+        ConnectorFactory factory = ConnectorFactory.getDefault();
+        factory.setPreferredConnectors("ssh-agent");
+        factory.setUSocketPath(socketPath);
+        return factory.createConnector();
+    }
+
+    private static final class WindowsNamedPipeAgentConnector implements Connector {
+        private final String pipePath;
+
+        WindowsNamedPipeAgentConnector(String pipePath) throws AgentProxyException {
+            this.pipePath = pipePath;
+            try (RandomAccessFile ignored = openPipe()) {
+            } catch (IOException e) {
+                throw new AgentProxyException(e.toString());
+            }
+        }
+
+        @Override
+        public String getName() {
+            return "ssh-agent";
+        }
+
+        @Override
+        public boolean isAvailable() {
+            return true;
+        }
+
+        @Override
+        public void query(com.jcraft.jsch.agentproxy.Buffer buffer) throws AgentProxyException {
+            try (RandomAccessFile pipe = openPipe()) {
+                pipe.write(buffer.buffer, 0, buffer.getLength());
+                buffer.rewind();
+                pipe.readFully(buffer.buffer, 0, 4);
+                int length = buffer.getInt();
+                buffer.rewind();
+                buffer.checkFreeSize(length);
+                pipe.readFully(buffer.buffer, 0, length);
+            } catch (IOException e) {
+                throw new AgentProxyException(e.toString());
+            }
+        }
+
+        private RandomAccessFile openPipe() throws IOException {
+            long deadline = System.nanoTime() + 2_000_000_000L;
+            while (true) {
+                try {
+                    return new RandomAccessFile(pipePath, "rw");
+                } catch (FileNotFoundException e) {
+                    if (System.nanoTime() >= deadline) {
+                        throw e;
+                    }
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw e;
+                    }
+                }
+            }
+        }
     }
 
     private static SftpException mapSftp(SFTPException e) {
@@ -141,6 +231,16 @@ final class SftpSession implements AutoCloseable {
     private static int timeoutMillis(SftpSettings settings) {
         long millis = Math.max(1L, settings.connect_timeout().toMillis());
         return millis > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) millis;
+    }
+
+    private static void silenceSlf4jNoProviderWarning() {
+        try {
+            Class<?> loggerFactory = Class.forName("org.slf4j.LoggerFactory");
+            var state = loggerFactory.getDeclaredField("INITIALIZATION_STATE");
+            state.setAccessible(true);
+            state.setInt(null, 4);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
     }
 
     private static void closeQuietly(AutoCloseable closeable) {

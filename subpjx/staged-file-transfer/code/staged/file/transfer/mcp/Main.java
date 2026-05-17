@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -128,8 +129,10 @@ public final class Main {
     }
 
     private static Map<String, Object> copyFile(Map<String, Object> args) {
-        MemoryFilesystem source = new MemoryFilesystem(list(args, "source_entries"));
-        MemoryFilesystem destination = bool(args, "same_filesystem") ? source : new MemoryFilesystem(list(args, "destination_entries"));
+        String sourceRoot = string(args, "source_root");
+        String destinationRoot = string(args, "destination_root");
+        LocalFilesystem source = new LocalFilesystem(sourceRoot);
+        LocalFilesystem destination = sourceRoot.equals(destinationRoot) ? source : new LocalFilesystem(destinationRoot);
         OperationResult result = StagedFileTransfer.copy_file(new CopyRequest(
                 source,
                 string(args, "source_path"),
@@ -140,33 +143,30 @@ public final class Main {
                 string(args, "transfer_id"),
                 intValue(args, "chunk_size"),
                 intValue(args, "channel_capacity")));
-        return Map.of(
-                "result", operationResult(result),
-                "source_entries", source.entries(),
-                "destination_entries", destination.entries());
+        return operationResult(result);
     }
 
     private static Map<String, Object> displace(Map<String, Object> args) {
-        MemoryFilesystem filesystem = new MemoryFilesystem(list(args, "entries"));
+        LocalFilesystem filesystem = new LocalFilesystem(string(args, "filesystem_root"));
         OperationResult result = StagedFileTransfer.displace(new DisplaceRequest(
                 filesystem,
                 string(args, "path"),
                 string(args, "staging_timestamp")));
-        return Map.of("result", operationResult(result), "entries", filesystem.entries());
+        return operationResult(result);
     }
 
     private static Map<String, Object> cleanupExpired(Map<String, Object> args) {
-        MemoryFilesystem filesystem = new MemoryFilesystem(list(args, "entries"));
+        LocalFilesystem filesystem = new LocalFilesystem(string(args, "filesystem_root"));
         OperationResult result = StagedFileTransfer.cleanup_expired(new CleanupRequest(
                 filesystem,
                 string(args, "directory_path"),
                 string(args, "bak_cutoff_exclusive"),
                 string(args, "tmp_cutoff_exclusive")));
-        return Map.of("result", operationResult(result), "entries", filesystem.entries());
+        return operationResult(result);
     }
 
     private static Map<String, Object> operationResult(OperationResult result) {
-        java.util.TreeMap<String, Object> map = new java.util.TreeMap<>();
+        TreeMap<String, Object> map = new TreeMap<>();
         map.put("status", result.status().name());
         map.put("created_paths", result.created_paths());
         map.put("removed_paths", result.removed_paths());
@@ -200,8 +200,8 @@ public final class Main {
         System.exit(0);
     }
 
-    private static Map<String, Object> ok(Object id, Map<String, Object> result) {
-        return Map.of("jsonrpc", "2.0", "id", id, "result", result);
+    private static Map<String, Object> ok(Object id, Map<String, Object> resultValue) {
+        return Map.of("jsonrpc", "2.0", "id", id, "result", resultValue);
     }
 
     private static Map<String, Object> result(Map<String, Object> value) {
@@ -213,7 +213,7 @@ public final class Main {
     }
 
     private static Response response(Object id, Map<String, Object> payload) {
-        java.util.TreeMap<String, Object> body = new java.util.TreeMap<>();
+        TreeMap<String, Object> body = new TreeMap<>();
         body.put("jsonrpc", "2.0");
         body.put("id", id);
         body.putAll(payload);
@@ -222,9 +222,9 @@ public final class Main {
 
     private static List<Map<String, Object>> tools() {
         return List.of(
-                tool("cleanup-expired", "Remove expired staged transfer metadata directories.", cleanupInput(), filesystemOutput()),
-                tool("copy-file", "Copy one file through a staged temporary path.", copyInput(), copyOutput()),
-                tool("displace", "Move one existing file or directory into a backup path.", displaceInput(), filesystemOutput()));
+                tool("cleanup-expired", "Remove expired staged transfer metadata directories.", cleanupInput(), operationResultSchema()),
+                tool("copy-file", "Copy one file through a staged temporary path.", copyInput(), operationResultSchema()),
+                tool("displace", "Move one existing file or directory into a backup path.", displaceInput(), operationResultSchema()));
     }
 
     private static Map<String, Object> tool(
@@ -241,59 +241,34 @@ public final class Main {
 
     private static Map<String, Object> copyInput() {
         return objectSchema(Map.of(
-                        "source_entries", entriesSchema(),
-                        "destination_entries", entriesSchema(),
-                        "same_filesystem", Map.of("type", "boolean"),
+                        "source_root", Map.of("type", "string"),
                         "source_path", Map.of("type", "string"),
+                        "destination_root", Map.of("type", "string"),
                         "destination_path", Map.of("type", "string"),
                         "winning_mod_time", Map.of("type", "string"),
                         "staging_timestamp", Map.of("type", "string"),
                         "transfer_id", Map.of("type", "string"),
                         "chunk_size", Map.of("type", "integer"),
                         "channel_capacity", Map.of("type", "integer")),
-                List.of("source_entries", "destination_entries", "source_path", "destination_path",
+                List.of("source_root", "source_path", "destination_root", "destination_path",
                         "winning_mod_time", "staging_timestamp", "transfer_id", "chunk_size", "channel_capacity"));
     }
 
     private static Map<String, Object> displaceInput() {
         return objectSchema(Map.of(
-                        "entries", entriesSchema(),
+                        "filesystem_root", Map.of("type", "string"),
                         "path", Map.of("type", "string"),
                         "staging_timestamp", Map.of("type", "string")),
-                List.of("entries", "path", "staging_timestamp"));
+                List.of("filesystem_root", "path", "staging_timestamp"));
     }
 
     private static Map<String, Object> cleanupInput() {
         return objectSchema(Map.of(
-                        "entries", entriesSchema(),
+                        "filesystem_root", Map.of("type", "string"),
                         "directory_path", Map.of("type", "string"),
                         "bak_cutoff_exclusive", Map.of("type", "string"),
                         "tmp_cutoff_exclusive", Map.of("type", "string")),
-                List.of("entries", "directory_path", "bak_cutoff_exclusive", "tmp_cutoff_exclusive"));
-    }
-
-    private static Map<String, Object> copyOutput() {
-        return objectSchema(Map.of(
-                        "result", operationResultSchema(),
-                        "source_entries", entriesSchema(),
-                        "destination_entries", entriesSchema()),
-                List.of("result", "source_entries", "destination_entries"));
-    }
-
-    private static Map<String, Object> filesystemOutput() {
-        return objectSchema(Map.of(
-                        "result", operationResultSchema(),
-                        "entries", entriesSchema()),
-                List.of("result", "entries"));
-    }
-
-    private static Map<String, Object> entriesSchema() {
-        return Map.of("type", "array", "items", objectSchema(Map.of(
-                        "path", Map.of("type", "string"),
-                        "kind", Map.of("type", "string"),
-                        "mod_time", Map.of("type", "string"),
-                        "data_base64", Map.of("type", "string")),
-                List.of("path", "kind", "mod_time")));
+                List.of("filesystem_root", "directory_path", "bak_cutoff_exclusive", "tmp_cutoff_exclusive"));
     }
 
     private static Map<String, Object> objectSchema(Map<String, Object> properties, List<String> required) {
@@ -333,25 +308,6 @@ public final class Main {
             throw new IllegalArgumentException(key + " must be an integer");
         }
         return number.intValue();
-    }
-
-    private static boolean bool(Map<String, Object> map, String key) {
-        Object value = map.get(key);
-        if (value == null) {
-            return false;
-        }
-        if (!(value instanceof Boolean bool)) {
-            throw new IllegalArgumentException(key + " must be a boolean");
-        }
-        return bool;
-    }
-
-    private static List<?> list(Map<String, Object> map, String key) {
-        Object value = map.get(key);
-        if (!(value instanceof List<?> list)) {
-            throw new IllegalArgumentException(key + " must be an array");
-        }
-        return list;
     }
 
     private record Response(Map<String, Object> body, boolean shutdown) {

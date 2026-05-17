@@ -8,6 +8,8 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 
 import snapshot.database.SnapshotDatabase;
 
@@ -21,27 +23,37 @@ final class SnapshotManager {
         this.times = times;
     }
 
-    List<Peer> openSnapshots(List<ConnectedPeer> connected, RunOptions options) throws IOException {
+    List<Peer> openSnapshots(List<ConnectedPeer> connected, RunOptions options, ExecutorService executor) throws IOException {
         Path tempRoot = Files.createTempDirectory("kitchensync-");
-        List<Peer> peers = new ArrayList<>();
+        List<CompletableFuture<Peer>> futures = new ArrayList<>();
         for (ConnectedPeer connectedPeer : connected) {
-            try {
-                PeerArgument argument = connectedPeer.argument();
-                Path snapshotPath = tempRoot.resolve("peer-" + argument.index()).resolve("snapshot.db");
-                Files.createDirectories(snapshotPath.getParent());
-                boolean existed = downloadSnapshot(connectedPeer.transport(), snapshotPath);
-                SnapshotDatabase db = SnapshotDatabase.open(snapshotPath);
-                db.purge(TimeUtil.snapshotTime(Instant.now().minus(options.tombstoneRetentionDays, ChronoUnit.DAYS)));
-                boolean hasRows = db.has_rows();
-                Peer peer = new Peer(argument.index(), argument.modifier(), connectedPeer.url(), connectedPeer.transport(),
-                        snapshotPath, db, existed, hasRows);
-                if (!existed && peer.role != sync.decision.engine.PeerRole.CANON) {
-                    peer.role = sync.decision.engine.PeerRole.SUBORDINATE;
+            PeerArgument argument = connectedPeer.argument();
+            Path snapshotPath = tempRoot.resolve("peer-" + argument.index()).resolve("snapshot.db");
+            futures.add(CompletableFuture.supplyAsync(() -> {
+                try {
+                    Files.createDirectories(snapshotPath.getParent());
+                    boolean existed = downloadSnapshot(connectedPeer.transport(), snapshotPath);
+                    SnapshotDatabase db = SnapshotDatabase.open(snapshotPath);
+                    db.purge(TimeUtil.snapshotTime(Instant.now().minus(options.tombstoneRetentionDays, ChronoUnit.DAYS)));
+                    boolean hasRows = db.has_rows();
+                    Peer peer = new Peer(argument.index(), argument.modifier(), connectedPeer.url(), connectedPeer.transport(),
+                            snapshotPath, db, existed, hasRows);
+                    if (!existed && peer.role != sync.decision.engine.PeerRole.CANON) {
+                        peer.role = sync.decision.engine.PeerRole.SUBORDINATE;
+                    }
+                    return peer;
+                } catch (IOException ex) {
+                    logger.error("snapshot download failed for " + connectedPeer.url().normalized());
+                    connectedPeer.transport().close();
+                    return null;
                 }
+            }, executor));
+        }
+        List<Peer> peers = new ArrayList<>();
+        for (CompletableFuture<Peer> future : futures) {
+            Peer peer = future.join();
+            if (peer != null) {
                 peers.add(peer);
-            } catch (IOException ex) {
-                logger.error("snapshot download failed for " + connectedPeer.url().normalized());
-                connectedPeer.transport().close();
             }
         }
         return peers;

@@ -6,28 +6,28 @@
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import zipfile
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path(".")
-JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
-JAR = PROJECT_DIR / "released/kitchensync.jar"
-WORK_DIR = PROJECT_DIR / "tests/.tmp/01_help-text"
-ISOLATED_JAR = WORK_DIR / "isolated/kitchensync.jar"
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR  = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
 
-
-EXPECTED_HELP = """Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
+# Mandated verbatim output from specs/help.md (01.27).
+# A verbatim match also satisfies 01.6 (URL forms), 01.7 (prefix modifiers),
+# 01.8 (fallback bracket syntax), 01.9 (global flags + defaults), 01.25 (per-URL query settings).
+MANDATED_HELP = r"""Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
 
 Synchronize file trees across multiple peers.
 
 Running with no arguments prints this help. See README.md for full docs.
 
 Peers:
-  /path or c:\\path                 Local path (same as file://)
+  /path or c:\path                 Local path (same as file://)
   sftp://user@host/path            Remote over SSH
   sftp://user@host:port/path       Non-standard SSH port
   sftp://host/path                 Remote over SSH, current OS user
@@ -73,155 +73,89 @@ Displaced files are recoverable from nearby .kitchensync/BAK/ directories (kept 
 """
 
 
-@dataclass(frozen=True)
-class Case:
-    req_ids: tuple[str, ...]
-    name: str
-    args: tuple[str, ...]
-
-
-HELP_CASES = [
-    Case(("01.1", "01.5", "01.17", "01.27", "01.28"), "no arguments", ()),
-    Case(("01.2", "01.5", "01.17", "01.27", "01.28"), "-h", ("-h",)),
-    Case(("01.3", "01.5", "01.17", "01.27", "01.28"), "--help", ("--help",)),
-    Case(("01.4", "01.5", "01.17", "01.27", "01.28"), "/?", ("/?",)),
-    Case(
-        ("01.26", "01.5", "01.17", "01.27", "01.28"),
-        "-h before validation errors",
-        ("--definitely-not-a-kitchensync-flag", "-h", "+peer-a", "+peer-b"),
-    ),
-    Case(
-        ("01.26", "01.5", "01.17", "01.27", "01.28"),
-        "--help before validation errors",
-        ("--definitely-not-a-kitchensync-flag", "--help", "+peer-a", "+peer-b"),
-    ),
-    Case(
-        ("01.26", "01.5", "01.17", "01.27", "01.28"),
-        "/? before validation errors",
-        ("--definitely-not-a-kitchensync-flag", "/?", "+peer-a", "+peer-b"),
-    ),
-]
-
-
-REQUIRED_FRAGMENTS = [
-    ("01.6", "/path or c:\\path"),
-    ("01.6", "sftp://user@host/path"),
-    ("01.6", "sftp://user@host:port/path"),
-    ("01.6", "sftp://user:password@host/path"),
-    ("01.7", "+<peer>"),
-    ("01.7", "-<peer>"),
-    ("01.8", "[url1,url2,...]"),
-    ("01.9", "--mc N"),
-    ("01.9", "default: 10"),
-    ("01.9", "--ct N"),
-    ("01.9", "default: 30"),
-    ("01.9", "--ka N"),
-    ("01.9", "-vl LEVEL"),
-    ("01.9", "default: info"),
-    ("01.9", "--xd N"),
-    ("01.9", "default: 2"),
-    ("01.9", "--bd N"),
-    ("01.9", "default: 90"),
-    ("01.9", "--td N"),
-    ("01.9", "default: 180"),
-    ("01.25", '"sftp://host/path?mc=5"'),
-    ("01.25", '"sftp://host/path?ct=60"'),
-    ("01.25", '"sftp://host/path?ka=10"'),
-    ("01.25", '"sftp://host/path?mc=5&ct=60"'),
-]
-
-
-def req_label(req_ids: tuple[str, ...]) -> str:
-    return ", ".join(req_ids)
-
-
-def prepare_work_dir() -> None:
-    if WORK_DIR.exists():
-        shutil.rmtree(WORK_DIR)
-    ISOLATED_JAR.parent.mkdir(parents=True)
-    shutil.copy2(JAR, ISOLATED_JAR)
-
-
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(JAVA.resolve()), "-jar", str(ISOLATED_JAR.name), *args],
-        cwd=ISOLATED_JAR.parent,
+        [str(JAVA), "-jar", str(JAR), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=30,
+        timeout=60,
         check=False,
     )
 
 
-def first_difference(left: str, right: str) -> str:
-    if left == right:
-        return "no difference"
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if left[index] != right[index]:
-            return (
-                f"first difference at byte/char {index}: "
-                f"got {left[index:index + 40]!r}, expected {right[index:index + 40]!r}"
-            )
-    return f"length differs: got {len(left)}, expected {len(right)}"
+def check_help_output(failures: list[str], r: subprocess.CompletedProcess[str], label: str) -> None:
+    """Assert exit 0, verbatim stdout, empty stderr for a help invocation."""
+    if r.returncode != 0:
+        failures.append(f"{label}: expected exit 0, got {r.returncode}")
+    actual = r.stdout.replace("\r\n", "\n")
+    if actual != MANDATED_HELP:
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(actual, MANDATED_HELP)) if a != b),
+            min(len(actual), len(MANDATED_HELP)),
+        )
+        ctx = slice(max(0, first_diff - 20), first_diff + 40)
+        failures.append(
+            f"{label}: stdout does not match mandated help (01.27)\n"
+            f"  expected {len(MANDATED_HELP)} chars, got {len(actual)} chars\n"
+            f"  first diff at char {first_diff}: "
+            f"expected {MANDATED_HELP[ctx]!r}, got {actual[ctx]!r}"
+        )
+    if r.stderr.strip():
+        failures.append(f"{label}: expected empty stderr (01.17), got {r.stderr[:200]!r}")
 
 
-def check_help_case(case: Case, failures: list[str]) -> str | None:
+def check_jar_embeds_help(failures: list[str]) -> None:
+    """Assert the released artifact contains the mandated help text."""
+    expected = MANDATED_HELP.encode("utf-8")
     try:
-        result = run_cli(*case.args)
+        with zipfile.ZipFile(JAR) as jar:
+            for entry in jar.infolist():
+                if entry.is_dir():
+                    continue
+                if expected in jar.read(entry):
+                    return
     except Exception as exc:
-        failures.append(f"{req_label(case.req_ids)} {case.name}: command failed to run: {exc}")
-        return None
+        failures.append(f"JAR embedded help text (01.28): could not inspect released artifact: {exc}")
+        return
 
-    if result.returncode != 0:
-        failures.append(
-            f"{req_label(case.req_ids)} {case.name}: expected exit code 0, got {result.returncode}"
-        )
-
-    if result.stderr != "":
-        failures.append(
-            f"{req_label(case.req_ids)} {case.name}: expected empty stderr, got {result.stderr!r}"
-        )
-
-    if result.stdout != EXPECTED_HELP:
-        failures.append(
-            f"{req_label(case.req_ids)} {case.name}: stdout did not match mandated help text; "
-            f"{first_difference(result.stdout, EXPECTED_HELP)}"
-        )
-
-    return result.stdout
+    failures.append("JAR embedded help text (01.28): mandated help text not found in released artifact")
 
 
-def main() -> int:
+def main() -> None:
     failures: list[str] = []
-    prepare_work_dir()
 
-    observed_help = None
-    for case in HELP_CASES:
-        stdout = check_help_case(case, failures)
-        if observed_help is None and stdout:
-            observed_help = stdout
+    # 01.1-01.4, 01.5, 01.17, 01.27: all four help invocations exit 0,
+    # print the mandated text verbatim to stdout, and produce no stderr.
+    for args, label in [
+        ([], "no arguments (01.1)"),
+        (["-h"], "-h (01.2)"),
+        (["--help"], "--help (01.3)"),
+        (["/?"], "'/?' (01.4)"),
+    ]:
+        check_help_output(failures, run_cli(*args), label)
 
-    if observed_help:
-        for req_id, fragment in REQUIRED_FRAGMENTS:
-            if fragment not in observed_help:
-                failures.append(f"{req_id}: help text missing required fragment {fragment!r}")
-    else:
-        failures.append("01.6, 01.7, 01.8, 01.9, 01.25: no help output was observed to check required content")
+    # 01.26: help flag in an otherwise-invalid invocation still exits 0 and prints help.
+    for args, label in [
+        (["-h",     "--zzz-unrecognized"], "-h with unrecognized flag (01.26)"),
+        (["--help", "--zzz-unrecognized"], "--help with unrecognized flag (01.26)"),
+        (["/?",     "--zzz-unrecognized"], "'/?' with unrecognized flag (01.26)"),
+    ]:
+        check_help_output(failures, run_cli(*args), label)
+
+    # 01.28: the released JAR embeds the mandated help text.
+    check_jar_embeds_help(failures)
 
     if failures:
-        print("FAIL tests/01_help-text.py")
-        for failure in failures:
-            print(f"- {failure}")
-        return 1
+        for msg in failures:
+            print(f"FAIL: {msg}")
+        sys.exit(1)
 
-    print(f"PASS tests/01_help-text.py ({len(HELP_CASES)} invocations)")
-    return 0
+    print("All checks passed.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

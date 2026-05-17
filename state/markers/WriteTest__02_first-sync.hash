@@ -1,10 +1,11 @@
 {
   "schema": "aitc.hash.v1",
   "job": "WriteTest",
-  "taken_at_utc": "2026-05-15T20:23:37Z",
+  "taken_at_utc": "2026-05-17T18:22:49Z",
   "hashes": {
-    "req": "a90a6287798d8af876d79ddf7951e0aea72b1651a7f0ebcbf2900e1562a71b3c",
-    "specs/README.md": "5d6036877bde66ba769cc1d660c58e2ae754940e4cfd991fbb403ba7ac7cddb8",
-    "testing_guidelines": "843700d1e14f94ee699cef02a31af184cb0fe186efee8cdf329c7ec888d7bafe"
+    "concrete_paths": "dcd2670da2e5a3c3674a64e1d2274198ce070920f05daff975cb63473e29a184",
+    "req": "dee941cf539187cfbbf4208217f90abba8293abca78a8af35a80b8dcaf8bc5f9",
+    "specs/README.md": "1a13d84272b42c74481d5dda89d8f1f30f39c45bebd17671747ff87185d88f62",
+    "testing_guidelines": "61a542fad57fbe8948ed8fd44d7b6a13dfceda82b5bd9691fa0ac4b410b5f3ae"
   }
 }

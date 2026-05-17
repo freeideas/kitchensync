@@ -17,7 +17,7 @@ final class Schemas {
 
     private static Map<String, Object> compileTool() {
         return Map.of(
-                "name", "compile-matcher",
+                "name", "compile",
                 "description", "Compile ordered gitignore pattern layers into an immutable matcher.",
                 "inputSchema", Map.of(
                         "type", "object",
@@ -29,7 +29,7 @@ final class Schemas {
 
     private static Map<String, Object> emptyTool() {
         return Map.of(
-                "name", "empty-matcher",
+                "name", "empty",
                 "description", "Create an immutable matcher with only built-in exclusions.",
                 "inputSchema", Map.of(
                         "type", "object",
@@ -41,38 +41,38 @@ final class Schemas {
 
     private static Map<String, Object> extendTool() {
         return Map.of(
-                "name", "extend-matcher",
+                "name", "extend",
                 "description", "Return a new matcher with one pattern layer appended.",
                 "inputSchema", Map.of(
                         "type", "object",
-                        "properties", Map.of("matcher_id", Map.of("type", "string"), "layer", layerSchema()),
-                        "required", List.of("matcher_id", "layer"),
+                        "properties", Map.of("matcher", Map.of("type", "string"), "layer", layerSchema()),
+                        "required", List.of("matcher", "layer"),
                         "additionalProperties", false),
                 "outputSchema", matcherIdSchema());
     }
 
     private static Map<String, Object> matchTool() {
         return Map.of(
-                "name", "match-entry",
+                "name", "match",
                 "description", "Match one path entry against ordered gitignore pattern layers.",
                 "inputSchema", Map.of(
                         "type", "object",
-                        "properties", Map.of("matcher_id", Map.of("type", "string"), "entry", pathEntrySchema()),
-                        "required", List.of("matcher_id", "entry"),
+                        "properties", Map.of("matcher", Map.of("type", "string"), "entry", pathEntrySchema()),
+                        "required", List.of("matcher", "entry"),
                         "additionalProperties", false),
                 "outputSchema", matchResultSchema());
     }
 
     private static Map<String, Object> filterTool() {
         return Map.of(
-                "name", "filter-entries",
+                "name", "filter",
                 "description", "Return the path entries that are not ignored.",
                 "inputSchema", Map.of(
                         "type", "object",
                         "properties", Map.of(
-                                "matcher_id", Map.of("type", "string"),
+                                "matcher", Map.of("type", "string"),
                                 "entries", Map.of("type", "array", "items", pathEntrySchema())),
-                        "required", List.of("matcher_id", "entries"),
+                        "required", List.of("matcher", "entries"),
                         "additionalProperties", false),
                 "outputSchema", Map.of(
                         "type", "object",

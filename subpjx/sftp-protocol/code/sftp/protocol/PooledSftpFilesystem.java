@@ -1,42 +1,26 @@
 package sftp.protocol;
 
-import java.util.concurrent.ScheduledFuture;
+import bounded.resource.pool.ResourceLease;
 
 public final class PooledSftpFilesystem extends SftpFilesystem {
-    private final SftpTransferPool pool;
-    private ScheduledFuture<?> idleFuture;
-    private boolean borrowed;
+    private final ResourceLease<SftpSession> lease;
+    private boolean closed;
 
-    PooledSftpFilesystem(SftpLocation location, SftpSession session, SftpTransferPool pool) {
-        super(location, session, () -> {
+    PooledSftpFilesystem(SftpLocation location, ResourceLease<SftpSession> lease) {
+        super(location, lease.resource(), () -> {
         });
-        this.pool = pool;
+        this.lease = lease;
     }
 
     @Override
     public void close() {
-        if (borrowed) {
-            borrowed = false;
-            pool.release(this);
+        if (closed) {
+            return;
         }
-    }
-
-    void borrow() {
-        borrowed = true;
-    }
-
-    void markIdle() {
-        borrowed = false;
-    }
-
-    void setIdleFuture(ScheduledFuture<?> idleFuture) {
-        this.idleFuture = idleFuture;
-    }
-
-    void cancelIdleClose() {
-        if (idleFuture != null) {
-            idleFuture.cancel(false);
-            idleFuture = null;
+        closed = true;
+        if (!usable()) {
+            lease.invalidate();
         }
+        lease.close();
     }
 }

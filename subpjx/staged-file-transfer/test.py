@@ -6,660 +6,817 @@
 
 from __future__ import annotations
 
-import base64
 import json
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync/subpjx/staged-file-transfer")
-JAVA = Path("/home/ace/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java")
-MCP_JAR = PROJECT_DIR / "released/staged-file-transfer_MCP.jar"
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync/subpjx/staged-file-transfer")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+MCP_JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/subpjx/staged-file-transfer/released/staged-file-transfer_MCP.jar")
+
+TS1 = "2026-05-15_10-31-00_000001Z"
+TS2 = "2026-05-15_11-00-00_000002Z"
+TS3 = "2026-05-15_12-00-00_000003Z"
+UID1 = "123e4567-e89b-12d3-a456-426614174000"
+UID2 = "123e4567-e89b-12d3-a456-426614174111"
+UID3 = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
 MOD_TIME = "2026-05-15T10:30:00Z"
 
+failures: list[str] = []
 
-class McpClient:
-    def __init__(self) -> None:
-        self.proc: subprocess.Popen[str] | None = None
-        self.port: int | None = None
-        self.sock: socket.socket | None = None
-        self.next_id = 1
-        self.extra_stdout: list[str] = []
-        self.stderr: list[str] = []
 
-    def start(self) -> None:
-        self.proc = subprocess.Popen(
-            [str(JAVA), "-jar", str(MCP_JAR)],
-            cwd=PROJECT_DIR,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if self.proc.stdout is None or self.proc.stderr is None:
-            raise RuntimeError("MCP server pipes were not created")
-
-        deadline = time.time() + 30
-        while time.time() < deadline and self.proc.poll() is None:
-            line = self.proc.stdout.readline()
-            if line.startswith("MCP_PORT="):
-                self.port = int(line.strip().split("=", 1)[1])
-                break
-            if line:
-                self.extra_stdout.append(line)
-        if self.port is None:
-            stderr = self.proc.stderr.read()
-            raise RuntimeError(
-                f"MCP server did not advertise MCP_PORT; exit={self.proc.poll()} stderr={stderr!r}"
-            )
-
-        threading.Thread(
-            target=self._drain, args=(self.proc.stdout, self.extra_stdout), daemon=True
-        ).start()
-        threading.Thread(target=self._drain, args=(self.proc.stderr, self.stderr), daemon=True).start()
-        self.sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
-        self.sock.settimeout(30)
-
-    @staticmethod
-    def _drain(stream: Any, sink: list[str]) -> None:
-        for line in stream:
+def drain(stream, sink=None):
+    for line in stream:
+        if sink is not None:
             sink.append(line)
 
-    def rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if self.sock is None:
-            raise RuntimeError("MCP socket is not connected")
-        rpc_id = self.next_id
-        self.next_id += 1
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
-        if params is not None:
-            request["params"] = params
-        self.sock.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
-        data = b""
-        deadline = time.time() + 30
-        while b"\n" not in data and time.time() < deadline:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-        line, _, _ = data.partition(b"\n")
-        if not line:
-            raise RuntimeError(f"MCP server closed connection for {method}")
-        return json.loads(line.decode("utf-8"))
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        response = self.rpc("tools/call", {"name": name, "arguments": arguments})
-        if "error" in response:
-            raise RuntimeError(f"{name} failed: {response['error']}")
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError(f"{name} returned non-object result: {response!r}")
+def launch_mcp() -> tuple[subprocess.Popen, int]:
+    proc = subprocess.Popen(
+        [str(JAVA), "-jar", str(MCP_JAR)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.stdout is None or proc.stderr is None:
+        proc.terminate()
+        raise RuntimeError("MCP server pipes were not created")
+
+    stderr_buf: list[str] = []
+    threading.Thread(target=drain, args=(proc.stderr, stderr_buf), daemon=True).start()
+
+    stdout_buf: list[str] = []
+    port = None
+    deadline = time.time() + 30
+    while time.time() < deadline and proc.poll() is None:
+        line = proc.stdout.readline()
+        stdout_buf.append(line)
+        if line.startswith("MCP_PORT="):
+            port = int(line.strip().split("=", 1)[1])
+            break
+
+    if port is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+        raise RuntimeError(
+            "MCP server did not advertise MCP_PORT\n"
+            f"--- stdout ---\n{''.join(stdout_buf)}\n"
+            f"--- stderr ---\n{''.join(stderr_buf)}"
+        )
+
+    threading.Thread(target=drain, args=(proc.stdout,), daemon=True).start()
+    return proc, port
+
+
+def shutdown_mcp(proc: subprocess.Popen, port: int) -> None:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+            rpc(sock, "aitc/shutdown", rpc_id=999)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def rpc(sock: socket.socket, method: str, params=None, rpc_id: int = 1) -> dict:
+    msg = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8"))
+    data = b""
+    deadline = time.time() + 15
+    while b"\n" not in data and time.time() < deadline:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    line, _, _ = data.partition(b"\n")
+    return json.loads(line.decode("utf-8"))
+
+
+def call_tool(sock: socket.socket, tool_name: str, arguments: dict, rpc_id: int = 1) -> dict:
+    return rpc(sock, "tools/call", {"name": tool_name, "arguments": arguments}, rpc_id)
+
+
+def parse_result(response: dict) -> dict:
+    if "error" in response and response["error"] is not None:
+        return {"_rpc_error": response["error"]}
+    result = response.get("result", {})
+    content = result.get("content", [])
+    if content and isinstance(content[0], dict):
+        text = content[0].get("text", "{}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"_parse_error": text}
+    if isinstance(result, dict) and "status" in result:
         return result
-
-    def close(self) -> None:
-        if self.sock is not None:
-            try:
-                self.rpc("aitc/shutdown")
-            except Exception:
-                pass
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        if self.proc is None:
-            return
-        try:
-            self.proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
-
-
-def file_entry(path: str, data: bytes, mod_time: str = "2026-05-15T00:00:00Z") -> dict[str, Any]:
-    return {
-        "path": path,
-        "kind": "file",
-        "mod_time": mod_time,
-        "data_base64": base64.b64encode(data).decode("ascii"),
-    }
-
-
-def directory_entry(path: str, mod_time: str = "2026-05-15T00:00:00Z") -> dict[str, Any]:
-    return {"path": path, "kind": "directory", "mod_time": mod_time}
-
-
-def copy_args(
-    source_entries: list[dict[str, Any]],
-    destination_entries: list[dict[str, Any]],
-    **overrides: Any,
-) -> dict[str, Any]:
-    args: dict[str, Any] = {
-        "source_entries": source_entries,
-        "destination_entries": destination_entries,
-        "source_path": "album/a.bin",
-        "destination_path": "album/a.bin",
-        "winning_mod_time": MOD_TIME,
-        "staging_timestamp": "2026-05-15_10-31-00_000001Z",
-        "transfer_id": "123e4567-e89b-12d3-a456-426614174000",
-        "chunk_size": 3,
-        "channel_capacity": 1,
-    }
-    args.update(overrides)
-    return args
-
-
-def expect(condition: bool, failures: list[str], message: str) -> None:
-    if not condition:
-        failures.append(message)
-
-
-def expect_result(
-    output: dict[str, Any],
-    failures: list[str],
-    context: str,
-    status: str,
-    error: str | None = None,
-) -> dict[str, Any]:
-    result = output.get("result")
-    expect(isinstance(result, dict), failures, f"{context}: expected object result, got {result!r}")
-    if not isinstance(result, dict):
-        return {}
-    expect(result.get("status") == status, failures, f"{context}: expected status {status}, got {result}")
-    if error is not None:
-        expect(result.get("error") == error, failures, f"{context}: expected error {error}, got {result}")
     return result
 
 
-def entry(entries: list[dict[str, Any]], path: str) -> dict[str, Any] | None:
-    return next((item for item in entries if item.get("path") == path), None)
+def check(condition: bool, msg: str) -> None:
+    if not condition:
+        failures.append(msg)
+        print(f"FAIL: {msg}")
+    else:
+        print(f"PASS: {msg}")
 
 
-def file_bytes(entries: list[dict[str, Any]], path: str) -> bytes | None:
-    item = entry(entries, path)
-    if item is None or item.get("kind") != "file":
-        return None
-    return base64.b64decode(str(item.get("data_base64", "")))
+def conn(port: int) -> socket.socket:
+    return socket.create_connection(("127.0.0.1", port), timeout=10)
 
 
-def has_path(entries: list[dict[str, Any]], path: str) -> bool:
-    return entry(entries, path) is not None
+# ---- copy_file ----
 
-
-def result_list(result: dict[str, Any], field: str) -> list[Any]:
-    value = result.get(field)
-    return value if isinstance(value, list) else []
-
-
-# The MCP wrapper exposes final entry snapshots and OperationResult fields, but
-# not per-operation traces, task scheduling, chunk events, or injected backend
-# failures for read, write, close, rename, set_mod_time, permission checks, or
-# delete_dir. The SPEC's bounded-pipeline overlap/backpressure, no-full-buffer
-# streaming, single-rename displacement, pre-rename backend failure cleanup,
-# set_mod_time failure, and cleanup-continues-after-delete-failure scenarios are
-# therefore not reasonably testable here.
-
-
-def check_copy_behaviors(client: McpClient, failures: list[str]) -> None:
-    data = b"\x00\xffhello\r\nbinary\x80\x81\x00"
-    output = client.call_tool("copy-file", copy_args([file_entry("album/a.bin", data)], []))
-    result = expect_result(output, failures, "copy binary into empty nested destination", "success")
-    destination = output["destination_entries"]
-    copied = entry(destination, "album/a.bin")
-    expect(file_bytes(destination, "album/a.bin") == data, failures, "copy nested: binary bytes changed")
-    expect(copied is not None and copied.get("mod_time") == MOD_TIME, failures, "copy nested: mod time wrong")
-    expect(not has_path(destination, "album/.kitchensync/TMP/2026-05-15_10-31-00_000001Z/123e4567-e89b-12d3-a456-426614174000/a.bin"), failures, "copy nested: TMP file remained")
-    expect(result.get("final_path") == "album/a.bin", failures, f"copy nested: wrong final_path, got {result}")
-    expect(
-        result.get("temporary_path")
-        == "album/.kitchensync/TMP/2026-05-15_10-31-00_000001Z/123e4567-e89b-12d3-a456-426614174000/a.bin",
-        failures,
-        f"copy nested: wrong temporary_path, got {result}",
-    )
-    expect(
-        "album/.kitchensync/TMP/2026-05-15_10-31-00_000001Z/123e4567-e89b-12d3-a456-426614174000"
-        in result_list(result, "created_paths"),
-        failures,
-        f"copy nested: TMP parent was not reported as created, got {result}",
-    )
-    expect(not result.get("backup_path"), failures, f"copy nested: backup_path should be absent, got {result}")
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("root.bin", b"root")],
-            [],
-            source_path="root.bin",
-            destination_path="root.bin",
-            staging_timestamp="2026-05-15_10-32-00_000001Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174001",
-        ),
-    )
-    result = expect_result(output, failures, "copy root-level destination", "success")
-    expect(file_bytes(output["destination_entries"], "root.bin") == b"root", failures, "copy root-level: bytes wrong")
-    expect(
-        result.get("temporary_path")
-        == ".kitchensync/TMP/2026-05-15_10-32-00_000001Z/123e4567-e89b-12d3-a456-426614174001/root.bin",
-        failures,
-        f"copy root-level: wrong temporary_path, got {result}",
-    )
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("same-source.bin", b"same filesystem")],
-            [],
-            same_filesystem=True,
-            source_path="same-source.bin",
-            destination_path="same-destination.bin",
-            staging_timestamp="2026-05-15_10-33-00_000001Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174002",
-        ),
-    )
-    expect_result(output, failures, "copy on same filesystem to a different path", "success")
-    expect(file_bytes(output["destination_entries"], "same-destination.bin") == b"same filesystem", failures, "same filesystem copy: bytes wrong")
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("notes/todo.txt", b"new")],
-            [file_entry("notes/todo.txt", b"old")],
-            source_path="notes/todo.txt",
-            destination_path="notes/todo.txt",
-            staging_timestamp="2026-05-15_11-00-00_000002Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174111",
-            chunk_size=1,
-            channel_capacity=2,
-        ),
-    )
-    result = expect_result(output, failures, "copy over existing file", "success")
-    destination = output["destination_entries"]
-    expect(file_bytes(destination, "notes/todo.txt") == b"new", failures, "copy over file: final bytes wrong")
-    expect(
-        file_bytes(destination, "notes/.kitchensync/BAK/2026-05-15_11-00-00_000002Z/todo.txt") == b"old",
-        failures,
-        "copy over file: old destination was not moved to BAK",
-    )
-    expect(
-        result.get("backup_path") == "notes/.kitchensync/BAK/2026-05-15_11-00-00_000002Z/todo.txt",
-        failures,
-        f"copy over file: wrong backup_path, got {result}",
-    )
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("replace-dir", b"file replacing directory")],
-            [file_entry("replace-dir/child.txt", b"inside old directory")],
-            source_path="replace-dir",
-            destination_path="replace-dir",
-            staging_timestamp="2026-05-15_11-01-00_000002Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174112",
-        ),
-    )
-    expect_result(output, failures, "copy over existing directory", "success")
-    destination = output["destination_entries"]
-    expect(file_bytes(destination, "replace-dir") == b"file replacing directory", failures, "copy over directory: final file not installed")
-    expect(
-        file_bytes(destination, ".kitchensync/BAK/2026-05-15_11-01-00_000002Z/replace-dir/child.txt")
-        == b"inside old directory",
-        failures,
-        "copy over directory: existing subtree was not moved to BAK",
-    )
-
-
-def check_displace_and_cleanup(client: McpClient, failures: list[str]) -> None:
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [file_entry("docs/readme.txt", b"readme")],
-            "path": "docs/readme.txt",
-            "staging_timestamp": "2026-05-15_11-59-59_000003Z",
-        },
-    )
-    result = expect_result(output, failures, "displace file", "success")
-    entries = output["entries"]
-    expect(not has_path(entries, "docs/readme.txt"), failures, "displace file: source still exists")
-    expect(
-        file_bytes(entries, "docs/.kitchensync/BAK/2026-05-15_11-59-59_000003Z/readme.txt") == b"readme",
-        failures,
-        "displace file: file was not moved to BAK path",
-    )
-    expect(
-        result.get("backup_path") == "docs/.kitchensync/BAK/2026-05-15_11-59-59_000003Z/readme.txt",
-        failures,
-        f"displace file: wrong backup_path, got {result}",
-    )
-
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [file_entry("album/raw/frame.dat", b"frame")],
-            "path": "album/raw",
-            "staging_timestamp": "2026-05-15_12-00-00_000003Z",
-        },
-    )
-    result = expect_result(output, failures, "displace directory", "success")
-    entries = output["entries"]
-    expect(not has_path(entries, "album/raw"), failures, "displace directory: source still exists")
-    expect(
-        file_bytes(entries, "album/.kitchensync/BAK/2026-05-15_12-00-00_000003Z/raw/frame.dat") == b"frame",
-        failures,
-        "displace directory: subtree was not preserved at BAK path",
-    )
-    expect(
-        result.get("backup_path") == "album/.kitchensync/BAK/2026-05-15_12-00-00_000003Z/raw",
-        failures,
-        f"displace directory: wrong backup_path, got {result}",
-    )
-
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [],
-            "path": "missing.txt",
-            "staging_timestamp": "2026-05-15_12-00-01_000003Z",
-        },
-    )
-    result = expect_result(output, failures, "displace missing path", "success")
-    expect(not result.get("backup_path"), failures, f"displace missing path: backup_path should be absent, got {result}")
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [
-                file_entry(".kitchensync/BAK/2026-04-30_23-59-59_000000Z/root-old.txt", b"old"),
-                file_entry(".kitchensync/BAK/2026-05-01_00-00-00_000000Z/root-keep.txt", b"keep"),
-            ],
-            "directory_path": "",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
-        },
-    )
-    result = expect_result(output, failures, "cleanup root metadata directory", "success")
-    entries = output["entries"]
-    removed_paths = result_list(result, "removed_paths")
-    expect(
-        ".kitchensync/BAK/2026-04-30_23-59-59_000000Z" in removed_paths,
-        failures,
-        f"cleanup root: expired BAK timestamp directory was not reported removed, got {result}",
-    )
-    expect(not has_path(entries, ".kitchensync/BAK/2026-04-30_23-59-59_000000Z/root-old.txt"), failures, "cleanup root: expired BAK file was retained")
-    expect(has_path(entries, ".kitchensync/BAK/2026-05-01_00-00-00_000000Z/root-keep.txt"), failures, "cleanup root: cutoff-equal BAK timestamp directory was deleted")
-
-    cleanup_entries = [
-        file_entry("album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt", b"old"),
-        file_entry("album/.kitchensync/BAK/2026-05-01_00-00-00_000000Z/keep.txt", b"keep"),
-        file_entry("album/.kitchensync/BAK/not-a-timestamp/keep.txt", b"keep"),
-        file_entry("album/.kitchensync/TMP/2026-05-13_23-59-59_000000Z/tmp.txt", b"tmp"),
-    ]
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": cleanup_entries,
-            "directory_path": "album",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
-        },
-    )
-    result = expect_result(output, failures, "cleanup expired BAK and TMP directories", "success")
-    entries = output["entries"]
-    removed_paths = result_list(result, "removed_paths")
-    expect(
-        "album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z" in removed_paths,
-        failures,
-        f"cleanup: expired BAK timestamp directory was not reported removed, got {result}",
-    )
-    expect(
-        "album/.kitchensync/TMP/2026-05-13_23-59-59_000000Z" in removed_paths,
-        failures,
-        f"cleanup: expired TMP timestamp directory was not reported removed, got {result}",
-    )
-    expect(
-        "album/.kitchensync/BAK/2026-05-01_00-00-00_000000Z" not in removed_paths,
-        failures,
-        f"cleanup: cutoff-equal BAK timestamp directory was reported removed, got {result}",
-    )
-    expect(not has_path(entries, "album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt"), failures, "cleanup: expired BAK file was retained")
-    expect(has_path(entries, "album/.kitchensync/BAK/2026-05-01_00-00-00_000000Z/keep.txt"), failures, "cleanup: cutoff-equal BAK timestamp directory was deleted")
-    expect(has_path(entries, "album/.kitchensync/BAK/not-a-timestamp/keep.txt"), failures, "cleanup: non-timestamp BAK directory was deleted")
-    expect(not has_path(entries, "album/.kitchensync/TMP/2026-05-13_23-59-59_000000Z/tmp.txt"), failures, "cleanup: expired TMP file was retained")
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [
-                file_entry(
-                    "mtime/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old-by-name.txt",
-                    b"old by name",
-                    mod_time="2026-05-20T00:00:00Z",
-                ),
-                file_entry(
-                    "mtime/.kitchensync/BAK/2026-05-02_00-00-00_000000Z/new-by-name.txt",
-                    b"new by name",
-                    mod_time="2026-04-01T00:00:00Z",
-                ),
-            ],
-            "directory_path": "mtime",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-        },
-    )
-    expect_result(output, failures, "cleanup uses timestamp names", "success")
-    entries = output["entries"]
-    expect(
-        not has_path(entries, "mtime/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old-by-name.txt"),
-        failures,
-        "cleanup timestamp names: expired name with newer mod time was retained",
-    )
-    expect(
-        has_path(entries, "mtime/.kitchensync/BAK/2026-05-02_00-00-00_000000Z/new-by-name.txt"),
-        failures,
-        "cleanup timestamp names: unexpired name with older mod time was deleted",
-    )
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [file_entry("plain/file.txt", b"plain")],
-            "directory_path": "plain",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
-        },
-    )
-    result = expect_result(output, failures, "cleanup missing metadata directories", "success")
-    expect(has_path(output["entries"], "plain/file.txt"), failures, "cleanup missing metadata: non-metadata file was removed")
-    expect(not result_list(result, "removed_paths"), failures, f"cleanup missing metadata: paths were removed, got {result}")
-
-
-def check_failure_and_invalid_inputs(client: McpClient, failures: list[str]) -> None:
-    invalid_cases = [
-        ("empty source path", {"source_path": ""}, "invalid_path"),
-        ("empty destination path", {"destination_path": ""}, "invalid_path"),
-        ("parent-segment source path", {"source_path": "../source.txt"}, "invalid_path"),
-        ("parent-segment destination path", {"destination_path": "../dest.txt"}, "invalid_path"),
-        ("absolute destination path", {"destination_path": "/dest.txt"}, "invalid_path"),
-        ("trailing-slash destination path", {"destination_path": "dest.txt/"}, "invalid_path"),
-        ("empty-segment destination path", {"destination_path": "dir//dest.txt"}, "invalid_path"),
-        ("dot-segment destination path", {"destination_path": "dir/./dest.txt"}, "invalid_path"),
-        ("backslash destination path", {"destination_path": "dir\\dest.txt"}, "invalid_path"),
-        ("nul destination path", {"destination_path": "dest\u0000.txt"}, "invalid_path"),
-        ("invalid timestamp", {"staging_timestamp": "2026-99-99_10-31-00_000001Z"}, "invalid_timestamp"),
-        ("invalid transfer id", {"transfer_id": "not-a-uuid"}, "invalid_transfer_id"),
-        ("invalid chunk size", {"chunk_size": 0}, "invalid_settings"),
-        ("invalid channel capacity", {"channel_capacity": 0}, "invalid_settings"),
-    ]
-    for label, overrides, expected_error in invalid_cases:
-        args = {
-            "source_path": "source.txt",
-            "destination_path": "dest.txt",
-            **overrides,
-        }
-        output = client.call_tool(
-            "copy-file",
-            copy_args(
-                [file_entry("source.txt", b"new")],
-                [file_entry("dest.txt", b"old")],
-                **args,
-            ),
-        )
-        expect_result(output, failures, label, "failed", expected_error)
-        expect(file_bytes(output["destination_entries"], "dest.txt") == b"old", failures, f"{label}: destination was mutated")
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("dest.txt", b"old")],
-            [],
-            same_filesystem=True,
-            source_path="dest.txt",
-            destination_path="dest.txt",
-            staging_timestamp="2026-05-15_10-31-00_100001Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174099",
-        ),
-    )
-    expect_result(output, failures, "same filesystem same path copy", "failed", "same_source_and_destination")
-    expect(file_bytes(output["destination_entries"], "dest.txt") == b"old", failures, "same path copy: destination was mutated")
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [],
-            [file_entry("dest.txt", b"old")],
-            source_path="missing.txt",
-            destination_path="dest.txt",
-            staging_timestamp="2026-05-15_10-31-00_200001Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174098",
-        ),
-    )
-    expect_result(output, failures, "missing source before final rename", "failed", "not_found")
-    expect(file_bytes(output["destination_entries"], "dest.txt") == b"old", failures, "missing source: original destination changed")
-    expect(not has_path(output["destination_entries"], ".kitchensync/TMP/2026-05-15_10-31-00_200001Z"), failures, "missing source: TMP metadata remained")
-
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [file_entry("dest.txt", b"old")],
-            "path": "../dest.txt",
-            "staging_timestamp": "2026-05-15_10-31-00_210001Z",
-        },
-    )
-    expect_result(output, failures, "displace invalid path", "failed", "invalid_path")
-    expect(file_bytes(output["entries"], "dest.txt") == b"old", failures, "displace invalid path: entries were mutated")
-
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [file_entry("dest.txt", b"old")],
-            "path": "",
-            "staging_timestamp": "2026-05-15_10-31-00_210002Z",
-        },
-    )
-    expect_result(output, failures, "displace empty path", "failed", "invalid_path")
-    expect(file_bytes(output["entries"], "dest.txt") == b"old", failures, "displace empty path: entries were mutated")
-
-    output = client.call_tool(
-        "displace",
-        {
-            "entries": [file_entry("dest.txt", b"old")],
-            "path": "dest.txt",
-            "staging_timestamp": "2026-05-15_10-31-00_12345Z",
-        },
-    )
-    expect_result(output, failures, "displace invalid timestamp", "failed", "invalid_timestamp")
-    expect(file_bytes(output["entries"], "dest.txt") == b"old", failures, "displace invalid timestamp: entries were mutated")
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [file_entry("album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt", b"old")],
-            "directory_path": "../album",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
-        },
-    )
-    expect_result(output, failures, "cleanup invalid directory path", "failed", "invalid_path")
-    expect(has_path(output["entries"], "album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt"), failures, "cleanup invalid directory path: entries were mutated")
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [file_entry("album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt", b"old")],
-            "directory_path": "album",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000",
-            "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
-        },
-    )
-    expect_result(output, failures, "cleanup invalid BAK cutoff timestamp", "failed", "invalid_timestamp")
-    expect(has_path(output["entries"], "album/.kitchensync/BAK/2026-04-30_23-59-59_000000Z/old.txt"), failures, "cleanup invalid timestamp: entries were mutated")
-
-    output = client.call_tool(
-        "cleanup-expired",
-        {
-            "entries": [file_entry("album/.kitchensync/TMP/2026-05-13_23-59-59_000000Z/tmp.txt", b"tmp")],
-            "directory_path": "album",
-            "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
-            "tmp_cutoff_exclusive": "2026-05-14_99-00_000000Z",
-        },
-    )
-    expect_result(output, failures, "cleanup invalid TMP cutoff timestamp", "failed", "invalid_timestamp")
-    expect(has_path(output["entries"], "album/.kitchensync/TMP/2026-05-13_23-59-59_000000Z/tmp.txt"), failures, "cleanup invalid TMP timestamp: entries were mutated")
-
-    output = client.call_tool(
-        "copy-file",
-        copy_args(
-            [file_entry("blocked.txt", b"blocked new")],
-            [
-                file_entry("blocked.txt", b"blocked old"),
-                file_entry(".kitchensync/BAK/2026-05-15_10-31-00_300001Z", b"not a directory"),
-            ],
-            source_path="blocked.txt",
-            destination_path="blocked.txt",
-            staging_timestamp="2026-05-15_10-31-00_300001Z",
-            transfer_id="123e4567-e89b-12d3-a456-426614174097",
-        ),
-    )
-    expect_result(output, failures, "displacement failure prevents final rename", "failed", "displacement_failed")
-    expect(file_bytes(output["destination_entries"], "blocked.txt") == b"blocked old", failures, "displacement failure: original changed")
-    expect(not has_path(output["destination_entries"], ".kitchensync/TMP/2026-05-15_10-31-00_300001Z"), failures, "displacement failure: TMP directory remained")
-
-
-def main() -> int:
-    failures: list[str] = []
-    client = McpClient()
+def test_copy_nested_empty_destination(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
     try:
-        client.start()
-        check_copy_behaviors(client, failures)
-        check_displace_and_cleanup(client, failures)
-        check_failure_and_invalid_inputs(client, failures)
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / "album").mkdir()
+        (src / "album" / "a.jpg").write_bytes(bytes([0x01, 0x02, 0x03, 0xFF, 0xFE]))
 
-        time.sleep(0.2)
-        expect(not client.extra_stdout, failures, f"public operations wrote to stdout after MCP_PORT: {client.extra_stdout!r}")
-        expect(not client.stderr, failures, f"public operations wrote to stderr: {client.stderr!r}")
-    except Exception as exc:
-        failures.append(f"test harness failed: {exc!r}")
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "album/a.jpg",
+                "destination_root": str(dst),
+                "destination_path": "album/a.jpg",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success", f"copy nested empty: status={r.get('status')}, full={r}")
+        check(r.get("final_path") == "album/a.jpg",
+              f"copy nested empty: final_path={r.get('final_path')!r}")
+        expected_tmp = f"album/.kitchensync/TMP/{TS1}/{UID1}/a.jpg"
+        check(r.get("temporary_path") == expected_tmp,
+              f"copy nested empty: temporary_path={r.get('temporary_path')!r}, want={expected_tmp!r}")
+        check(not r.get("backup_path"),
+              f"copy nested empty: backup_path should be absent, got {r.get('backup_path')!r}")
+        dest = dst / "album" / "a.jpg"
+        check(dest.exists(), "copy nested empty: destination file must exist")
+        check(dest.read_bytes() == bytes([0x01, 0x02, 0x03, 0xFF, 0xFE]),
+              "copy nested empty: binary content must match exactly")
+        tmp_uuid_dir = dst / "album" / ".kitchensync" / "TMP" / TS1 / UID1
+        check(not tmp_uuid_dir.exists(),
+              "copy nested empty: TMP UUID dir cleaned up after success")
     finally:
-        client.close()
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_root_level_path(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / "a.txt").write_bytes(b"root file")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "a.txt",
+                "destination_root": str(dst),
+                "destination_path": "a.txt",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS2,
+                "transfer_id": UID2,
+                "chunk_size": 1024,
+                "channel_capacity": 2,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"copy root level: status={r.get('status')}, full={r}")
+        expected_tmp = f".kitchensync/TMP/{TS2}/{UID2}/a.txt"
+        check(r.get("temporary_path") == expected_tmp,
+              f"copy root level: temporary_path={r.get('temporary_path')!r}, want={expected_tmp!r}")
+        check((dst / "a.txt").read_bytes() == b"root file",
+              "copy root level: content preserved")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_over_existing_file(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / "notes").mkdir()
+        (src / "notes" / "todo.txt").write_bytes(b"new content")
+        (dst / "notes").mkdir()
+        (dst / "notes" / "todo.txt").write_bytes(b"old content")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "notes/todo.txt",
+                "destination_root": str(dst),
+                "destination_path": "notes/todo.txt",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS2,
+                "transfer_id": UID2,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"copy over file: status={r.get('status')}, full={r}")
+        expected_bak = f"notes/.kitchensync/BAK/{TS2}/todo.txt"
+        check(r.get("backup_path") == expected_bak,
+              f"copy over file: backup_path={r.get('backup_path')!r}, want={expected_bak!r}")
+        bak = dst / "notes" / ".kitchensync" / "BAK" / TS2 / "todo.txt"
+        check(bak.exists(), "copy over file: displaced file must exist at BAK path")
+        check(bak.read_bytes() == b"old content",
+              "copy over file: original content preserved in BAK")
+        check((dst / "notes" / "todo.txt").read_bytes() == b"new content",
+              "copy over file: new content at destination")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_over_existing_directory(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / "item").write_bytes(b"\xAB\xCD")
+        (dst / "item").mkdir()
+        (dst / "item" / "child.txt").write_bytes(b"inside dir")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "item",
+                "destination_root": str(dst),
+                "destination_path": "item",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS3,
+                "transfer_id": UID3,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"copy over dir: status={r.get('status')}, full={r}")
+        expected_bak = f".kitchensync/BAK/{TS3}/item"
+        check(r.get("backup_path") == expected_bak,
+              f"copy over dir: backup_path={r.get('backup_path')!r}, want={expected_bak!r}")
+        bak_dir = dst / ".kitchensync" / "BAK" / TS3 / "item"
+        check(bak_dir.is_dir(), "copy over dir: displaced dir must exist at BAK path")
+        check((bak_dir / "child.txt").exists(),
+              "copy over dir: subtree preserved in BAK")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_same_filesystem_different_paths(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "original.txt").write_bytes(b"shared fs data")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(fs),
+                "source_path": "original.txt",
+                "destination_root": str(fs),
+                "destination_path": "copy.txt",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"copy same fs: status={r.get('status')}, full={r}")
+        check((fs / "copy.txt").read_bytes() == b"shared fs data",
+              "copy same fs: content copied correctly")
+        check((fs / "original.txt").exists(),
+              "copy same fs: source file unchanged")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_small_chunk_preserves_binary(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        content = bytes(range(256))
+        (src / "bin.dat").write_bytes(content)
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "bin.dat",
+                "destination_root": str(dst),
+                "destination_path": "bin.dat",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 1,
+                "channel_capacity": 1,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"copy small chunk: status={r.get('status')}, full={r}")
+        dest = dst / "bin.dat"
+        check(dest.exists() and dest.read_bytes() == content,
+              "copy small chunk: all 256 byte values preserved with chunk_size=1")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_copy_winning_mod_time(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+        (src / "f.txt").write_bytes(b"hi")
+
+        target_mtime = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "f.txt",
+                "destination_root": str(dst),
+                "destination_path": "f.txt",
+                "winning_mod_time": "2026-01-01T00:00:00Z",
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"mod time: copy should succeed, got {r}")
+        dest = dst / "f.txt"
+        if dest.exists():
+            actual = dest.stat().st_mtime
+            check(abs(actual - target_mtime) < 2.0,
+                  f"mod time: expected ~{target_mtime}, got {actual} (diff={abs(actual - target_mtime):.3f}s)")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+# ---- displace ----
+
+def test_displace_file(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        (fs / "album").mkdir(parents=True)
+        (fs / "album" / "photo.jpg").write_bytes(b"\xFF\xD8\xFF")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "displace", {
+                "filesystem_root": str(fs),
+                "path": "album/photo.jpg",
+                "staging_timestamp": TS3,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"displace file: status={r.get('status')}, full={r}")
+        expected_bak = f"album/.kitchensync/BAK/{TS3}/photo.jpg"
+        check(r.get("backup_path") == expected_bak,
+              f"displace file: backup_path={r.get('backup_path')!r}, want={expected_bak!r}")
+        check(not (fs / "album" / "photo.jpg").exists(),
+              "displace file: original must be gone")
+        bak = fs / "album" / ".kitchensync" / "BAK" / TS3 / "photo.jpg"
+        check(bak.exists() and bak.read_bytes() == b"\xFF\xD8\xFF",
+              "displace file: content preserved in BAK")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_displace_directory(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        (fs / "album" / "raw" / "sub").mkdir(parents=True)
+        (fs / "album" / "raw" / "img001.dng").write_bytes(b"\xAB\xCD")
+        (fs / "album" / "raw" / "sub" / "img002.dng").write_bytes(b"\xEF\x01")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "displace", {
+                "filesystem_root": str(fs),
+                "path": "album/raw",
+                "staging_timestamp": TS3,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"displace dir: status={r.get('status')}, full={r}")
+        expected_bak = f"album/.kitchensync/BAK/{TS3}/raw"
+        check(r.get("backup_path") == expected_bak,
+              f"displace dir: backup_path={r.get('backup_path')!r}, want={expected_bak!r}")
+        check(not (fs / "album" / "raw").exists(),
+              "displace dir: original directory must be gone")
+        bak = fs / "album" / ".kitchensync" / "BAK" / TS3 / "raw"
+        check(bak.is_dir(), "displace dir: BAK directory must exist")
+        check((bak / "img001.dng").read_bytes() == b"\xAB\xCD",
+              "displace dir: top-level file in subtree preserved")
+        check((bak / "sub" / "img002.dng").read_bytes() == b"\xEF\x01",
+              "displace dir: nested file in subtree preserved")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_displace_nonexistent(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "displace", {
+                "filesystem_root": str(fs),
+                "path": "does/not/exist.txt",
+                "staging_timestamp": TS1,
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"displace nonexistent: status={r.get('status')}, full={r}")
+        check(not r.get("backup_path"),
+              f"displace nonexistent: backup_path should be absent, got {r.get('backup_path')!r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+# ---- cleanup_expired ----
+
+def test_cleanup_expired(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        bak = fs / "album" / ".kitchensync" / "BAK"
+        tmp = fs / "album" / ".kitchensync" / "TMP"
+
+        expired_bak = "2026-04-30_23-59-59_000000Z"
+        retained_bak = "2026-05-01_00-00-00_000000Z"
+        expired_tmp = "2026-05-13_23-59-59_000000Z"
+
+        (bak / expired_bak).mkdir(parents=True)
+        (bak / expired_bak / "old.txt").write_bytes(b"old")
+        (bak / retained_bak).mkdir(parents=True)
+        (bak / "not-a-timestamp").mkdir(parents=True)
+        (tmp / expired_tmp / "uuid1").mkdir(parents=True)
+        (tmp / expired_tmp / "uuid1" / "staged.dat").write_bytes(b"tmp")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "cleanup-expired", {
+                "filesystem_root": str(fs),
+                "directory_path": "album",
+                "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
+                "tmp_cutoff_exclusive": "2026-05-14_00-00-00_000000Z",
+            })
+        r = parse_result(resp)
+        check(r.get("status") in ("success", "partial_success"),
+              f"cleanup: status={r.get('status')}, full={r}")
+        removed = r.get("removed_paths", [])
+        check(any(expired_bak in p for p in removed),
+              f"cleanup: expired BAK '{expired_bak}' must appear in removed_paths={removed}")
+        check(any(expired_tmp in p for p in removed),
+              f"cleanup: expired TMP '{expired_tmp}' must appear in removed_paths={removed}")
+        check(not (bak / expired_bak).exists(),
+              "cleanup: expired BAK dir deleted from filesystem")
+        check(not (tmp / expired_tmp).exists(),
+              "cleanup: expired TMP dir deleted from filesystem")
+        check((bak / retained_bak).exists(),
+              "cleanup: retained BAK dir must still exist")
+        check((bak / "not-a-timestamp").exists(),
+              "cleanup: non-timestamp directory must be ignored and preserved")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_cleanup_root_directory(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        expired_bak = "2026-04-15_00-00-00_000000Z"
+        (fs / ".kitchensync" / "BAK" / expired_bak).mkdir(parents=True)
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "cleanup-expired", {
+                "filesystem_root": str(fs),
+                "directory_path": "",
+                "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
+                "tmp_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
+            })
+        r = parse_result(resp)
+        check(r.get("status") in ("success", "partial_success"),
+              f"cleanup root: status={r.get('status')}, full={r}")
+        check(not (fs / ".kitchensync" / "BAK" / expired_bak).exists(),
+              "cleanup root: expired BAK at root level must be deleted")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_cleanup_missing_kitchensync(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        (fs / "mydir").mkdir(parents=True)
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "cleanup-expired", {
+                "filesystem_root": str(fs),
+                "directory_path": "mydir",
+                "bak_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
+                "tmp_cutoff_exclusive": "2026-05-01_00-00-00_000000Z",
+            })
+        r = parse_result(resp)
+        check(r.get("status") == "success",
+              f"cleanup no .kitchensync: status={r.get('status')}, full={r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+# ---- error behavior ----
+
+def test_invalid_path_errors(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "a.txt").write_bytes(b"x")
+
+        cases = [
+            ("/leading/slash", "leading slash"),
+            ("trailing/slash/", "trailing slash"),
+            ("has\\backslash", "backslash"),
+            ("empty//segment", "empty segment"),
+            ("dot/./segment", "dot segment"),
+            ("dotdot/../up", "dotdot segment"),
+        ]
+
+        with conn(port) as sock:
+            for i, (bad_path, label) in enumerate(cases, start=1):
+                resp = call_tool(sock, "copy-file", {
+                    "source_root": str(fs),
+                    "source_path": "a.txt",
+                    "destination_root": str(fs),
+                    "destination_path": bad_path,
+                    "winning_mod_time": MOD_TIME,
+                    "staging_timestamp": TS1,
+                    "transfer_id": UID1,
+                    "chunk_size": 4096,
+                    "channel_capacity": 4,
+                }, rpc_id=i)
+                r = parse_result(resp)
+                check(r.get("error") == "invalid_path",
+                      f"invalid path ({label}): expected error=invalid_path, got {r}")
+
+            resp = call_tool(sock, "displace", {
+                "filesystem_root": str(fs),
+                "path": "/absolute",
+                "staging_timestamp": TS1,
+            }, rpc_id=len(cases) + 1)
+            r = parse_result(resp)
+            check(r.get("error") == "invalid_path",
+                  f"displace invalid path: expected error=invalid_path, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_invalid_timestamp_errors(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "a.txt").write_bytes(b"x")
+
+        cases = [
+            ("2026-05-15T10:31:00Z", "ISO 8601 format"),
+            ("2026-05-15_10-31-00", "missing microseconds and Z"),
+            ("not-a-timestamp", "gibberish"),
+            ("2026-13-15_10-31-00_000001Z", "month=13"),
+        ]
+
+        with conn(port) as sock:
+            for i, (bad_ts, label) in enumerate(cases, start=1):
+                resp = call_tool(sock, "copy-file", {
+                    "source_root": str(fs),
+                    "source_path": "a.txt",
+                    "destination_root": str(fs),
+                    "destination_path": "b.txt",
+                    "winning_mod_time": MOD_TIME,
+                    "staging_timestamp": bad_ts,
+                    "transfer_id": UID1,
+                    "chunk_size": 4096,
+                    "channel_capacity": 4,
+                }, rpc_id=i)
+                r = parse_result(resp)
+                check(r.get("error") == "invalid_timestamp",
+                      f"invalid timestamp ({label}): expected error=invalid_timestamp, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_invalid_transfer_id_errors(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "a.txt").write_bytes(b"x")
+
+        cases = [
+            ("not-a-uuid", "random string"),
+            ("123456789", "numeric only"),
+            ("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk", "invalid hex chars"),
+        ]
+
+        with conn(port) as sock:
+            for i, (bad_id, label) in enumerate(cases, start=1):
+                resp = call_tool(sock, "copy-file", {
+                    "source_root": str(fs),
+                    "source_path": "a.txt",
+                    "destination_root": str(fs),
+                    "destination_path": "b.txt",
+                    "winning_mod_time": MOD_TIME,
+                    "staging_timestamp": TS1,
+                    "transfer_id": bad_id,
+                    "chunk_size": 4096,
+                    "channel_capacity": 4,
+                }, rpc_id=i)
+                r = parse_result(resp)
+                check(r.get("error") == "invalid_transfer_id",
+                      f"invalid transfer_id ({label}): expected error=invalid_transfer_id, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_invalid_settings_errors(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "a.txt").write_bytes(b"x")
+
+        cases = [
+            (0, 4, "chunk_size=0"),
+            (-1, 4, "chunk_size=-1"),
+            (4096, 0, "channel_capacity=0"),
+            (4096, -1, "channel_capacity=-1"),
+        ]
+
+        with conn(port) as sock:
+            for i, (chunk, cap, label) in enumerate(cases, start=1):
+                resp = call_tool(sock, "copy-file", {
+                    "source_root": str(fs),
+                    "source_path": "a.txt",
+                    "destination_root": str(fs),
+                    "destination_path": "b.txt",
+                    "winning_mod_time": MOD_TIME,
+                    "staging_timestamp": TS1,
+                    "transfer_id": UID1,
+                    "chunk_size": chunk,
+                    "channel_capacity": cap,
+                }, rpc_id=i)
+                r = parse_result(resp)
+                check(r.get("error") == "invalid_settings",
+                      f"invalid settings ({label}): expected error=invalid_settings, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_same_source_and_destination(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        fs = tmpdir / "fs"
+        fs.mkdir()
+        (fs / "a.txt").write_bytes(b"x")
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(fs),
+                "source_path": "a.txt",
+                "destination_root": str(fs),
+                "destination_path": "a.txt",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("error") == "same_source_and_destination",
+              f"same src+dst: expected error=same_source_and_destination, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def test_source_not_found(port: int) -> None:
+    tmpdir = Path(tempfile.mkdtemp(prefix="sft_"))
+    try:
+        src = tmpdir / "src"
+        dst = tmpdir / "dst"
+        src.mkdir(); dst.mkdir()
+
+        with conn(port) as sock:
+            resp = call_tool(sock, "copy-file", {
+                "source_root": str(src),
+                "source_path": "missing.txt",
+                "destination_root": str(dst),
+                "destination_path": "out.txt",
+                "winning_mod_time": MOD_TIME,
+                "staging_timestamp": TS1,
+                "transfer_id": UID1,
+                "chunk_size": 4096,
+                "channel_capacity": 4,
+            })
+        r = parse_result(resp)
+        check(r.get("error") == "not_found",
+              f"source not found: expected error=not_found, got {r}")
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+# not reasonably testable: concurrent reader/writer overlap -- internal pipeline concurrency
+#   not observable through tools/call
+# not reasonably testable: failed read/write before rename leaves original in place --
+#   requires fault injection into filesystem backend
+# not reasonably testable: displacement failure during copy prevents final rename --
+#   requires fault injection
+# not reasonably testable: set_mod_time failure -> partial_success with file in place --
+#   requires fault injection
+# not reasonably testable: cleanup partial failure continues and returns partial_success --
+#   requires fault injection
+# not reasonably testable: library stdout/stderr suppression -- indistinguishable from
+#   MCP wrapper's own stdout (MCP_PORT line) through tools/call surface
+
+
+def main() -> None:
+    proc, port = launch_mcp()
+    try:
+        test_copy_nested_empty_destination(port)
+        test_copy_root_level_path(port)
+        test_copy_over_existing_file(port)
+        test_copy_over_existing_directory(port)
+        test_copy_same_filesystem_different_paths(port)
+        test_copy_small_chunk_preserves_binary(port)
+        test_copy_winning_mod_time(port)
+        test_displace_file(port)
+        test_displace_directory(port)
+        test_displace_nonexistent(port)
+        test_cleanup_expired(port)
+        test_cleanup_root_directory(port)
+        test_cleanup_missing_kitchensync(port)
+        test_invalid_path_errors(port)
+        test_invalid_timestamp_errors(port)
+        test_invalid_transfer_id_errors(port)
+        test_invalid_settings_errors(port)
+        test_same_source_and_destination(port)
+        test_source_not_found(port)
+    finally:
+        shutdown_mcp(proc, port)
 
     if failures:
-        print("FAIL")
-        for index, failure in enumerate(failures, 1):
-            print(f"{index}. {failure}")
-        return 1
-    print("PASS")
-    return 0
+        print(f"\n{len(failures)} check(s) failed:")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
+    else:
+        print("\nAll checks passed.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

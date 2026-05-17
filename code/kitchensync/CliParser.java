@@ -21,6 +21,7 @@ final class CliParser {
                 case "--mc" -> options.maxConnections = positiveInt(value(args, ++i, arg), arg);
                 case "--ct" -> options.connectTimeoutSeconds = positiveInt(value(args, ++i, arg), arg);
                 case "--ka" -> options.keepAliveSeconds = positiveInt(value(args, ++i, arg), arg);
+                case "--dir-status" -> options.dirStatusSeconds = nonNegativeInt(value(args, ++i, arg), arg);
                 case "--xd" -> options.tmpRetentionDays = positiveInt(value(args, ++i, arg), arg);
                 case "--bd" -> options.bakRetentionDays = positiveInt(value(args, ++i, arg), arg);
                 case "--td" -> options.tombstoneRetentionDays = positiveInt(value(args, ++i, arg), arg);
@@ -58,6 +59,18 @@ final class CliParser {
         try {
             int value = Integer.parseInt(text);
             if (value <= 0) {
+                throw new NumberFormatException();
+            }
+            return value;
+        } catch (NumberFormatException ex) {
+            throw new ValidationException("Invalid value for " + flag + ": " + text);
+        }
+    }
+
+    private static int nonNegativeInt(String text, String flag) {
+        try {
+            int value = Integer.parseInt(text);
+            if (value < 0) {
                 throw new NumberFormatException();
             }
             return value;

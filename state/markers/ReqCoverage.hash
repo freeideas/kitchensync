@@ -1,9 +1,9 @@
 {
   "schema": "aitc.hash.v1",
   "job": "ReqCoverage",
-  "taken_at_utc": "2026-05-16T10:59:13Z",
+  "taken_at_utc": "2026-05-17T17:40:12Z",
   "hashes": {
-    "reqs": "9e0fa26dbd1a39bdbd5270cdc100de8566282b7992cacfbf11f65b35262ba017",
-    "specs": "6073745182f066f1385a19001da024b4a3d36ba3e62d08e5868d18d54f29741d"
+    "reqs": "bf157f5865885c24e67f59ef095ec1fe31fabf98a67d032613e099f0c4286cb3",
+    "specs": "658df71a4967251e17c45055b5d2c8d77de658a6371482389383238c7900fae1"
   }
 }

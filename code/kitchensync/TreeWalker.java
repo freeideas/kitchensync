@@ -21,6 +21,11 @@ import gitignore.matcher.PatternLayer;
 import snapshot.database.EntryMetadata;
 import snapshot.database.SnapshotDatabase;
 import snapshot.database.SnapshotTime;
+import staged.file.transfer.DisplaceRequest;
+import staged.file.transfer.OperationResult;
+import staged.file.transfer.OperationStatus;
+import staged.file.transfer.StagedFileTransfer;
+import staged.file.transfer.TransferException;
 import sync.decision.engine.AuthoritativeKind;
 import sync.decision.engine.DecisionInput;
 import sync.decision.engine.EntryDecision;
@@ -51,6 +56,7 @@ final class TreeWalker {
     }
 
     private void syncDirectory(List<Peer> peers, String dir, IgnoreMatcher matcher) {
+        logger.setCurrentDirectory(dir);
         Map<Peer, CompletableFuture<List<EntryInfo>>> futures = new LinkedHashMap<>();
         for (Peer peer : peers) {
             futures.put(peer, CompletableFuture.supplyAsync(() -> list(peer, dir), executor));
@@ -72,6 +78,7 @@ final class TreeWalker {
         if (active.stream().noneMatch(p -> !p.subordinate())) {
             return;
         }
+        confirmListedDirectory(active, dir);
 
         Set<String> names = new LinkedHashSet<>();
         for (Map<String, EntryInfo> listing : listings.values()) {
@@ -93,6 +100,8 @@ final class TreeWalker {
                         logger.error("failed to read .syncignore at " + dir);
                     }
                 }
+            } else if (ignoreDecision.authoritativeState().kind() == AuthoritativeKind.DIRECTORY) {
+                logger.error("failed to read .syncignore at " + dir);
             }
             names.remove(".syncignore");
         }
@@ -149,16 +158,29 @@ final class TreeWalker {
         LinkedHashMap<PeerId, PeerRole> roles = new LinkedHashMap<>();
         Map<PeerId, LiveEntry> live = new LinkedHashMap<>();
         Map<PeerId, sync.decision.engine.SnapshotRow> snapshots = new LinkedHashMap<>();
+        Map<PeerId, EntryInfo> liveEntries = new LinkedHashMap<>();
         for (Peer peer : active) {
             roles.put(peer.id, peer.role);
             EntryInfo entry = listings.get(peer).get(name);
             if (entry != null) {
-                live.put(peer.id, new LiveEntry(entry.directory() ? sync.decision.engine.EntryKind.DIRECTORY
-                        : sync.decision.engine.EntryKind.FILE, entry.modTime(), entry.byteSize()));
+                liveEntries.put(peer.id, entry);
             }
             synchronized (peer.snapshot) {
                 peer.snapshot.lookup(path).ifPresent(row -> snapshots.put(peer.id, toDecisionRow(row)));
             }
+        }
+        boolean canonPresent = active.stream().anyMatch(Peer::canon);
+        boolean contributingHistory = active.stream().anyMatch(peer -> !peer.subordinate() && snapshots.containsKey(peer.id));
+        for (Peer peer : active) {
+            EntryInfo entry = liveEntries.get(peer.id);
+            if (entry == null) {
+                continue;
+            }
+            if (!canonPresent && contributingHistory && !peer.subordinate() && !snapshots.containsKey(peer.id)) {
+                continue;
+            }
+            live.put(peer.id, new LiveEntry(entry.directory() ? sync.decision.engine.EntryKind.DIRECTORY
+                    : sync.decision.engine.EntryKind.FILE, entry.modTime(), entry.byteSize()));
         }
         return SyncDecisionEngine.decideEntry(new DecisionInput(path, roles, live, snapshots));
     }
@@ -167,12 +189,13 @@ final class TreeWalker {
             EntryDecision decision) {
         String path = PathUtil.child(dir, name);
         EntryInfo winning = winningEntry(active, listings, name, decision);
+        boolean directoryDecision = decision.authoritativeState().kind() == AuthoritativeKind.DIRECTORY;
         boolean loggedCopy = false;
         boolean loggedDelete = false;
         for (Peer peer : active) {
             List<SnapshotEffect> snapshotEffects = decision.snapshotEffects().getOrDefault(peer.id, List.of());
             for (SnapshotEffect effect : snapshotEffects) {
-                applySnapshot(peer, path, winning, effect);
+                applySnapshot(peer, path, winning, effect, directoryDecision);
             }
         }
         for (Peer peer : active) {
@@ -192,6 +215,10 @@ final class TreeWalker {
                         Peer source = peer(active, decision.authoritativeState().sourcePeer()).orElse(null);
                         if (source != null) {
                             EntryInfo current = listings.get(peer).get(name);
+                            if (current != null && matchesFile(winning, current)) {
+                                confirmPresent(peer, path);
+                                continue;
+                            }
                             if (current != null && !current.directory() && !loggedDelete) {
                                 logger.info("X " + path);
                                 loggedDelete = true;
@@ -210,19 +237,29 @@ final class TreeWalker {
         }
     }
 
-    private void applySnapshot(Peer peer, String path, EntryInfo winning, SnapshotEffect effect) {
+    private void confirmPresent(Peer peer, String path) {
+        try {
+            EntryInfo live = peer.transport.stat(path);
+            synchronized (peer.snapshot) {
+                if (!live.directory()) {
+                    markOldDirectorySubtreeDisplaced(peer.snapshot, path);
+                }
+                peer.snapshot.record_present(path, metadata(live), times.nextSnapshotTime());
+            }
+        } catch (Exception ex) {
+            logger.error("snapshot update failed for " + path);
+        }
+    }
+
+    private void applySnapshot(Peer peer, String path, EntryInfo winning, SnapshotEffect effect, boolean directoryDecision) {
         if (effect == SnapshotEffect.NO_SNAPSHOT_CHANGE) {
             return;
         }
         try {
             switch (effect) {
                 case CONFIRM_PRESENT -> {
-                    EntryInfo live = peer.transport.stat(path);
-                    synchronized (peer.snapshot) {
-                        if (!live.directory()) {
-                            markOldDirectorySubtreeDisplaced(peer.snapshot, path);
-                        }
-                        peer.snapshot.record_present(path, metadata(live), times.nextSnapshotTime());
+                    if (!directoryDecision) {
+                        confirmPresent(peer, path);
                     }
                 }
                 case COPY_PENDING -> {
@@ -270,6 +307,15 @@ final class TreeWalker {
         }
     }
 
+    private void confirmListedDirectory(List<Peer> active, String dir) {
+        if (dir.isEmpty()) {
+            return;
+        }
+        for (Peer peer : active) {
+            confirmPresent(peer, dir);
+        }
+    }
+
     private static void markOldDirectorySubtreeDisplaced(SnapshotDatabase db, String path) {
         if (db.lookup(path)
                 .map(row -> row.kind() == snapshot.database.EntryKind.DIRECTORY && row.deleted_time().isEmpty())
@@ -292,6 +338,17 @@ final class TreeWalker {
                 TimeUtil.snapshotTime(entry.modTime()), entry.byteSize());
     }
 
+    private static boolean matchesFile(EntryInfo winning, EntryInfo current) {
+        return !winning.directory() && !current.directory()
+                && winning.byteSize() == current.byteSize()
+                && !laterThanTolerance(winning.modTime(), current.modTime())
+                && !laterThanTolerance(current.modTime(), winning.modTime());
+    }
+
+    private static boolean laterThanTolerance(Instant left, Instant right) {
+        return java.time.Duration.between(right, left).compareTo(java.time.Duration.ofSeconds(5)) > 0;
+    }
+
     private static sync.decision.engine.SnapshotRow toDecisionRow(snapshot.database.SnapshotRow row) {
         return new sync.decision.engine.SnapshotRow(
                 row.kind() == snapshot.database.EntryKind.DIRECTORY ? sync.decision.engine.EntryKind.DIRECTORY
@@ -303,25 +360,36 @@ final class TreeWalker {
     }
 
     private void displace(Peer peer, String path) throws TransportException {
-        String parent = PathUtil.parent(path);
-        String basename = PathUtil.basename(path);
-        String bakDir = PathUtil.child(parent, ".kitchensync/BAK/" + times.nextText());
-        peer.transport.createDir(bakDir);
-        peer.transport.rename(path, PathUtil.child(bakDir, basename));
+        try {
+            OperationResult result = StagedFileTransfer.displace(
+                    new DisplaceRequest(new StagedTransferAdapter(peer.transport), path, times.nextText()));
+            if (result.status() == OperationStatus.failed) {
+                throw new TransportException(TransportException.Category.IO_ERROR,
+                        result.error() == null ? "displace failed" : result.error().name());
+            }
+        } catch (TransferException ex) {
+            throw new TransportException(TransportException.Category.IO_ERROR, ex.error().name(), ex);
+        }
     }
 
     private void cleanupMetadata(List<Peer> peers, String dir) {
         for (Peer peer : peers) {
-            cleanup(peer.transport, PathUtil.child(dir, ".kitchensync/BAK"), options.bakRetentionDays);
-            cleanup(peer.transport, PathUtil.child(dir, ".kitchensync/TMP"), options.tmpRetentionDays);
+            cleanup(peer.transport, dir);
         }
     }
 
-    private void cleanup(Transport transport, String path, int retentionDays) {
+    private void cleanup(Transport transport, String dir) {
+        String metadata = PathUtil.child(dir, ".kitchensync");
+        String bakCutoff = TimeUtil.snapshotTime(Instant.now().minus(options.bakRetentionDays, ChronoUnit.DAYS)).value();
+        String tmpCutoff = TimeUtil.snapshotTime(Instant.now().minus(options.tmpRetentionDays, ChronoUnit.DAYS)).value();
+        cleanupKind(transport, PathUtil.child(metadata, "BAK"), bakCutoff);
+        cleanupKind(transport, PathUtil.child(metadata, "TMP"), tmpCutoff);
+    }
+
+    private void cleanupKind(Transport transport, String path, String cutoff) {
         try {
-            Instant cutoff = Instant.now().minus(retentionDays, ChronoUnit.DAYS);
             for (EntryInfo entry : transport.listDir(path)) {
-                if (entry.directory() && older(entry.name(), cutoff)) {
+                if (entry.directory() && entry.name().compareTo(cutoff) < 0) {
                     deleteRecursive(transport, PathUtil.child(path, entry.name()));
                 }
             }
@@ -330,8 +398,8 @@ final class TreeWalker {
     }
 
     private void deleteRecursive(Transport transport, String path) throws TransportException {
-        EntryInfo stat = transport.stat(path);
-        if (!stat.directory()) {
+        EntryInfo entry = transport.stat(path);
+        if (!entry.directory()) {
             transport.deleteFile(path);
             return;
         }
@@ -339,14 +407,6 @@ final class TreeWalker {
             deleteRecursive(transport, PathUtil.child(path, child.name()));
         }
         transport.deleteDir(path);
-    }
-
-    private boolean older(String timestamp, Instant cutoff) {
-        try {
-            return TimeUtil.instant(timestamp).isBefore(cutoff);
-        } catch (RuntimeException ex) {
-            return false;
-        }
     }
 
     private static EntryInfo firstEntry(Map<Peer, Map<String, EntryInfo>> listings, String name) {

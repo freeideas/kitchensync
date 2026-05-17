@@ -8,7 +8,7 @@ import snapshot.database.SnapshotTime;
 import snapshot.database.SnapshotTimestampGenerator;
 
 final class TimeUtil {
-    private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_SSSSSS'Z'")
+    private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("uuuu-MM-dd_HH-mm-ss_SSSSSS'Z'")
             .withZone(ZoneOffset.UTC);
     private final SnapshotTimestampGenerator generator = new SnapshotTimestampGenerator();
 

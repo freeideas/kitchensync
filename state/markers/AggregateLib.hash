@@ -1,18 +1,18 @@
 {
   "schema": "aitc.hash.v1",
   "job": "AggregateLib",
-  "taken_at_utc": "2026-05-16T11:39:56Z",
+  "taken_at_utc": "2026-05-17T21:07:56Z",
   "hashes": {
-    "subpjx/gitignore-matcher/released_lib": "3aefbc120596d1003cd25e6a8bc61ae9e12185f1099af273300b302c73812d8f",
-    "subpjx/gitignore-matcher/released_mcp": "a11c8778a1d530c583d60f51ff3adaac9805e3fe95c569e3a3988b16036240d6",
-    "subpjx/sftp-protocol/released_lib": "a09234a642fc81f1151f31ef40d1430d130fb02ad0d8a0931bfe5c458042cee7",
-    "subpjx/sftp-protocol/released_mcp": "d674f119e3e4eb3ed00eab7446af5271af5cc60fae45c7312ec3059a66065d7e",
-    "subpjx/snapshot-database/released_lib": "22fe09114dbd87fb788ee9f1740d15f5c306c5a2e77f2b00a25c8e62ded462f2",
-    "subpjx/snapshot-database/released_mcp": "fdbc01a35b57420a95869347a566878006f6b8723ff490af890f71599da90dd3",
+    "subpjx/gitignore-matcher/released_lib": "ee9dd6df6b225ede74cf891160f10a5171aba81633e0c8767e865ef06f4dbdb3",
+    "subpjx/gitignore-matcher/released_mcp": "448c8c06839270aaf53b8fac3131ccb1c2640c55baf7f035b38948c014555398",
+    "subpjx/sftp-protocol/released_lib": "4197e718096e0b1eb3e76e622a2da8fac21cb5b506ab713f00ffb4a668649a28",
+    "subpjx/sftp-protocol/released_mcp": "6893d44ade891a36f0a3bfa9a0c8590221ee09aa3c307cf96b3ba9dd017b86f9",
+    "subpjx/snapshot-database/released_lib": "f3040052ad091a3cb388498dc2f1859c5c89196f63e6b03ed1eb7a09177233a1",
+    "subpjx/snapshot-database/released_mcp": "ed22d6bb9a94af813e0c0c1ed777ebdbb3cf75742b232fc13da9a16b97510e74",
     "subpjx/staged-file-transfer/released_lib": "13ae38211251708fb846e70a92839d8c0e30cdc83e31d8fd34e315e39794afd1",
-    "subpjx/staged-file-transfer/released_mcp": "cfb06d195647ca28fca06db4d3f062f714e87017ef088bfcf2ce7769eae9cccd",
+    "subpjx/staged-file-transfer/released_mcp": "cb1c2374eeeca186da66c92b08f9e0dd453380bda8e45de847893b24b4dc20b0",
     "subpjx/sync-decision-engine/released_lib": "31850c1e30d8c6e2811a244426ad756d5372179ba22fa0fbf693feced9cd8edb",
-    "subpjx/sync-decision-engine/released_mcp": "34c1f000aafddbc8a985bdbaee4530239b14b1d9baf90d6fbfb6be7850507000",
+    "subpjx/sync-decision-engine/released_mcp": "05c1f3951ad48d678b9173dfea6b07f04d6938e96955523474af3d9254e8bca1",
     "subpjx/url-parser/released_lib": "0af91c96f5e85ee4c46bc939af49ee281f31ea05ba409bb13ceca339112e66ee",
     "subpjx/url-parser/released_mcp": "8155b10412a7837db02bfdb576bd64df606937a1c7257999764b30fd70f2ea8f"
   }

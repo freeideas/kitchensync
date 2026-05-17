@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env uvrun
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
@@ -13,27 +13,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path("/home/ace/Desktop/prjx/kitchensync")
-JAVA = PROJECT_DIR / "tools/compiler/jdk/bin/java"
-JAR = PROJECT_DIR / "released/kitchensync.jar"
-WORK = PROJECT_DIR / "tests/.tmp/03_builtin-excludes"
-
-
-def clean(path: Path) -> None:
-    if path.exists() or path.is_symlink():
-        shutil.rmtree(path, ignore_errors=True)
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+PROJECT_DIR = Path("C:/Users/human/Desktop/prjx/kitchensync")
+WORK = PROJECT_DIR / "tests" / "tmp" / "03_builtin-excludes"
 
 
-def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
-
-
-def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(JAVA), "-jar", str(JAR), *peers],
-        cwd=str(PROJECT_DIR),
+        [str(JAVA), "-jar", str(JAR), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -45,220 +36,197 @@ def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def note_result(
-    failures: list[str], name: str, condition: bool, detail: str = ""
-) -> None:
-    if condition:
-        print(f"PASS: {name}")
-    else:
-        message = f"FAIL: {name}"
-        if detail:
-            message = f"{message}: {detail}"
-        print(message)
+def reset_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+
+
+def write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def check(failures: list[str], condition: bool, message: str) -> None:
+    if not condition:
         failures.append(message)
 
 
-def no_entry(path: Path) -> bool:
-    return not path.exists() and not path.is_symlink()
-
-
-def text_equals(path: Path, expected: str, failures: list[str], name: str) -> None:
-    try:
-        actual = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        note_result(failures, name, False, f"could not read {path}: {exc}")
-        return
-    note_result(
-        failures,
-        name,
-        actual == expected,
-        f"expected {expected!r} at {path}, got {actual!r}",
-    )
-
-
-def check_sync_succeeded(
-    failures: list[str], name: str, result: subprocess.CompletedProcess[str]
+def check_run(
+    failures: list[str], result: subprocess.CompletedProcess[str], label: str
 ) -> None:
-    detail = (
-        f"exit={result.returncode}\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
-    )
-    note_result(failures, name, result.returncode == 0, detail)
+    if result.returncode != 0:
+        failures.append(
+            f"{label} exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
 
 
-def make_symlink(link: Path, target: Path, failures: list[str], name: str) -> None:
+# 03.47, 03.48, 03.49: .kitchensync/, symlinks, and special files are never
+# synced even when .syncignore explicitly attempts to negate their exclusion.
+def scenario_hard_builtin_excludes(failures: list[str]) -> None:
+    source = WORK / "hard-src"
+    dest = WORK / "hard-dst"
+    reset_dir(source)
+    reset_dir(dest)
+
+    write(source / "ordinary.txt", "ordinary\n")
+    write(source / ".kitchensync" / "private.txt", "must not sync\n")
+    write(source / "nested" / ".kitchensync" / "private.txt", "must not sync\n")
+
+    # attempt symlinks -- skip symlink assertions if the OS disallows creation
+    symlinks_created = False
+    write(source / "file-target.txt", "target\n")
+    (source / "dir-target").mkdir()
+    write(source / "dir-target" / "inside.txt", "inside\n")
     try:
-        link.symlink_to(target, target_is_directory=target.is_dir())
-    except OSError as exc:
-        failures.append(f"FAIL: {name}: could not create symlink: {exc}")
+        (source / "link-file").symlink_to(source / "file-target.txt")
+        (source / "link-dir").symlink_to(source / "dir-target", target_is_directory=True)
+        symlinks_created = True
+    except OSError:
+        print("03.48: skipped -- cannot create symlinks in this environment")
 
+    # attempt special files (platform-dependent)
+    special_entries: list[Path] = []
+    open_sockets: list[socket.socket] = []
+    if hasattr(os, "mkfifo"):
+        fifo = source / "special-fifo"
+        try:
+            os.mkfifo(fifo)
+            special_entries.append(fifo)
+        except OSError:
+            pass
+    if hasattr(socket, "AF_UNIX"):
+        sock_path = source / "special-socket"
+        try:
+            unix_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            unix_sock.bind(str(sock_path))
+            unix_sock.listen(1)
+            open_sockets.append(unix_sock)
+            special_entries.append(sock_path)
+        except OSError:
+            pass
+    if not special_entries:
+        print("03.49: not reasonably testable on this host -- no FIFO or AF_UNIX socket available")
 
-def make_fifo(path: Path, failures: list[str]) -> None:
-    try:
-        os.mkfifo(path)
-    except OSError as exc:
-        failures.append(f"FAIL: fifo fixture: could not create FIFO: {exc}")
-
-
-def bind_socket(path: Path, failures: list[str]) -> socket.socket | None:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        sock.bind(str(path))
-        sock.listen(1)
-        return sock
-    except OSError as exc:
-        sock.close()
-        failures.append(f"FAIL: socket fixture: could not create socket: {exc}")
-        return None
-
-
-def exercise_hard_excludes(failures: list[str]) -> None:
-    source = WORK / "hard-source"
-    target = WORK / "hard-target"
-    source.mkdir(parents=True)
-    target.mkdir(parents=True)
-
-    write_text(
-        source / ".syncignore",
-        "\n".join(
-            [
-                "!.kitchensync/",
-                "!nested/.kitchensync/",
-                "!link-file",
-                "!link-dir/",
-                "!fifo-entry",
-                "!socket-entry",
-                "",
-            ]
-        ),
-    )
-    write_text(source / "regular.txt", "regular file copied\n")
-    write_text(source / "nested/keep.txt", "keeps parent directory observable\n")
-    write_text(source / ".kitchensync/root-hidden.txt", "must not sync\n")
-    write_text(source / "nested/.kitchensync/hidden.txt", "must not sync\n")
-    write_text(source / ".git/config", "must not sync by default\n")
-    write_text(source / "real-file.txt", "symlink target\n")
-    write_text(source / "real-dir/inside.txt", "directory symlink target\n")
-    make_symlink(source / "link-file", source / "real-file.txt", failures, "file symlink fixture")
-    make_symlink(source / "link-dir", source / "real-dir", failures, "directory symlink fixture")
-    # Device nodes are also special files, but portable plain-Python tests cannot
-    # create them without elevated, OS-specific setup. FIFOs and sockets cover the
-    # observable special-file exclusion through the public sync surface.
-    make_fifo(source / "fifo-entry", failures)
-    sock = bind_socket(source / "socket-entry", failures)
+    # .syncignore negates every hard exclude -- none should have any effect
+    ignore_lines = [
+        "!.kitchensync/", "!.kitchensync/**",
+        "!nested/.kitchensync/", "!nested/.kitchensync/**",
+    ]
+    if symlinks_created:
+        ignore_lines += ["!link-file", "!link-dir/"]
+    for entry in special_entries:
+        ignore_lines.append(f"!{entry.name}")
+    write(source / ".syncignore", "\n".join(ignore_lines) + "\n")
 
     try:
-        result = run_sync(f"+{source}", f"-{target}")
+        result = run_cli(f"+{source}", str(dest))
     finally:
-        if sock is not None:
+        for sock in open_sockets:
             sock.close()
 
-    check_sync_succeeded(failures, "sync with built-in excluded entries", result)
-    text_equals(
-        target / "regular.txt",
-        "regular file copied\n",
+    check_run(failures, result, "hard built-in excludes")
+    check(
         failures,
-        "ordinary files still sync in built-in exclusion scenario",
+        (dest / "ordinary.txt").read_text(encoding="utf-8") == "ordinary\n"
+        if (dest / "ordinary.txt").exists() else False,
+        "ordinary.txt must sync (baseline)",
     )
-    note_result(
+    # 03.47
+    check(
         failures,
-        "root .kitchensync payload is never synced even when unignored",
-        no_entry(target / ".kitchensync/root-hidden.txt"),
-        f"unexpected entry at {target / '.kitchensync/root-hidden.txt'}",
+        not (dest / ".kitchensync" / "private.txt").exists(),
+        "03.47: root .kitchensync/ content must not sync even when negated",
     )
-    note_result(
+    check(
         failures,
-        "nested .kitchensync payload is never synced even when unignored",
-        no_entry(target / "nested/.kitchensync/hidden.txt"),
-        f"unexpected entry at {target / 'nested/.kitchensync/hidden.txt'}",
+        not (dest / "nested" / ".kitchensync" / "private.txt").exists(),
+        "03.47: nested .kitchensync/ content must not sync even when negated",
     )
-    note_result(
-        failures,
-        "file symlink is never synced even when unignored",
-        no_entry(target / "link-file"),
-        f"unexpected entry at {target / 'link-file'}",
-    )
-    note_result(
-        failures,
-        "directory symlink is never synced even when unignored",
-        no_entry(target / "link-dir"),
-        f"unexpected entry at {target / 'link-dir'}",
-    )
-    note_result(
-        failures,
-        "FIFO is never synced even when unignored",
-        no_entry(target / "fifo-entry"),
-        f"unexpected entry at {target / 'fifo-entry'}",
-    )
-    note_result(
-        failures,
-        "socket is never synced even when unignored",
-        no_entry(target / "socket-entry"),
-        f"unexpected entry at {target / 'socket-entry'}",
-    )
-    note_result(
-        failures,
-        ".git is excluded by default",
-        no_entry(target / ".git/config"),
-        f"unexpected entry at {target / '.git/config'}",
-    )
+    # 03.48
+    if symlinks_created:
+        check(
+            failures,
+            not (dest / "link-file").exists() and not (dest / "link-file").is_symlink(),
+            "03.48: file symlink must not sync even when negated",
+        )
+        check(
+            failures,
+            not (dest / "link-dir").exists() and not (dest / "link-dir").is_symlink(),
+            "03.48: directory symlink must not sync even when negated",
+        )
+    # 03.49
+    for entry in special_entries:
+        check(
+            failures,
+            not (dest / entry.name).exists(),
+            f"03.49: special entry {entry.name!r} must not sync even when negated",
+        )
 
 
-def exercise_git_unignore(failures: list[str]) -> None:
-    source = WORK / "git-source"
-    target = WORK / "git-target"
-    source.mkdir(parents=True)
-    target.mkdir(parents=True)
+# 03.50: .git/ is excluded from sync by default (no .syncignore involved).
+def scenario_git_default_excluded(failures: list[str]) -> None:
+    source = WORK / "git-default-src"
+    dest = WORK / "git-default-dst"
+    reset_dir(source)
+    reset_dir(dest)
 
-    write_text(source / ".syncignore", "!.git/\n")
-    write_text(source / ".git/config", "[core]\n\trepositoryformatversion = 0\n")
-    write_text(source / ".git/refs/heads/main", "0123456789abcdef\n")
-    write_text(source / "subdir/.git/config", "[core]\n\tbare = false\n")
-    write_text(source / "normal.txt", "normal file copied\n")
+    write(source / "ordinary.txt", "ordinary\n")
+    write(source / ".git" / "config", "must not sync\n")
+    result = run_cli(f"+{source}", str(dest))
 
-    result = run_sync(f"+{source}", f"-{target}")
-    check_sync_succeeded(failures, "sync with .git explicitly unignored", result)
-    text_equals(
-        target / ".git/config",
-        "[core]\n\trepositoryformatversion = 0\n",
+    check_run(failures, result, ".git default exclusion")
+    check(failures, (dest / "ordinary.txt").exists(), "ordinary.txt must sync (baseline)")
+    check(failures, not (dest / ".git").exists(), "03.50: .git/ must be excluded by default")
+
+
+# 03.51: !.git/ in .syncignore re-enables .git/ at that level and below.
+def scenario_git_reenabled(failures: list[str]) -> None:
+    source = WORK / "git-reenabled-src"
+    dest = WORK / "git-reenabled-dst"
+    reset_dir(source)
+    reset_dir(dest)
+
+    write(source / ".syncignore", "!.git/\n")
+    write(source / ".git" / "config", "root git config\n")
+    write(source / "nested" / ".git" / "config", "nested git config\n")
+    result = run_cli(f"+{source}", str(dest))
+
+    check_run(failures, result, ".git re-enabled")
+    check(
         failures,
-        "!.git/ re-enables .git at that level",
+        (dest / ".git" / "config").read_text(encoding="utf-8") == "root git config\n"
+        if (dest / ".git" / "config").exists() else False,
+        "03.51: !.git/ must allow .git/ to sync at .syncignore level",
     )
-    text_equals(
-        target / ".git/refs/heads/main",
-        "0123456789abcdef\n",
+    check(
         failures,
-        "!.git/ re-enables entries below that level",
-    )
-    text_equals(
-        target / "subdir/.git/config",
-        "[core]\n\tbare = false\n",
-        failures,
-        "!.git/ follows normal hierarchy for lower .git directories",
+        (dest / "nested" / ".git" / "config").read_text(encoding="utf-8") == "nested git config\n"
+        if (dest / "nested" / ".git" / "config").exists() else False,
+        "03.51: !.git/ must allow .git/ to sync below .syncignore level",
     )
 
 
 def main() -> int:
     failures: list[str] = []
-    clean(WORK)
-    WORK.mkdir(parents=True, exist_ok=True)
-
+    reset_dir(WORK)
     try:
-        exercise_hard_excludes(failures)
-        exercise_git_unignore(failures)
-    except subprocess.TimeoutExpired as exc:
-        failures.append(f"FAIL: sync timed out: {exc}")
-    except Exception as exc:
-        failures.append(f"FAIL: unexpected test error: {type(exc).__name__}: {exc}")
+        scenario_hard_builtin_excludes(failures)
+        scenario_git_default_excluded(failures)
+        scenario_git_reenabled(failures)
     finally:
-        clean(WORK)
+        if WORK.exists():
+            shutil.rmtree(WORK)
 
     if failures:
-        print("\nFailures:")
-        for failure in failures:
-            print(f"- {failure}")
+        print("\nFAILURES:")
+        for i, f in enumerate(failures, 1):
+            print(f"\n{i}. {f}")
         return 1
+
+    print("03_builtin-excludes: all checks passed")
     return 0
 
 

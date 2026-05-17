@@ -279,19 +279,9 @@ public final class GitignorePatternSet {
             if (rootRelative) {
                 return regex.matcher(path).matches();
             }
-            int start = 0;
-            while (start <= path.length()) {
-                int slash = path.indexOf('/', start);
-                String segment = slash < 0 ? path.substring(start) : path.substring(start, slash);
-                if (regex.matcher(segment).matches()) {
-                    return true;
-                }
-                if (slash < 0) {
-                    return false;
-                }
-                start = slash + 1;
-            }
-            return false;
+            int lastSlash = path.lastIndexOf('/');
+            String name = lastSlash < 0 ? path : path.substring(lastSlash + 1);
+            return regex.matcher(name).matches();
         }
     }
 }

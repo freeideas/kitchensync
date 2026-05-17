@@ -10,31 +10,30 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PROJECT_DIR = Path(".")
-JAVA = Path("tools/compiler/jdk/bin/java")
-JAR = Path("released/kitchensync.jar")
-WORK_DIR = Path("tests/.tmp_03_canon_peer")
+JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
 
-
-def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+failures: list[str] = []
 
 
-def read_text(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+def check(condition: bool, message: str, detail: str = "") -> None:
+    if condition:
+        print(f"PASS: {message}")
+    else:
+        full = f"{message}\n  {detail}" if detail else message
+        failures.append(full)
+        print(f"FAIL: {full}")
 
 
-def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
+def run_sync(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(JAVA), "-jar", str(JAR), *peers],
-        cwd=PROJECT_DIR,
+        [str(JAVA), "-jar", str(JAR), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -46,134 +45,131 @@ def run_sync(*peers: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def result_summary(result: subprocess.CompletedProcess[str]) -> str:
-    out = result.stdout.strip()
-    err = result.stderr.strip()
-    parts = [f"exit={result.returncode}"]
-    if out:
-        parts.append(f"stdout={out[-800:]}")
-    if err:
-        parts.append(f"stderr={err[-800:]}")
-    return "; ".join(parts)
+def run_detail(result: subprocess.CompletedProcess[str]) -> str:
+    return f"rc={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
 
-def bak_matches(peer: Path, relative: str, expected_text: str | None = None) -> list[Path]:
-    matches = sorted((peer / ".kitchensync" / "BAK").glob(f"*/{relative}"))
-    if expected_text is None:
-        return matches
-    return [path for path in matches if read_text(path) == expected_text]
+def find_in_bak(peer_root: Path, name: str) -> list[Path]:
+    bak = peer_root / ".kitchensync" / "BAK"
+    if not bak.is_dir():
+        return []
+    return [p for p in bak.rglob("*") if p.name == name]
 
 
-def check(failures: list[str], condition: bool, message: str) -> None:
-    if not condition:
-        failures.append(message)
+def main() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        canon = Path(td) / "canon"
+        peer_a = Path(td) / "peer-a"
+        peer_b = Path(td) / "peer-b"
+        for d in (canon, peer_a, peer_b):
+            d.mkdir()
 
+        # Phase 1: seed sync -- establish snapshot history on all peers.
+        (canon / "conflict.txt").write_text("initial\n", encoding="utf-8")
+        os.utime(str(canon / "conflict.txt"), (1_700_000_000, 1_700_000_000))
+        (canon / "will-displace.txt").write_text("exists now\n", encoding="utf-8")
+        (canon / "will-displace-dir").mkdir()
+        (canon / "will-displace-dir" / "nested.txt").write_text("dir content\n", encoding="utf-8")
 
-def main() -> int:
-    failures: list[str] = []
-    canon = WORK_DIR / "canon"
-    peer_a = WORK_DIR / "peer_a"
-    peer_b = WORK_DIR / "peer_b"
-    peers = (peer_a, peer_b)
-
-    if WORK_DIR.exists():
-        shutil.rmtree(WORK_DIR)
-    canon.mkdir(parents=True)
-    for peer in peers:
-        peer.mkdir(parents=True)
-
-    initial_shared = "initial shared file\n"
-    initial_obsolete = "initial obsolete file\n"
-    initial_obsolete_dir = "initial obsolete directory file\n"
-    canon_shared = "canon\n"
-    peer_shared = "peer has a newer, larger file that canon must overwrite\n"
-    peer_obsolete = "peer-only file canon lacks and must displace\n"
-    peer_obsolete_dir = "peer-only directory content canon lacks and must displace\n"
-    canon_new_dir = "directory created from canon\n"
-
-    try:
-        write_text(canon / "shared.txt", initial_shared)
-        write_text(canon / "obsolete.txt", initial_obsolete)
-        write_text(canon / "obsolete_dir" / "inside.txt", initial_obsolete_dir)
-
-        seed = run_sync(f"+{canon}", *(str(peer) for peer in peers))
+        seed = run_sync("+" + str(canon), str(peer_a), str(peer_b))
         check(
-            failures,
             seed.returncode == 0,
-            "initial canon sync should succeed so every peer has snapshot history; "
-            + result_summary(seed),
+            "seed sync must succeed before canon-peer checks can be meaningful",
+            run_detail(seed),
         )
 
-        write_text(canon / "shared.txt", canon_shared)
-        os.utime(canon / "shared.txt", (946684800, 946684800))
-        for index, peer in enumerate(peers, start=1):
-            write_text(peer / "shared.txt", f"{peer_shared} peer {index}\n")
-            os.utime(peer / "shared.txt", (4102444800 + index, 4102444800 + index))
+        # Phase 2: mutate canon then re-sync with + to assert all four canon behaviors.
+        #
+        # 03.15: rewrite conflict.txt on canon with an OLDER mtime than the peer copies,
+        #        then advance peer mtimes -- canon must still win regardless of mod_time
+        #        and regardless of snapshot history.
+        canon_content = "canon wins\n"
+        (canon / "conflict.txt").write_text(canon_content, encoding="utf-8")
+        os.utime(str(canon / "conflict.txt"), (1_600_000_000, 1_600_000_000))
+        for peer in (peer_a, peer_b):
+            (peer / "conflict.txt").write_text("peer newer content\n", encoding="utf-8")
+            os.utime(str(peer / "conflict.txt"), (1_900_000_000, 1_900_000_000))
 
-        (canon / "obsolete.txt").unlink(missing_ok=True)
-        for index, peer in enumerate(peers, start=1):
-            write_text(peer / "obsolete.txt", f"{peer_obsolete} peer {index}\n")
-            os.utime(peer / "obsolete.txt", (4102444800 + index, 4102444800 + index))
+        # 03.16: remove will-displace.txt from canon; peers still have modified copies.
+        (canon / "will-displace.txt").unlink()
+        file_contents: dict[Path, str] = {}
+        for peer in (peer_a, peer_b):
+            content = f"{peer.name} changed after snapshot\n"
+            (peer / "will-displace.txt").write_text(content, encoding="utf-8")
+            os.utime(str(peer / "will-displace.txt"), (1_900_000_000, 1_900_000_000))
+            file_contents[peer] = content
 
-        shutil.rmtree(canon / "obsolete_dir", ignore_errors=True)
-        for index, peer in enumerate(peers, start=1):
-            write_text(peer / "obsolete_dir" / "inside.txt", f"{peer_obsolete_dir} peer {index}\n")
+        # 03.17: add a new directory to canon; peers don't have it.
+        (canon / "new-canon-dir").mkdir()
+        (canon / "new-canon-dir" / "readme.txt").write_text("from canon\n", encoding="utf-8")
 
-        write_text(canon / "new_dir" / "inside.txt", canon_new_dir)
-        for peer in peers:
-            shutil.rmtree(peer / "new_dir", ignore_errors=True)
+        # 03.40: remove will-displace-dir from canon; peers still have modified copies.
+        shutil.rmtree(str(canon / "will-displace-dir"))
+        for peer in (peer_a, peer_b):
+            (peer / "will-displace-dir" / f"{peer.name}.txt").write_text(
+                "peer directory changed after snapshot\n",
+                encoding="utf-8",
+            )
 
-        canon_run = run_sync(f"+{canon}", *(str(peer) for peer in peers))
+        result = run_sync("+" + str(canon), str(peer_a), str(peer_b))
         check(
-            failures,
-            canon_run.returncode == 0,
-            "canon sync should succeed after conflicting peer changes; "
-            + result_summary(canon_run),
+            result.returncode == 0,
+            "canon sync with snapshot history must exit 0",
+            run_detail(result),
         )
 
-        for index, peer in enumerate(peers, start=1):
-            check(
-                failures,
-                read_text(peer / "shared.txt") == canon_shared,
-                f"03.15 canon file should overwrite peer {index} even when the peer file is newer, larger, and has snapshot history",
+        for peer in (peer_a, peer_b):
+            # 03.15: peer file must carry canon's content despite its older mtime
+            actual = (
+                (peer / "conflict.txt").read_text(encoding="utf-8")
+                if (peer / "conflict.txt").exists()
+                else None
             )
             check(
-                failures,
-                not (peer / "obsolete.txt").exists(),
-                f"03.16 peer {index} file should be removed from its original path when the canon peer lacks that file",
+                actual == canon_content,
+                f"03.15: {peer.name}/conflict.txt must equal canon content regardless of mod_time",
+                f"got {actual!r}",
             )
-            check(
-                failures,
-                bool(bak_matches(peer, "obsolete.txt", f"{peer_obsolete} peer {index}\n")),
-                f"03.16 displaced peer {index} file should be recoverable under that peer's .kitchensync/BAK with its peer content",
-            )
-            check(
-                failures,
-                (peer / "new_dir").is_dir() and read_text(peer / "new_dir" / "inside.txt") == canon_new_dir,
-                f"03.17 canon directory should be created on peer {index} when that peer lacks it",
-            )
-            check(
-                failures,
-                not (peer / "obsolete_dir").exists(),
-                f"03.40 peer {index} directory should be removed from its original path when the canon peer lacks that directory",
-            )
-            check(
-                failures,
-                bool(bak_matches(peer, "obsolete_dir/inside.txt", f"{peer_obsolete_dir} peer {index}\n")),
-                f"03.40 displaced peer {index} directory should be recoverable under that peer's .kitchensync/BAK with its contents",
-            )
-    finally:
-        shutil.rmtree(WORK_DIR, ignore_errors=True)
 
-    if failures:
-        print("FAILURES:", file=sys.stderr)
-        for index, failure in enumerate(failures, start=1):
-            print(f"{index}. {failure}", file=sys.stderr)
-        return 1
+            # 03.16: file absent from canon must be displaced to BAK/ on peers
+            check(
+                not (peer / "will-displace.txt").exists(),
+                f"03.16: {peer.name}/will-displace.txt must not remain at original path",
+            )
+            archived = find_in_bak(peer, "will-displace.txt")
+            check(
+                any(p.is_file() and p.read_text(encoding="utf-8") == file_contents[peer] for p in archived),
+                f"03.16: modified will-displace.txt must be displaced under {peer.name}/.kitchensync/BAK/",
+                f"BAK contents: {list((peer / '.kitchensync' / 'BAK').rglob('*')) if (peer / '.kitchensync' / 'BAK').is_dir() else 'no BAK dir'}",
+            )
 
-    print("03_canon-peer passed")
-    return 0
+            # 03.17: directory present on canon must be created on peers that lack it
+            check(
+                (peer / "new-canon-dir").is_dir(),
+                f"03.17: new-canon-dir must be created on {peer.name}",
+            )
+
+            # 03.40: directory absent from canon must be displaced to BAK/ on peers
+            check(
+                not (peer / "will-displace-dir").exists(),
+                f"03.40: {peer.name}/will-displace-dir must not remain at original path",
+            )
+            archived_dir = find_in_bak(peer, "will-displace-dir")
+            check(
+                any((p / f"{peer.name}.txt").is_file() for p in archived_dir if p.is_dir()),
+                f"03.40: modified will-displace-dir must be displaced under {peer.name}/.kitchensync/BAK/",
+                f"BAK contents: {list((peer / '.kitchensync' / 'BAK').rglob('*')) if (peer / '.kitchensync' / 'BAK').is_dir() else 'no BAK dir'}",
+            )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
+
+    if failures:
+        print("FAILURES:", file=sys.stderr)
+        for i, f in enumerate(failures, 1):
+            print(f"{i}. {f}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("All checks passed.")
+        sys.exit(0)

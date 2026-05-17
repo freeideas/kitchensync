@@ -1,4 +1,4 @@
-# Decomposition
+﻿# Decomposition
 
 These are component boundaries that make sense for kitchensync from an
 architectural point of view. They are suggestions about useful library seams in

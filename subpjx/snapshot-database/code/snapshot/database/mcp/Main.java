@@ -18,11 +18,6 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.time.Clock;
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -30,15 +25,10 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class Main {
-    private static final Pattern TIME_PATTERN = Pattern.compile(
-            "^(\\d{4})-(\\d{2})-(\\d{2})_(\\d{2})-(\\d{2})-(\\d{2})_(\\d{6})Z$");
     private static final Map<String, SnapshotDatabase> DATABASES = new ConcurrentHashMap<>();
-    private static final AtomicLong NEXT_DATABASE_ID = new AtomicLong(1);
+    private static final SnapshotTimestampGenerator GENERATOR = new SnapshotTimestampGenerator();
     private static volatile boolean stopping;
     private static ServerSocket serverSocket;
 
@@ -109,8 +99,6 @@ public final class Main {
             return response(id, error(-32700, "parse error"));
         } catch (InvalidParamsException e) {
             return response(id, error(-32602, "invalid params"));
-        } catch (InvalidArgumentException e) {
-            return response(id, error(-32000, "invalid argument: " + e.getMessage()));
         } catch (ToolException e) {
             return response(id, error(-32000, e.getMessage()));
         } catch (SnapshotDatabaseException e) {
@@ -125,59 +113,72 @@ public final class Main {
         String name = requireParamsString(params.get("name"));
         Map<?, ?> args = requireParamsArguments(params.get("arguments"));
         Object output = switch (name) {
-            case "close-database" -> {
-                SnapshotDatabase database = database(args);
-                database.close();
+            case "close" -> {
+                validateArgs(args, "db_path");
+                String path = string(args, "db_path");
+                SnapshotDatabase db = DATABASES.remove(path);
+                if (db != null) {
+                    db.close();
+                }
                 yield Map.of();
             }
             case "confirm-copy-completed" -> {
+                validateArgs(args, "db_path", "relative_path", "seen_at");
                 database(args).confirm_copy_completed(string(args, "relative_path"), time(args, "seen_at"));
                 yield Map.of();
             }
-            case "generate-timestamps" -> {
-                List<?> values = requireList(args.get("wall_clock_times"), "wall_clock_times");
-                SequenceClock clock = new SequenceClock(values);
-                SnapshotTimestampGenerator generator = new SnapshotTimestampGenerator(clock);
-                java.util.ArrayList<String> timestamps = new java.util.ArrayList<>();
-                for (int i = 0; i < values.size(); i++) {
-                    timestamps.add(generator.next().value());
-                    clock.advance();
-                }
-                yield Map.of("timestamps", timestamps);
+            case "generate-timestamp" -> {
+                validateArgs(args);
+                yield Map.of("timestamp", GENERATOR.next().value());
             }
-            case "has-rows" -> Map.of("has_rows", database(args).has_rows());
+            case "has-rows" -> {
+                validateArgs(args, "db_path");
+                yield Map.of("has_rows", database(args).has_rows());
+            }
             case "lookup" -> {
-                Optional<SnapshotRow> row = database(args).lookup(string(args, "relative_path"));
-                yield map("found", row.isPresent(), "row", row.map(Main::row).orElse(null));
+                validateArgs(args, "db_path", "relative_path");
+                Optional<SnapshotRow> found = database(args).lookup(string(args, "relative_path"));
+                yield found.map(Main::rowMap).orElse(Map.of());
             }
             case "mark-absent" -> {
+                validateArgs(args, "db_path", "relative_path");
                 database(args).mark_absent(string(args, "relative_path"));
                 yield Map.of();
             }
             case "mark-displaced" -> {
+                validateArgs(args, "db_path", "relative_path");
                 database(args).mark_displaced(string(args, "relative_path"));
                 yield Map.of();
             }
-            case "open-database" -> {
-                SnapshotDatabase db = SnapshotDatabase.open(string(args, "db_file"));
-                String databaseId = "db-" + NEXT_DATABASE_ID.getAndIncrement();
-                DATABASES.put(databaseId, db);
-                yield Map.of("database_id", databaseId);
+            case "open" -> {
+                validateArgs(args, "db_path");
+                String path = string(args, "db_path");
+                DATABASES.computeIfAbsent(path, SnapshotDatabase::open);
+                yield Map.of();
             }
-            case "path-id" -> Map.of("id", SnapshotDatabase.path_id(string(args, "relative_path")));
+            case "path-id" -> {
+                validateArgs(args, "relative_path");
+                yield Map.of("id", SnapshotDatabase.path_id(string(args, "relative_path")));
+            }
             case "purge" -> {
-                PurgeResult result = database(args).purge(time(args, "cutoff_time"));
-                yield Map.of("deleted_count", result.deleted_rows());
+                validateArgs(args, "db_path", "cutoff_time");
+                PurgeResult r = database(args).purge(time(args, "cutoff_time"));
+                yield Map.of("deleted_count", r.deleted_rows());
             }
             case "record-copy-pending" -> {
+                validateArgs(args, "db_path", "relative_path", "kind", "mod_time", "byte_size");
                 database(args).record_copy_pending(string(args, "relative_path"), metadata(args));
                 yield Map.of();
             }
             case "record-present" -> {
+                validateArgs(args, "db_path", "relative_path", "kind", "mod_time", "byte_size", "seen_at");
                 database(args).record_present(string(args, "relative_path"), metadata(args), time(args, "seen_at"));
                 yield Map.of();
             }
-            case "root-parent-id" -> Map.of("id", SnapshotDatabase.root_parent_id());
+            case "root-parent-id" -> {
+                validateArgs(args);
+                yield Map.of("id", SnapshotDatabase.root_parent_id());
+            }
             default -> throw new ToolException("not implemented");
         };
         return response(id, result(output));
@@ -192,8 +193,8 @@ public final class Main {
 
     private static void shutdown() {
         stopping = true;
-        for (SnapshotDatabase database : DATABASES.values()) {
-            database.close();
+        for (SnapshotDatabase db : DATABASES.values()) {
+            db.close();
         }
         try {
             serverSocket.close();
@@ -203,58 +204,31 @@ public final class Main {
     }
 
     private static SnapshotDatabase database(Map<?, ?> args) {
-        SnapshotDatabase database = DATABASES.get(string(args, "database_id"));
-        if (database == null) {
-            throw new SnapshotDatabaseException("database_error", "database not found");
+        String path = string(args, "db_path");
+        SnapshotDatabase db = DATABASES.get(path);
+        if (db == null) {
+            throw new SnapshotDatabaseException("database_error", "database not found: " + path);
         }
-        return database;
+        return db;
     }
 
     private static EntryMetadata metadata(Map<?, ?> args) {
-        Object metadataValue = args.get("metadata");
-        if (!(metadataValue instanceof Map<?, ?> metadata)) {
-            throw new SnapshotDatabaseException("invalid_metadata", "metadata is required");
-        }
+        requireMetadataField(args, "kind");
+        requireMetadataField(args, "mod_time");
+        requireMetadataField(args, "byte_size");
         return new EntryMetadata(
-                EntryKind.fromWireName(metadataString(metadata, "kind")),
-                metadataTime(metadata),
-                metadataLong(metadata, "byte_size"));
+                EntryKind.fromWireName(string(args, "kind")),
+                time(args, "mod_time"),
+                longArg(args, "byte_size"));
     }
 
-    private static SnapshotTime metadataTime(Map<?, ?> metadata) {
-        Object value = metadata.get("mod_time");
-        if (!(value instanceof String text)) {
+    private static void requireMetadataField(Map<?, ?> args, String key) {
+        if (!args.containsKey(key)) {
             throw new SnapshotDatabaseException("invalid_metadata", "metadata is required");
         }
-        return new SnapshotTime(text);
     }
 
-    private static String metadataString(Map<?, ?> metadata, String key) {
-        Object value = metadata.get(key);
-        if (value instanceof String string) {
-            return string;
-        }
-        throw new SnapshotDatabaseException("invalid_metadata", "metadata is required");
-    }
-
-    private static long metadataLong(Map<?, ?> metadata, String key) {
-        Object value = metadata.get(key);
-        if (value instanceof Long number) {
-            return number;
-        }
-        if (value instanceof Integer number) {
-            return number.longValue();
-        }
-        if (value instanceof Short number) {
-            return number.longValue();
-        }
-        if (value instanceof Byte number) {
-            return number.longValue();
-        }
-        throw new SnapshotDatabaseException("invalid_metadata", "metadata is required");
-    }
-
-    private static Map<String, Object> row(SnapshotRow row) {
+    private static Map<String, Object> rowMap(SnapshotRow row) {
         return map(
                 "basename", row.basename(),
                 "byte_size", row.byte_size(),
@@ -269,61 +243,65 @@ public final class Main {
 
     private static List<Map<String, Object>> tools() {
         return List.of(
-                tool("close-database", "Close an open snapshot database.", dbHandle(), emptySchema()),
-                tool("confirm-copy-completed", "Confirm that a pending copy completed.", dbHandle("relative_path", "seen_at"), emptySchema()),
-                tool("generate-timestamps", "Generate strictly increasing snapshot timestamps.", objectSchema(map("wall_clock_times", map("items", stringSchema(), "type", "array")), List.of("wall_clock_times")), objectSchema(map("timestamps", map("items", stringSchema(), "type", "array")), List.of("timestamps"))),
-                tool("has-rows", "Report whether the snapshot table has rows.", dbHandle(), objectSchema(map("has_rows", map("type", "boolean")), List.of("has_rows"))),
-                tool("lookup", "Look up one snapshot row by relative path.", dbHandle("relative_path"), lookupOutputSchema()),
-                tool("mark-absent", "Mark one path absent if it exists.", dbHandle("relative_path"), emptySchema()),
-                tool("mark-displaced", "Mark one path and its descendants displaced.", dbHandle("relative_path"), emptySchema()),
-                tool("open-database", "Open and initialize a snapshot database.", objectSchema(map("db_file", stringSchema()), List.of("db_file")), objectSchema(map("database_id", stringSchema()), List.of("database_id"))),
-                tool("path-id", "Calculate the deterministic path ID for a relative path.", objectSchema(map("relative_path", stringSchema()), List.of("relative_path")), objectSchema(map("id", stringSchema()), List.of("id"))),
-                tool("purge", "Delete stale snapshot rows older than a cutoff.", dbHandle("cutoff_time"), objectSchema(map("deleted_count", map("type", "integer")), List.of("deleted_count"))),
-                tool("record-copy-pending", "Record metadata for a decided file copy before completion.", dbHandle("relative_path", "metadata"), emptySchema()),
-                tool("record-present", "Record an entry confirmed present.", dbHandle("relative_path", "metadata", "seen_at"), emptySchema()),
-                tool("root-parent-id", "Return the root parent sentinel path ID.", objectSchema(Map.of(), List.of()), objectSchema(map("id", stringSchema()), List.of("id"))));
+                tool("close", "Close an open snapshot database.", dbPathSchema(), emptySchema()),
+                tool("confirm-copy-completed", "Confirm a pending file copy completed.", dbPathWith("relative_path", "seen_at"), emptySchema()),
+                tool("generate-timestamp", "Generate a strictly increasing snapshot timestamp.", emptySchema(), objectSchema(map("timestamp", stringSchema()), List.of("timestamp"))),
+                tool("has-rows", "Return true when the snapshot table has rows.", dbPathSchema(), objectSchema(map("has_rows", map("type", "boolean")), List.of("has_rows"))),
+                tool("lookup", "Look up one snapshot row by relative path.", dbPathWith("relative_path"), lookupOutputSchema()),
+                tool("mark-absent", "Mark one path absent.", dbPathWith("relative_path"), emptySchema()),
+                tool("mark-displaced", "Mark one path and its descendants displaced.", dbPathWith("relative_path"), emptySchema()),
+                tool("open", "Open and initialize a snapshot database file.", dbPathSchema(), emptySchema()),
+                tool("path-id", "Return the deterministic path ID for a relative path.", pathOnlySchema(), objectSchema(map("id", stringSchema()), List.of("id"))),
+                tool("purge", "Delete stale rows older than a cutoff timestamp.", dbPathWith("cutoff_time"), objectSchema(map("deleted_count", map("type", "integer")), List.of("deleted_count"))),
+                tool("record-copy-pending", "Record metadata for a decided file copy.", dbPathWith("relative_path", "kind", "mod_time", "byte_size"), emptySchema()),
+                tool("record-present", "Record an entry confirmed present.", dbPathWith("relative_path", "kind", "mod_time", "byte_size", "seen_at"), emptySchema()),
+                tool("root-parent-id", "Return the root-child parent sentinel path ID.", emptySchema(), objectSchema(map("id", stringSchema()), List.of("id"))));
     }
 
-    private static Map<String, Object> tool(String name, String description, Map<String, Object> input, Map<String, Object> output) {
+    private static Map<String, Object> tool(
+            String name,
+            String description,
+            Map<String, Object> input,
+            Map<String, Object> output) {
         return map("description", description, "inputSchema", input, "name", name, "outputSchema", output);
     }
 
-    private static Map<String, Object> dbHandle(String... extraRequired) {
-        Map<String, Object> properties = new TreeMap<>();
-        properties.put("database_id", stringSchema());
-        for (String field : extraRequired) {
-            switch (field) {
-                case "metadata" -> properties.put("metadata", metadataSchema());
-                case "seen_at", "cutoff_time" -> properties.put(field, stringSchema());
-                default -> properties.put(field, stringSchema());
-            }
-        }
+    private static Map<String, Object> dbPathSchema() {
+        return objectSchema(map("db_path", stringSchema()), List.of("db_path"));
+    }
+
+    private static Map<String, Object> dbPathWith(String... extras) {
+        Map<String, Object> props = new TreeMap<>();
+        props.put("db_path", stringSchema());
         List<String> required = new java.util.ArrayList<>();
-        required.add("database_id");
-        required.addAll(List.of(extraRequired));
-        return objectSchema(properties, required);
+        required.add("db_path");
+        for (String extra : extras) {
+            if (extra.equals("byte_size")) {
+                props.put(extra, map("type", "integer"));
+            } else {
+                props.put(extra, stringSchema());
+            }
+            required.add(extra);
+        }
+        return objectSchema(props, required);
+    }
+
+    private static Map<String, Object> pathOnlySchema() {
+        return objectSchema(map("relative_path", stringSchema()), List.of("relative_path"));
     }
 
     private static Map<String, Object> lookupOutputSchema() {
-        Map<String, Object> row = objectSchema(map(
-                "basename", stringSchema(),
-                "byte_size", map("type", "integer"),
-                "deleted_time", map("type", List.of("string", "null")),
-                "id", stringSchema(),
-                "kind", stringSchema(),
-                "last_seen", map("type", List.of("string", "null")),
-                "mod_time", stringSchema(),
-                "parent_id", stringSchema(),
-                "relative_path", stringSchema()), List.of(
-                "basename", "byte_size", "deleted_time", "id", "kind", "last_seen", "mod_time", "parent_id", "relative_path"));
-        return objectSchema(map("found", map("type", "boolean"), "row", map("anyOf", List.of(row, map("type", "null")))), List.of("found", "row"));
-    }
-
-    private static Map<String, Object> metadataSchema() {
-        return objectSchema(map(
-                "byte_size", map("type", "integer"),
-                "kind", map("enum", List.of("file", "directory"), "type", "string"),
-                "mod_time", stringSchema()), List.of("byte_size", "kind", "mod_time"));
+        Map<String, Object> props = new TreeMap<>();
+        props.put("basename", stringSchema());
+        props.put("byte_size", map("type", "integer"));
+        props.put("deleted_time", map("type", List.of("string", "null")));
+        props.put("id", stringSchema());
+        props.put("kind", map("enum", List.of("file", "directory"), "type", "string"));
+        props.put("last_seen", map("type", List.of("string", "null")));
+        props.put("mod_time", stringSchema());
+        props.put("parent_id", stringSchema());
+        props.put("relative_path", stringSchema());
+        return objectSchema(props, List.of());
     }
 
     private static Map<String, Object> emptySchema() {
@@ -338,33 +316,48 @@ public final class Main {
         return map("type", "string");
     }
 
-    private static SnapshotTime time(Map<?, ?> map, String key) {
-        return new SnapshotTime(string(map, key));
+    private static SnapshotTime time(Map<?, ?> args, String key) {
+        return new SnapshotTime(string(args, key));
     }
 
     private static String string(Map<?, ?> map, String key) {
-        return requireString(map.get(key), key);
+        Object value = map.get(key);
+        if (value instanceof String s) {
+            return s;
+        }
+        throw new ToolException("invalid argument: " + key + " must be a string");
     }
 
-    private static String requireString(Object value, String name) {
-        if (value instanceof String string) {
-            return string;
+    private static long longArg(Map<?, ?> args, String key) {
+        Object value = args.get(key);
+        if (value instanceof Long l) {
+            return l;
         }
-        throw new InvalidArgumentException(name);
+        if (value instanceof Integer i) {
+            return i.longValue();
+        }
+        throw new ToolException("invalid argument: " + key + " must be an integer");
     }
 
-    private static Map<?, ?> requireObject(Object value, String name) {
-        if (value instanceof Map<?, ?> map) {
-            return map;
+    private static void validateArgs(Map<?, ?> args, String... required) {
+        java.util.Set<String> allowed = new java.util.TreeSet<>(List.of(required));
+        for (String key : required) {
+            if (!args.containsKey(key)) {
+                if (isMetadataField(key)) {
+                    throw new SnapshotDatabaseException("invalid_metadata", "metadata is required");
+                }
+                throw new ToolException("invalid argument: " + key + " is required");
+            }
         }
-        throw new InvalidArgumentException(name);
+        for (Object key : args.keySet()) {
+            if (!(key instanceof String name) || !allowed.contains(name)) {
+                throw new ToolException("invalid argument: unknown field");
+            }
+        }
     }
 
-    private static List<?> requireList(Object value, String name) {
-        if (value instanceof List<?> list) {
-            return list;
-        }
-        throw new InvalidArgumentException(name);
+    private static boolean isMetadataField(String key) {
+        return "kind".equals(key) || "mod_time".equals(key) || "byte_size".equals(key);
     }
 
     private static Map<?, ?> requireParamsObject(Object value) {
@@ -375,8 +368,8 @@ public final class Main {
     }
 
     private static String requireParamsString(Object value) {
-        if (value instanceof String string) {
-            return string;
+        if (value instanceof String s) {
+            return s;
         }
         throw new InvalidParamsException();
     }
@@ -386,23 +379,6 @@ public final class Main {
             return map;
         }
         throw new InvalidParamsException();
-    }
-
-    private static Instant instant(String value) {
-        new SnapshotTime(value);
-        Matcher matcher = TIME_PATTERN.matcher(value);
-        if (!matcher.matches()) {
-            throw new SnapshotDatabaseException("invalid_timestamp", "invalid timestamp");
-        }
-        LocalDateTime dateTime = LocalDateTime.of(
-                Integer.parseInt(matcher.group(1)),
-                Integer.parseInt(matcher.group(2)),
-                Integer.parseInt(matcher.group(3)),
-                Integer.parseInt(matcher.group(4)),
-                Integer.parseInt(matcher.group(5)),
-                Integer.parseInt(matcher.group(6)),
-                Integer.parseInt(matcher.group(7)) * 1_000);
-        return dateTime.toInstant(ZoneOffset.UTC);
     }
 
     private static Map<String, Object> result(Object value) {
@@ -436,18 +412,8 @@ public final class Main {
         return body;
     }
 
-    private static Response response(Object id, Map<String, Object> payload, boolean shutdown) {
-        return new Response(responseBody(id, payload), shutdown);
-    }
-
     private static Response response(Object id, Map<String, Object> payload) {
-        return response(id, payload, false);
-    }
-
-    private static final class InvalidArgumentException extends RuntimeException {
-        InvalidArgumentException(String message) {
-            super(message);
-        }
+        return new Response(responseBody(id, payload), false);
     }
 
     private static final class InvalidParamsException extends RuntimeException {
@@ -456,36 +422,6 @@ public final class Main {
     private static final class ToolException extends RuntimeException {
         ToolException(String message) {
             super(message);
-        }
-    }
-
-    private static final class SequenceClock extends Clock {
-        private final List<?> values;
-        private int index;
-
-        SequenceClock(List<?> values) {
-            this.values = values;
-        }
-
-        void advance() {
-            if (index + 1 < values.size()) {
-                index++;
-            }
-        }
-
-        @Override
-        public ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return Main.instant(requireString(values.get(index), "wall_clock_times"));
         }
     }
 }

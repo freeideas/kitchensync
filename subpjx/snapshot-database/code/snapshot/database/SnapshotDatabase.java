@@ -280,6 +280,7 @@ public final class SnapshotDatabase implements AutoCloseable {
     private static String normalize(String relativePath) {
         if (relativePath == null
                 || relativePath.isEmpty()
+                || relativePath.equals(".")
                 || relativePath.equals("/")
                 || relativePath.startsWith("/")
                 || relativePath.endsWith("/")

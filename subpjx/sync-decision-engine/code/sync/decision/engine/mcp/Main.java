@@ -255,13 +255,8 @@ public final class Main {
 
     private static Map<String, Object> filesystemToJson(EntryDecision decision) {
         LinkedHashMap<String, Object> rows = new LinkedHashMap<>();
-        String source = decision.authoritativeState().sourcePeer() == null ? null : decision.authoritativeState().sourcePeer().value();
         for (var peer : decision.filesystemEffects().entrySet()) {
-            List<Object> effects = new ArrayList<>();
-            for (FilesystemEffect effect : peer.getValue()) {
-                effects.add(map("effect", effect.wireName(), "source_peer", effect == FilesystemEffect.COPY_FILE ? source : null));
-            }
-            rows.put(peer.getKey().value(), effects);
+            rows.put(peer.getKey().value(), peer.getValue().stream().map(FilesystemEffect::wireName).toList());
         }
         return rows;
     }
@@ -348,13 +343,7 @@ public final class Main {
     }
 
     private static Map<String, Object> filesystemEffectSchema() {
-        return map(
-                "additionalProperties", false,
-                "properties", map(
-                        "effect", map("enum", List.of("keep", "copy_file", "create_directory", "displace"), "type", "string"),
-                        "source_peer", map("type", List.of("string", "null"))),
-                "required", List.of("effect", "source_peer"),
-                "type", "object");
+        return map("enum", List.of("keep", "copy_file", "create_directory", "displace"), "type", "string");
     }
 
     private static Map<String, Object> snapshotEffectSchema() {

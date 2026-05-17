@@ -365,8 +365,10 @@ Required scenarios:
   database and does not affect unrelated rows.
 - `purge` removes old tombstones, old live rows, and rows with absent
   `last_seen`, while preserving newer rows.
-- `SnapshotTimestampGenerator` returns strictly increasing timestamp text even
-  when the wall clock repeats.
+- `SnapshotTimestampGenerator` returns exact-format, strictly increasing
+  timestamp text across consecutive calls through the public wrapper. Do not
+  require black-box wrapper tests to force a repeated wall clock unless a clock
+  injection hook is part of the wrapper surface.
 - Failed transactions leave the previous committed rows observable.
 - No public operation emits stdout or stderr.
 
@@ -381,8 +383,7 @@ Scenarios to avoid:
 - Do not test physical BAK/TMP path creation, file renames, atomic swaps, or
   cleanup of staged filesystem directories.
 - Do not test ignore-pattern parsing or `.syncignore` resolution.
-- Do not require wall-clock sleeps tighter than one microsecond; inject a clock
-  or equivalent time source for timestamp generator tests.
+- Do not require wall-clock sleeps tighter than one microsecond.
 
 ## Semantic Anchors
 

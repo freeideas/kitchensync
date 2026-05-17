@@ -131,11 +131,11 @@ public final class Main {
         Map<String, Object> arguments = (Map<String, Object>) rawArguments;
         try {
             return switch (name) {
-                case "compile-matcher" -> response(id, Map.of("result", compileMatcher(arguments)));
-                case "empty-matcher" -> response(id, Map.of("result", emptyMatcher(arguments)));
-                case "extend-matcher" -> response(id, Map.of("result", extendMatcher(arguments)));
-                case "match-entry" -> response(id, Map.of("result", matchEntry(arguments)));
-                case "filter-entries" -> response(id, Map.of("result", filterEntries(arguments)));
+                case "compile" -> response(id, Map.of("result", compileMatcher(arguments)));
+                case "empty" -> response(id, Map.of("result", emptyMatcher(arguments)));
+                case "extend" -> response(id, Map.of("result", extendMatcher(arguments)));
+                case "match" -> response(id, Map.of("result", matchEntry(arguments)));
+                case "filter" -> response(id, Map.of("result", filterEntries(arguments)));
                 default -> response(id, error(-32000, "not implemented"));
             };
         } catch (IgnoreMatcherException ex) {
@@ -147,32 +147,32 @@ public final class Main {
         }
     }
 
-    private static Map<String, Object> compileMatcher(Map<String, Object> arguments) {
+    private static String compileMatcher(Map<String, Object> arguments) {
         requireOnly(arguments, Set.of("layers", "options"));
         return matcherId(IgnoreMatcher.compile(layers(required(arguments, "layers")), options(arguments.get("options"))));
     }
 
-    private static Map<String, Object> emptyMatcher(Map<String, Object> arguments) {
+    private static String emptyMatcher(Map<String, Object> arguments) {
         requireOnly(arguments, Set.of("options"));
         return matcherId(IgnoreMatcher.empty(options(arguments.get("options"))));
     }
 
-    private static Map<String, Object> extendMatcher(Map<String, Object> arguments) {
-        requireOnly(arguments, Set.of("matcher_id", "layer"));
-        IgnoreMatcher matcher = matcher(required(arguments, "matcher_id"));
-        return matcherId(matcher.extend(layer(required(arguments, "layer"))));
+    private static String extendMatcher(Map<String, Object> arguments) {
+        requireOnly(arguments, Set.of("matcher", "layer"));
+        IgnoreMatcher m = matcher(required(arguments, "matcher"));
+        return matcherId(m.extend(layer(required(arguments, "layer"))));
     }
 
     private static Map<String, Object> matchEntry(Map<String, Object> arguments) {
-        requireOnly(arguments, Set.of("matcher_id", "entry"));
-        IgnoreMatcher matcher = matcher(required(arguments, "matcher_id"));
-        return matchResult(matcher.match(pathEntry(required(arguments, "entry"))));
+        requireOnly(arguments, Set.of("matcher", "entry"));
+        IgnoreMatcher m = matcher(required(arguments, "matcher"));
+        return matchResult(m.match(pathEntry(required(arguments, "entry"))));
     }
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> filterEntries(Map<String, Object> arguments) {
-        requireOnly(arguments, Set.of("matcher_id", "entries"));
-        IgnoreMatcher matcher = matcher(required(arguments, "matcher_id"));
+        requireOnly(arguments, Set.of("matcher", "entries"));
+        IgnoreMatcher m = matcher(required(arguments, "matcher"));
         Object value = required(arguments, "entries");
         if (!(value instanceof List<?> rawEntries)) {
             throw new IllegalArgumentException("entries must be an array");
@@ -182,25 +182,25 @@ public final class Main {
             entries.add(pathEntry(item));
         }
         ArrayList<Map<String, Object>> kept = new ArrayList<>();
-        for (PathEntry entry : matcher.filter(entries)) {
+        for (PathEntry entry : m.filter(entries)) {
             kept.add(pathEntryJson(entry));
         }
         return Map.of("entries", kept);
     }
 
-    private static Map<String, Object> matcherId(IgnoreMatcher matcher) {
+    private static String matcherId(IgnoreMatcher m) {
         String id = Long.toString(nextMatcherId.getAndIncrement());
-        matchers.put(id, matcher);
-        return Map.of("matcher_id", id);
+        matchers.put(id, m);
+        return id;
     }
 
     private static IgnoreMatcher matcher(Object value) {
-        String id = string(value, "matcher_id");
-        IgnoreMatcher matcher = matchers.get(id);
-        if (matcher == null) {
-            throw new IllegalArgumentException("unknown matcher_id");
+        String id = string(value, "matcher");
+        IgnoreMatcher m = matchers.get(id);
+        if (m == null) {
+            throw new IllegalArgumentException("unknown matcher");
         }
-        return matcher;
+        return m;
     }
 
     private static PatternLayer layer(Object value) {
