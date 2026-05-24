@@ -66,10 +66,11 @@ final class SnapshotManager {
                 peer.transport.createDir(".kitchensync");
                 String stage = ".kitchensync/TMP/" + times.nextText() + "/" + UUID.randomUUID() + "/snapshot.db";
                 writeLocalFileToTransport(peer.localSnapshotPath, peer.transport, stage);
+                deleteIfExists(peer.transport, SNAPSHOT_PATH);
                 peer.transport.rename(stage, SNAPSHOT_PATH);
                 deleteSnapshotSidecars(peer.transport);
             } catch (TransportException | IOException ex) {
-                logger.error("snapshot upload failed for " + peer.url.normalized());
+                logger.error("snapshot upload failed for " + peer.url.normalized() + ": " + detail(ex));
             }
         }
     }
@@ -87,6 +88,13 @@ final class SnapshotManager {
                 throw ex;
             }
         }
+    }
+
+    private static String detail(Exception ex) {
+        if (ex instanceof TransportException transportException) {
+            return transportException.category().name().toLowerCase() + ": " + transportException.getMessage();
+        }
+        return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
     }
 
     private boolean downloadSnapshot(Transport transport, Path target) throws IOException {

@@ -45,14 +45,39 @@ Query-string parameters on a URL override global settings (see concurrency.md fo
 
 Query-string parameters are stripped during URL normalization - they are not part of the URL's identity.
 
+### Command-Line Excludes
+
+`-x <relative-path>` excludes one path from scanning, decisions, copying,
+deletion, displacement, and snapshot updates. The flag is repeatable.
+
+Exclude paths are slash-separated relative paths in the same format KitchenSync
+prints in stdout progress lines:
+
+- no leading `/`;
+- no trailing `/`;
+- no `\` separators;
+- no empty, `.`, or `..` path segments;
+- no NUL characters.
+
+If the excluded path is a file, only that file is skipped. If it is a directory,
+the directory and all descendants are skipped. Excluded entries are treated as
+if they do not exist for this run. Existing excluded files or directories on any
+peer are left untouched, and existing snapshot rows for excluded paths are not
+consulted or updated during the run.
+
+Command-line excludes are stronger than `.syncignore`: a `.syncignore` negation
+cannot re-include a path excluded by `-x`. Excluding `.syncignore` itself
+prevents that ignore file from being resolved at that directory.
+
 ### Global Options
 
 | Flag   | Default | Meaning                                |
 | ------ | ------- | -------------------------------------- |
-| `--mc` | 10      | Max SFTP connections per user+host+port |
+| `--mc` | 10      | Max concurrent transfers/connections    |
 | `--ct` | 30      | Seconds for SSH handshake timeout      |
 | `--ka` | 30      | SFTP idle keep-alive TTL (seconds)     |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
+| `-x`   | -       | Exclude a relative path from scanning and copying; repeatable |
 | `--dir-status` | 10 | Seconds of quiet stdout before directory status is logged; 0 disables |
 | `--xd` | 2       | Delete stale TMP staging after N days  |
 | `--bd` | 90      | Delete displaced files (BAK/) after N days |
@@ -98,7 +123,7 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 
 ## Startup
 
-1. Parse command line. A help invocation is any of: `-h`, `--help`, `/?`, or no arguments at all; help invocations print the help text to stdout and exit 0 (see `help.md`). For non-help invocations, validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--ka`, `--xd`, `--bd`, and `--td` are positive integers; `--dir-status` is a non-negative integer; `-vl` is one of `error`/`info`/`debug`/`trace`). On any validation error, print the error message followed by the help text and exit 1.
+1. Parse command line. A help invocation is any of: `-h`, `--help`, `/?`, or no arguments at all; help invocations print the help text to stdout and exit 0 (see `help.md`). For non-help invocations, validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--mc`, `--ct`, `--ka`, `--xd`, `--bd`, and `--td` are positive integers; `--dir-status` is a non-negative integer; `-vl` is one of `error`/`info`/`debug`/`trace`; every `-x` path is a valid relative slash path). On any validation error, print the error message followed by the help text and exit 1.
 2. Connect to all peers in parallel. Auto-create the peer's root directory (and any missing parents) if it does not exist - for both `file://` and `sftp://` URLs. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. Skip unreachable peers with an error-level diagnostic. If directory creation fails, treat the peer as unreachable (try next fallback URL).
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
@@ -123,6 +148,27 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 
 File copies are enqueued during the combined-tree walk and executed concurrently, subject to per-peer connection limits (see concurrency.md). Directory creation and displacement to BAK/ run inline during the walk - both are same-filesystem operations that subsequent steps may depend on.
 
+### Rename Compatibility
+
+KitchenSync must not assume that transport `rename(src, dst)` overwrites an
+existing destination. This matters for SFTP servers that reject rename when
+`dst` already exists.
+
+User data replacement is a BAK operation, not a delete operation. When a copied
+file would replace an existing file or directory, KitchenSync must first move
+the existing destination to BAK, then rename the fully staged replacement into
+place. If moving the existing destination to BAK fails, the original destination
+must remain in place, the staged TMP file must be cleaned up when possible, and
+the copy is skipped for that run.
+
+Snapshot replacement is a metadata replace operation. Uploading
+`.kitchensync/snapshot.db` must write the new database to a TMP path and close
+it before changing the live snapshot path. Replacement must work on transports
+whose rename does not overwrite an existing target. The implementation may
+delete the old `.kitchensync/snapshot.db` immediately before renaming the staged
+snapshot into place. If the final rename fails, the staged snapshot is left
+under TMP for `--xd` cleanup and the failure is logged.
+
 ### File Copy
 
 Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires one connection from the source peer's pool and one from the destination peer's pool before starting (see concurrency.md for pool semantics - SFTP pools are keyed by user+host+port, so two SFTP peers that share user+host+port share a pool; `file://` peers have no pool).
@@ -133,7 +179,25 @@ Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires 
 4. **Set mod_time** - set the destination file's modification time to the winning mod_time from the decision (not re-read from the source)
 5. **Clean up** empty TMP directories
 
-Content is streamed, not buffered entirely in memory. Each transfer spawns two concurrent tasks connected by a bounded channel: a reader task that reads chunks from the source and pushes them into the channel, and a writer task that pulls chunks and writes them to the destination. The reader and writer operate simultaneously - the channel provides backpressure (reader blocks when the channel is full, writer blocks when it is empty). A single-loop read-then-write pattern is not acceptable. On transfer failure, delete the TMP staging file/directory for that transfer before returning the connections to the pool.
+Content is streamed, not buffered entirely in memory. Each transfer uses a
+generous bounded buffer sized for modern hardware: large enough to avoid
+excessive syscall and transport round trips, but still bounded so many
+concurrent transfers cannot consume unbounded memory. The default chunk size
+must be at least 1 MiB unless a transport-specific constraint requires smaller
+chunks. Each streamed transfer spawns two concurrent tasks connected by a
+bounded channel: a reader task that reads chunks from the source and pushes them
+into the channel, and a writer task that pulls chunks and writes them to the
+destination. The reader and writer operate simultaneously - the channel provides
+backpressure (reader blocks when the channel is full, writer blocks when it is
+empty). A single-loop read-then-write pattern is not acceptable.
+
+When both source and destination are local filesystems, KitchenSync may use the
+host filesystem's native file-copy primitive to populate the TMP staging file
+instead of the generic streaming pump. The same safety boundary still applies:
+copy to TMP first, displace any existing destination to BAK, rename TMP into
+place, set the winning mod_time, and clean up temporary staging on failure.
+On transfer failure, delete the TMP staging file/directory for that transfer
+before returning the connections to the pool.
 
 ### Displace to BAK
 
@@ -154,6 +218,17 @@ Logged once per decision, not per peer. This gives the user visible progress out
 Directory status is a quiet-period progress line. During the combined-tree walk, KitchenSync tracks the directory currently being listed or compared. If no stdout line has been written for `--dir-status` seconds, it logs `? <relative-directory>` at `info` level. The root directory is logged as `? .`. A value of `--dir-status 0` disables directory status logging.
 
 Verbosity levels (`-vl`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative - each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in section Errors below, nonfatal diagnostics for skipped peers and recoverable operation failures, and listing errors described in multi-tree-sync.md section Algorithm), `info` (the `C`/`X` progress lines above and `?` directory status lines), and `trace` (pool acquire/release events, see concurrency.md section Trace Logging). No debug-specific messages are defined; `-vl debug` is observationally identical to `-vl info` until debug-only messages are specified.
+
+Failed file-transfer diagnostics must identify the relative path, the
+destination peer URL, the failed phase, and the transport error category when
+available. The failed phase is one of: `read_source`, `write_tmp`,
+`displace_existing`, `rename_final`, `set_mod_time`, or `cleanup`.
+
+Example:
+
+```text
+transfer failed for kitchensync.exe to sftp://ace@host/path: displace_existing: permission_denied
+```
 
 ## TMP Staging
 
@@ -198,6 +273,12 @@ All operations return the same error categories regardless of transport: not fou
 ### Testability
 
 Each transport is independently testable via its own component-level interface (the `sftp-protocol` component exposes its surface for direct testing; the file-stdlib path is exercised by end-to-end tests with `file://` peers). The full sync is tested end-to-end via the CLI with mixed transports - typical end-to-end tests use `file://` peers under a temporary directory; additional tests exercise `sftp://` peers against localhost. See `TESTING-GUIDELINES.md`.
+
+SFTP replacement behavior must be tested against a local SFTP fixture or fake
+transport that rejects plain rename-over-existing while allowing ordinary
+create, write, delete, and rename-to-new-path operations. KitchenSync must pass
+that fixture for both snapshot replacement and user-file replacement. Tests
+must not depend on a personal LAN host or external account.
 
 ## Errors
 

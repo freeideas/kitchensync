@@ -12,5 +12,6 @@ final class RunOptions {
     int tmpRetentionDays = 2;
     int bakRetentionDays = 90;
     int tombstoneRetentionDays = 180;
+    final List<String> excludes = new ArrayList<>();
     final List<PeerArgument> peers = new ArrayList<>();
 }

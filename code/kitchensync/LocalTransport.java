@@ -53,6 +53,22 @@ final class LocalTransport implements Transport {
         }
     }
 
+    List<String> listNames(String relativePath) throws TransportException {
+        Path dir = resolve(relativePath);
+        if (!Files.isDirectory(dir)) {
+            throw notFound(relativePath);
+        }
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            for (Path child : stream) {
+                names.add(child.getFileName().toString());
+            }
+            return names;
+        } catch (IOException ex) {
+            throw io("list failed: " + relativePath, ex);
+        }
+    }
+
     @Override
     public EntryInfo stat(String relativePath) throws TransportException {
         Path path = resolve(relativePath);
@@ -185,6 +201,10 @@ final class LocalTransport implements Transport {
             return root;
         }
         return root.resolve(relativePath.replace('/', java.io.File.separatorChar)).normalize();
+    }
+
+    Path localPath(String relativePath) {
+        return resolve(relativePath);
     }
 
     private static TransportException notFound(String path) {

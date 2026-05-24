@@ -96,13 +96,28 @@ java -jar kitchensync.jar --mc 5 --ct 60 c:/photos sftp://host/photos
 
 | Flag   | Default | Meaning                                     |
 | ------ | ------- | ------------------------------------------- |
-| `--mc` | 10      | Max SFTP connections per user+host+port     |
+| `--mc` | 10      | Max concurrent transfers/connections        |
 | `--ct` | 30      | SSH handshake timeout (seconds)             |
 | `--ka` | 30      | SFTP idle keep-alive TTL (seconds)          |
 | `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
+| `-x`   | -       | Exclude a relative path from sync           |
 | `--xd` | 2       | Delete stale staging after N days           |
 | `--bd` | 90      | Delete displaced files after N days         |
 | `--td` | 180     | Forget deletion records after N days        |
+
+## Command-Line Excludes
+
+Use `-x <relative-path>` to pretend a file or directory does not exist. The
+path must be relative to each peer root and written with `/` separators, matching
+KitchenSync's stdout paths:
+
+```
+java -jar kitchensync.jar c:/appz d:/appz -x "PortablePlatform/PortableApps" -x brave
+```
+
+If the excluded path is a directory, its whole subtree is skipped. Excluded
+entries are not copied, deleted, displaced to BAK, or updated in snapshots.
+Existing excluded files on peers are left untouched.
 
 ## URL Schemes
 

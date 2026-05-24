@@ -3,6 +3,7 @@ package sftp.protocol;
 import net.schmizz.sshj.sftp.FileAttributes;
 import net.schmizz.sshj.sftp.FileMode;
 import net.schmizz.sshj.sftp.OpenMode;
+import net.schmizz.sshj.sftp.RenameFlags;
 import net.schmizz.sshj.sftp.RemoteFile;
 import net.schmizz.sshj.sftp.RemoteResourceInfo;
 import net.schmizz.sshj.sftp.SFTPClient;
@@ -127,7 +128,7 @@ public class SftpFilesystem implements AutoCloseable {
                     throw mapped;
                 }
             }
-            sftp().rename(source, target);
+            sftp().rename(source, target, EnumSet.of(RenameFlags.OVERWRITE));
             return null;
         });
     }

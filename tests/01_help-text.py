@@ -15,7 +15,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 JAVA = Path("C:/Users/human/Desktop/prjx/kitchensync/tools/compiler/jdk/bin/java.exe")
-JAR  = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
+JAR = Path("C:/Users/human/Desktop/prjx/kitchensync/released/kitchensync.jar")
 
 # Mandated verbatim output from specs/help.md (01.27).
 # A verbatim match also satisfies 01.6 (URL forms), 01.7 (prefix modifiers),
@@ -34,8 +34,8 @@ Peers:
   sftp://user:password@host/path   Inline password (prefer SSH keys)
 
 Prefix modifiers:
-  +<peer>                          Canon — this peer's state wins all conflicts
-  -<peer>                          Subordinate — overwritten to match the group
+  +<peer>                          Canon - this peer's state wins all conflicts
+  -<peer>                          Subordinate - overwritten to match the group
 
 Fallback URLs (multiple paths to the same data):
   [url1,url2,...]                  Try in order, first that connects wins
@@ -50,10 +50,12 @@ Per-URL settings (query string, inside quotes):
 
 Options:
   -h, --help, /?                      Show this help
-  --mc N             Max SFTP connections per user+host+port (default: 10)
+  --mc N             Max concurrent transfers/connections (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
   --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
+  --dir-status N     Seconds of quiet stdout before ? DIR status; 0 disables (default: 10)
+  -x RELPATH         Exclude relative slash path from sync; repeatable
   --xd N             Delete stale TMP staging after N days (default: 2)
   --bd N             Delete displaced files (BAK/) after N days (default: 90)
   --td N             Forget deletion records after N days (default: 180)
@@ -140,9 +142,9 @@ def main() -> None:
 
     # 01.26: help flag in an otherwise-invalid invocation still exits 0 and prints help.
     for args, label in [
-        (["-h",     "--zzz-unrecognized"], "-h with unrecognized flag (01.26)"),
+        (["-h", "--zzz-unrecognized"], "-h with unrecognized flag (01.26)"),
         (["--help", "--zzz-unrecognized"], "--help with unrecognized flag (01.26)"),
-        (["/?",     "--zzz-unrecognized"], "'/?' with unrecognized flag (01.26)"),
+        (["/?", "--zzz-unrecognized"], "'/?' with unrecognized flag (01.26)"),
     ]:
         check_help_output(failures, run_cli(*args), label)
 

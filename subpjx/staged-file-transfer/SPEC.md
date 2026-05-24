@@ -41,6 +41,10 @@ are slash-separated paths relative to that backend's root.
 | `delete_dir(path)` | Removes an empty directory. |
 | `set_mod_time(path, time)` | Sets the modification time of a file or directory. |
 
+`rename(src, dst)` must not be assumed to overwrite an existing destination.
+The library must arrange copy and displacement operations so they work on
+backends, including SFTP backends, where rename-to-existing fails.
+
 The library never closes or disposes a `TransferFilesystem`. Borrowing pooled
 connections, returning pooled connections, and closing backend sessions are
 caller responsibilities.
@@ -153,7 +157,8 @@ Required behavior:
 3. Close both read and write handles. Handles are closed even after read, write,
    or close failures when the backend allows it.
 4. If a file or directory already exists at `destination_path`, displace it to
-   BAK using the same `staging_timestamp`.
+   BAK using the same `staging_timestamp`. This is a rename to a new BAK path,
+   not a delete, and must happen before the final rename.
 5. Rename the TMP file to `destination_path`.
 6. Set `destination_path` modification time to `winning_mod_time`.
 7. Remove empty TMP UUID and timestamp directories created for this copy when
@@ -164,7 +169,7 @@ its empty TMP directories when possible. The original destination entry, if any,
 must not be displaced before the TMP write has completed successfully.
 
 If displacement fails, the final rename is not attempted. The TMP file is
-deleted when possible.
+deleted when possible. The original destination entry remains in place.
 
 If the final rename succeeds but `set_mod_time` fails, the result is
 `partial_success` with error `set_mod_time_failed`; the copied file remains in

@@ -25,6 +25,7 @@ final class CliParser {
                 case "--xd" -> options.tmpRetentionDays = positiveInt(value(args, ++i, arg), arg);
                 case "--bd" -> options.bakRetentionDays = positiveInt(value(args, ++i, arg), arg);
                 case "--td" -> options.tombstoneRetentionDays = positiveInt(value(args, ++i, arg), arg);
+                case "-x" -> options.excludes.add(PathExcludes.validate(value(args, ++i, arg)));
                 case "-vl" -> options.verbosity = verbosity(value(args, ++i, arg));
                 default -> {
                     if (arg.startsWith("-") && !arg.startsWith("-/") && !arg.startsWith("-[")

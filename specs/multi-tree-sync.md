@@ -2,7 +2,7 @@
 
 ## Overview
 
-Synchronizes N file trees in a single recursive combined-tree walk. At each directory level: list all peers in parallel, union their entries, decide the authoritative state for each, act, and recurse. The traversal is pre-order: every entry in a directory is decided and acted on before recursing into any subdirectory. This means a directory marked for displacement is renamed (with its entire subtree) before its children are ever visited - there is no separate "file deletion" pass. The snapshot is consulted per-peer for reconciliation (detecting deletions and modifications) but does not contribute entries to the union - only live peer listings drive traversal.
+Synchronizes N file trees in a single recursive combined-tree walk. At each directory level: list all peers in parallel, union their entries, decide the authoritative state for each, act, and recurse. The traversal is pre-order: every entry in a directory is decided and acted on before recursing into any subdirectory. Entry traversal order within a directory is deterministic, case-insensitive lexicographic order with the original case-sensitive name as a tie-breaker. This means a directory marked for displacement is renamed (with its entire subtree) before its children are ever visited - there is no separate "file deletion" pass. The snapshot is consulted per-peer for reconciliation (detecting deletions and modifications) but does not contribute entries to the union - only live peer listings drive traversal.
 
 Subordinate peers (`-` prefix) are listed and receive outcomes, but their entries do not influence decisions. See "Subordinate Peers" below.
 
@@ -30,6 +30,9 @@ function sync_directory(peers, path):
     // Also include names from subordinate peers (for cleanup), but they don't add to decisions
     all_names = all_names | union(subordinate.listings.keys() for subordinate in active_peers if subordinate.is_subordinate)
 
+    // Phase 2a: Apply command-line excludes before .syncignore resolution
+    all_names = all_names - matched_by_command_line_excludes
+
     // Phase 2b: Resolve .syncignore before other entries (see ignore.md)
     if ".syncignore" in all_names:
         resolve and sync .syncignore using normal decision rules
@@ -43,7 +46,8 @@ function sync_directory(peers, path):
         remove ".syncignore" from all_names  // already handled
 
     // Phase 3: Decide and act on each entry
-    for name in all_names:
+    ordered_names = sort_case_insensitive_then_case_sensitive(all_names)
+    for name in ordered_names:
         states = gather_states(contributing, listings, name)  // subordinate peers excluded
         snap = snapshot_lookup_per_peer(path/name)
         decision = decide(states, snap)
@@ -80,6 +84,12 @@ function sync_directory(peers, path):
 
 **Listing errors:** If `list_directory` fails for a specific path on a reachable peer, that peer is excluded from decisions for that directory and its entire subtree (equivalent to an offline peer for that path). The error is logged at `error` level. The peer's snapshot rows for that subtree are not modified - `last_seen` is not updated, so no false deletions are inferred. If all contributing peers fail listing for a directory (none of the contributing peers remain in `active_peers` for that level), skip decisions for that directory and its entire subtree - no entries are processed and no subordinate peer files are displaced.
 
+**Command-line excludes:** Paths supplied with `-x` are removed from the entry
+union before `.syncignore` is resolved and before decisions are made. A matching
+directory is not recursed into. A matching file is not copied or deleted.
+Excluded paths do not consult or update snapshot rows during the run, and
+existing entries on any peer are left in place.
+
 ## Subordinate Peers
 
 A subordinate peer (`-` prefix on the command line) participates in listing and receives file operations, but does not contribute to decisions:
@@ -97,6 +107,11 @@ Always excluded from listings (never synced):
 - `.kitchensync/` directories - sync metadata must not sync
 - Symbolic links (files and directories) - following symlinks could escape the sync root or create loops
 - Special files (devices, FIFOs, sockets)
+
+Excluded by explicit command-line request:
+
+- Paths supplied with `-x <relative-path>`. These excludes are not overridden by
+  `.syncignore` negation patterns.
 
 Excluded by default but may be overridden by a `!.git/` entry in `.syncignore` (see ignore.md):
 

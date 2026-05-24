@@ -81,6 +81,12 @@ def main() -> int:
         # 01.14: -vl value outside error/info/debug/trace is a validation error
         ("01.14 -vl=warn", ("-vl", "warn", L, R)),
         ("01.14 -vl=verbose", ("-vl", "verbose", L, R)),
+        # Command-line excludes must be relative slash paths.
+        ("01.x -x missing value", ("-x",)),
+        ("01.x -x absolute", ("-x", "/absolute", L, R)),
+        ("01.x -x backslash", ("-x", "bad\\path", L, R)),
+        ("01.x -x dotdot", ("-x", "bad/../path", L, R)),
+        ("01.x -x trailing slash", ("-x", "bad/path/", L, R)),
     ]
 
     # 01.13: non-positive-integer values for any numeric option are a validation error

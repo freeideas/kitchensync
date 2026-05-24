@@ -33,11 +33,12 @@ Per-URL settings (query string, inside quotes):
 
 Options:
   -h, --help, /?                      Show this help
-  --mc N             Max SFTP connections per user+host+port (default: 10)
+  --mc N             Max concurrent transfers/connections (default: 10)
   --ct N             SSH handshake timeout in seconds (default: 30)
   --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
   -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
   --dir-status N     Seconds of quiet stdout before ? DIR status; 0 disables (default: 10)
+  -x RELPATH         Exclude relative slash path from sync; repeatable
   --xd N             Delete stale TMP staging after N days (default: 2)
   --bd N             Delete displaced files (BAK/) after N days (default: 90)
   --td N             Forget deletion records after N days (default: 180)

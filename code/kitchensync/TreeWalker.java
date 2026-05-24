@@ -85,6 +85,7 @@ final class TreeWalker {
             names.addAll(listing.keySet());
         }
         names.remove(".kitchensync");
+        removeExcluded(names, dir);
 
         IgnoreMatcher currentMatcher = matcher;
         if (names.contains(".syncignore")) {
@@ -387,10 +388,25 @@ final class TreeWalker {
     }
 
     private void cleanupKind(Transport transport, String path, String cutoff) {
+        if (transport instanceof LocalTransport local) {
+            cleanupLocalKind(local, path, cutoff);
+            return;
+        }
         try {
             for (EntryInfo entry : transport.listDir(path)) {
                 if (entry.directory() && entry.name().compareTo(cutoff) < 0) {
                     deleteRecursive(transport, PathUtil.child(path, entry.name()));
+                }
+            }
+        } catch (TransportException ignored) {
+        }
+    }
+
+    private void cleanupLocalKind(LocalTransport transport, String path, String cutoff) {
+        try {
+            for (String name : transport.listNames(path)) {
+                if (name.compareTo(cutoff) < 0) {
+                    deleteRecursive(transport, PathUtil.child(path, name));
                 }
             }
         } catch (TransportException ignored) {
@@ -417,6 +433,10 @@ final class TreeWalker {
             }
         }
         return null;
+    }
+
+    private void removeExcluded(Set<String> names, String dir) {
+        names.removeIf(name -> PathExcludes.excluded(options.excludes, PathUtil.child(dir, name)));
     }
 
     private static Optional<Peer> peer(List<Peer> peers, PeerId id) {

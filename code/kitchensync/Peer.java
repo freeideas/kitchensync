@@ -1,6 +1,7 @@
 package kitchensync;
 
 import java.nio.file.Path;
+import java.util.concurrent.Semaphore;
 
 import snapshot.database.SnapshotDatabase;
 import sync.decision.engine.PeerId;
@@ -17,6 +18,7 @@ final class Peer {
     final SnapshotDatabase snapshot;
     final boolean existingSnapshotFile;
     final boolean snapshotHasRows;
+    final Semaphore transferPermits;
 
     Peer(int index, PeerModifier declaredModifier, PeerUrl url, Transport transport, Path localSnapshotPath,
             SnapshotDatabase snapshot, boolean existingSnapshotFile, boolean snapshotHasRows) {
@@ -34,6 +36,7 @@ final class Peer {
         this.snapshot = snapshot;
         this.existingSnapshotFile = existingSnapshotFile;
         this.snapshotHasRows = snapshotHasRows;
+        this.transferPermits = new Semaphore(Math.max(1, url.config().maxConnections()));
     }
 
     boolean subordinate() {
