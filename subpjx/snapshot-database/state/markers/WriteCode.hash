@@ -1,8 +1,0 @@
-{
-  "schema": "aitc.hash.v1",
-  "job": "WriteCode",
-  "taken_at_utc": "2026-05-17T17:40:13Z",
-  "hashes": {
-    "semantic_source": "b9a5f12fe7820461b2f881a5c13ddd5117ac9222a3857c12e835ca33728a6550"
-  }
-}

@@ -1,169 +1,111 @@
-﻿# KitchenSync
+# KitchenSync
 
 Synchronize file trees across multiple peers.
 
+KitchenSync is for people who keep the same files in more than one place:
+photos on a laptop and a NAS, project archives on a workstation and a USB
+drive, or shared folders reachable through different network paths. It is a
+plain command-line tool, not a service. If a peer is reachable by local
+filesystem access or SSH/SFTP, KitchenSync can bring it into the group.
+
+## How to run
+
+Run the released CLI executable as `kitchensync` with options followed by two or
+more peer paths or URLs:
+
+```
+kitchensync [options] <peer> <peer> [<peer>...]
+```
+
+Tests observe the process exit code, stdout, stderr, and filesystem changes
+under the peer directories they create. All diagnostics and progress output go
+to stdout; stderr remains empty.
+
 ## Why KitchenSync?
 
-**Concurrent by design.** Changes propagate simultaneously across multiple concurrent connections. Peers are listed in parallel, decisions are made once, and copies fan out to all peers that need them.
+**Concurrent by design.** Peers are listed in parallel, decisions are made once,
+and file copies fan out under one global copy limit.
 
-**Recover overwritten and deleted files.** Old copies of overwritten or deleted files go to a `.kitchensync/BAK/` directory beside the affected path. Multiple previous versions are kept for 90 days (configurable).
+**Recover overwritten and deleted files.** Replaced or removed content is moved
+near the affected path so a bad sync is recoverable without a central server.
 
-**Zero KitchenSync infrastructure on peers.** Only needs SSH access - no KitchenSync daemons, ports, or services. If you can `ssh user@host`, KitchenSync can sync with it.
+**No KitchenSync infrastructure on peers.** There are no daemons, open ports,
+accounts, subscriptions, or cloud control planes.
 
-**Fully command-line driven.** Peer lists and run options come from the command line. No setup wizards, no JSON. Want a fancy saved command? Write a shell script. Or don't - it's up to you.
+**Command-line driven.** Peer lists and run options come from the command. Saved
+workflows can be ordinary shell scripts.
 
-**Occasionally-connected peers just work.** USB drives, sleeping laptops, flaky connections - plug them in and KitchenSync brings them current. Each peer carries its own snapshot history, so it always knows what changed.
+**Occasionally connected peers work naturally.** A sleeping laptop or unplugged
+USB drive can miss a run and catch up later from its own snapshot history.
 
-**Multiple paths to every peer.** Each peer can have several fallback URLs - local IP, VPN, Tailscale, public DNS. KitchenSync tries them in order and uses the first one that connects. At home you hit the cloud drive over your LAN; at the office it goes through the VPN. One command, no switching.
+**Multiple paths can identify one peer.** A peer can be tried through a local
+path, LAN address, VPN name, or public DNS name, in the order supplied by the
+command.
 
-**Runs anywhere Java does.** A single JAR plus a Java 21 runtime - Windows, Linux, macOS. No Cygwin, no WSL, no MinGW. Paths like `c:\photos` work exactly as you'd expect.
+## First Sync
 
-**No central server.** Every peer is equal (unless you say otherwise). No account, no cloud, no subscription.
-
-## The `+` and `-` URL Prefixes
-
-- **`+`** - this peer wins every disagreement (canon)
-- **`-`** - this peer loses every disagreement (subordinate)
-- **(no prefix)** - bidirectional; newest wins
-
-## Quick Start
-
-Any non-canon peer without a snapshot is automatically treated as `-` - it receives the group's state without influencing decisions.
-
-Sync your photos to a cloud drive. First time, use `+` so your local copy wins every disagreement:
+The first run needs one authoritative peer:
 
 ```
-java -jar kitchensync.jar +c:/photos sftp://bilbo@cloud/volume1/photos
+kitchensync +c:/photos sftp://bilbo@cloud/volume1/photos
 ```
 
-That's it. Both directories are now in sync. No config file was created. No database was installed anywhere central. Each peer just got a tiny `.kitchensync/` directory with its snapshot.
-
-## Next Time
-
-Run the same thing without `+`. KitchenSync uses the snapshots from last time to sync bidirectionally - changes on either side propagate. You don't have to remember which files you changed on which device; KitchenSync knows what to update, copy, and/or archive.
+The `+` marks the copy that should win disagreements. After the first run, the
+same peers can sync bidirectionally:
 
 ```
-java -jar kitchensync.jar c:/photos sftp://bilbo@cloud/volume1/photos
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos
 ```
 
-## Add More Peers
+## Add A Peer
 
-Just add them to the command:
-
-```
-java -jar kitchensync.jar c:/photos sftp://bilbo@cloud/volume1/photos d:/backup/photos
-```
-
-The new peer has no snapshot yet, so it's automatically subordinate - it receives the group's state without influencing decisions.
-
-## Add a USB Drive
-
-Use `-` to explicitly mark a peer as subordinate, even if it already has a snapshot:
+Add another peer to the command. New peers receive the group's current state
+before they influence future decisions:
 
 ```
-java -jar kitchensync.jar c:/photos sftp://bilbo@cloud/volume1/photos -/mnt/usb/photos
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos d:/backup/photos
 ```
 
-Next time the USB is plugged in, drop the `-` and it participates as a full bidirectional peer.
-
-## Fallback URLs
-
-Your cloud drive has a local IP and a VPN address? Group them with brackets - KitchenSync tries each in order:
+A peer can also be marked subordinate for a run:
 
 ```
-java -jar kitchensync.jar c:/photos [h:/office-share/photos,sftp://192.168.1.50:2222/photos,sftp://cloud.vpn/photos]
+kitchensync c:/photos sftp://bilbo@cloud/volume1/photos -/mnt/usb/photos
 ```
 
-At home it connects over LAN. At the office it falls back to VPN. One command.
+## Fallback Paths
 
-## Per-URL Tuning
-
-Slow VPN link? Limit its connections. Fast LAN? Crank them up. Use query-string parameters:
-
-```
-java -jar kitchensync.jar c:/photos "[sftp://192.168.1.50/photos?mc=20,sftp://cloud.vpn/photos?mc=3&ct=60]"
-```
-
-(Quotes needed because of the `?` - your shell would glob it otherwise.)
-
-## Global Options
-
-Set defaults for the whole run:
+Put multiple URLs in brackets when they are different ways to reach the same
+peer:
 
 ```
-java -jar kitchensync.jar --mc 5 --ct 60 c:/photos sftp://host/photos
+kitchensync c:/photos [h:/office-share/photos,sftp://192.168.1.50:2222/photos,sftp://cloud.vpn/photos]
 ```
 
-| Flag   | Default | Meaning                                     |
-| ------ | ------- | ------------------------------------------- |
-| `--mc` | 10      | Max concurrent transfers/connections        |
-| `--ct` | 30      | SSH handshake timeout (seconds)             |
-| `--ka` | 30      | SFTP idle keep-alive TTL (seconds)          |
-| `-vl`  | `info`  | Verbosity level (error, info, debug, trace) |
-| `-x`   | -       | Exclude a relative path from sync           |
-| `--xd` | 2       | Delete stale staging after N days           |
-| `--bd` | 90      | Delete displaced files after N days         |
-| `--td` | 180     | Forget deletion records after N days        |
-
-## Command-Line Excludes
-
-Use `-x <relative-path>` to pretend a file or directory does not exist. The
-path must be relative to each peer root and written with `/` separators, matching
-KitchenSync's stdout paths:
+Connection tuning can be attached to individual URLs:
 
 ```
-java -jar kitchensync.jar c:/appz d:/appz -x "PortablePlatform/PortableApps" -x brave
+kitchensync c:/photos "[sftp://192.168.1.50/photos?timeout-conn=20,sftp://cloud.vpn/photos?timeout-conn=60&timeout-idle=10]"
 ```
 
-If the excluded path is a directory, its whole subtree is skipped. Excluded
-entries are not copied, deleted, displaced to BAK, or updated in snapshots.
-Existing excluded files on peers are left untouched.
+## Exclude A Path
 
-## URL Schemes
+Use `-x` for paths that should be ignored during a run:
 
-| Form                                 | Meaning                           |
-| ------------------------------------ | --------------------------------- |
-| `/path` or `c:\path` or `./relative` | Local path (same as `file://`)    |
-| `sftp://user@host/path`              | Remote over SSH (port 22)         |
-| `sftp://user@host:port/path`         | Non-standard SSH port             |
-| `sftp://host/path`                   | Remote over SSH, current OS user  |
-| `sftp://user:password@host/path`     | Inline password (prefer SSH keys) |
+```
+kitchensync c:/appz d:/appz -x "PortablePlatform/PortableApps" -x brave
+```
 
-## Authentication
+## Specification
 
-For remote peers, just make sure you can reach the directory via SSH. If `ssh user@host` `cd /path` works, KitchenSync can sync it.
+The detailed behavior lives in the focused specs:
 
-KitchenSync tries these in order:
-
-1. Inline password from URL
-2. SSH agent (`SSH_AUTH_SOCK`)
-3. `~/.ssh/id_ed25519`
-4. `~/.ssh/id_ecdsa`
-5. `~/.ssh/id_rsa`
-
-Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
-
-## The `.kitchensync/` Directory
-
-The snapshot database lives at the peer root. BAK/ and TMP/ directories are created alongside affected files at any directory level.
-
-| Path                                                      | Purpose                          |
-| --------------------------------------------------------- | -------------------------------- |
-| `.kitchensync/snapshot.db`                                | Peer's snapshot history (SQLite) |
-| `<parent>/.kitchensync/BAK/<timestamp>/<basename>`        | Displaced files (recoverable)    |
-| `<parent>/.kitchensync/TMP/<timestamp>/<uuid>/<basename>` | Transfer staging (atomic swap)   |
-
-These are never synced between peers.
-
-## How Sync Works
-
-1. Connect to all peers in parallel (fallback URLs tried in order)
-2. Download each peer's snapshot to a local temp directory
-3. Walk the combined directory tree, listing all peers in parallel at each level
-4. Union the entries across peers
-5. For each entry, decide the authoritative state (canon wins, or newest mod_time wins)
-6. Enqueue file copies, create/remove directories as needed
-7. Execute copies concurrently (subject to connection limits)
-8. Upload updated snapshots back to each peer (atomic rename)
-
-Decisions are made once per entry, not per peer pair. Snapshots track what each peer had last time, enabling deletion detection and conflict resolution.
+- `sync.md` defines the command line, startup, run phases, transports, logging,
+  dry-run behavior, and error handling.
+- `multi-tree-sync.md` defines traversal, decisions, excludes, subordinate
+  peers, BAK/TMP cleanup, and snapshot updates during sync.
+- `database.md` defines peer snapshot storage, schema, URL normalization, path
+  hashing, tombstones, and timestamps.
+- `concurrency.md` defines copy concurrency, fallback connection behavior,
+  listing concurrency, progress output, retries, and trace logging.
+- `help.md` defines the exact help screen.
+- `TESTING-GUIDELINES.md` defines constraints for SFTP tests.

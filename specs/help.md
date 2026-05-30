@@ -1,13 +1,13 @@
 ﻿# Help Screen
 
-`-h`, `--help`, `/?`, or no arguments at all prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1. The help text is embedded in the JAR at build time.
+No arguments prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1.
 
 ```
-Usage: java -jar kitchensync.jar [options] <peer> <peer> [<peer>...]
+Usage: kitchensync [options] <peer> <peer> [<peer>...]
 
 Synchronize file trees across multiple peers.
 
-Running with no arguments prints this help. See README.md for full docs.
+Running with no arguments prints this help. See the specs for full behavior.
 
 Peers:
   /path or c:\path                 Local path (same as file://)
@@ -26,33 +26,34 @@ Fallback URLs (multiple paths to the same data):
   -[url1,url2,...]                 Subordinate peer with fallbacks
 
 Per-URL settings (query string, inside quotes):
-  "sftp://host/path?mc=5"          Max SFTP connections for this user+host+port
-  "sftp://host/path?ct=60"         Connection timeout for this URL
-  "sftp://host/path?ka=10"         SFTP idle keep-alive TTL for this URL
-  "sftp://host/path?mc=5&ct=60"    Combine multiple
+  "sftp://host/path?timeout-conn=60"     Connection timeout for this URL
+  "sftp://host/path?timeout-idle=10"     SFTP idle keep-alive TTL for this URL
+  "sftp://host/path?timeout-conn=60&timeout-idle=10"  Combine multiple
 
 Options:
-  -h, --help, /?                      Show this help
-  --mc N             Max concurrent transfers/connections (default: 10)
-  --ct N             SSH handshake timeout in seconds (default: 30)
-  --ka N             SFTP idle keep-alive TTL in seconds (default: 30)
-  -vl LEVEL          Verbosity level: error, info, debug, trace (default: info)
-  --dir-status N     Seconds of quiet stdout before ? DIR status; 0 disables (default: 10)
+  --dry-run          Read-only and plan, but make no peer changes
+  --max-copies N     Max active file copies across the whole run (default: 10)
+  --retries-copy N   Give up copying after this many tries (default: 3)
+  --retries-list N   Give up listing after this many tries (default: 3)
+  --timeout-conn N   SSH handshake timeout in seconds (default: 30)
+  --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)
+  --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)
   -x RELPATH         Exclude relative slash path from sync; repeatable
-  --xd N             Delete stale TMP staging after N days (default: 2)
-  --bd N             Delete displaced files (BAK/) after N days (default: 90)
-  --td N             Forget deletion records after N days (default: 180)
+  --keep-tmp-days N  Delete stale TMP staging after N days (default: 2)
+  --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)
+  --keep-del-days N  Forget deletion records after N days (default: 180)
 
 Quick start:
-  java -jar kitchensync.jar +c:/photos sftp://user@host/photos      First sync (c: is canon)
-  java -jar kitchensync.jar c:/photos sftp://host/photos            Bidirectional
-  java -jar kitchensync.jar c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
-  java -jar kitchensync.jar c:/photos "sftp://user:p%40ss@host/photos"  Inline password
+  kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)
+  kitchensync c:/photos sftp://host/photos            Bidirectional
+  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
+  kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password
 
 Canon (+) is required on first sync when no peer has snapshot history.
 After the first sync, bidirectional sync works without canon.
 
 Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 
-Displaced files are recoverable from nearby .kitchensync/BAK/ directories (kept for --bd days).
+Displaced files are recoverable from nearby:
+  .kitchensync/BAK/ directories (kept for --keep-bak-days days).
 ```

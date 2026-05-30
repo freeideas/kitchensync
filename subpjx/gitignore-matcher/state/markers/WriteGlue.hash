@@ -1,9 +1,0 @@
-{
-  "schema": "aitc.hash.v1",
-  "job": "WriteGlue",
-  "taken_at_utc": "2026-05-17T17:40:13Z",
-  "hashes": {
-    "AggregateLib_marker": "94ef0e09815d2a739796fcac80f0dcdebd9242bda2a6721a9ff1db7b56a62777",
-    "semantic_source": "261b8dfc369408ac9b5bd43c7fcc0a8386b76f07e9d86a29caf9c7f613f5170e"
-  }
-}

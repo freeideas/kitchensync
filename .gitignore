@@ -1,182 +1,102 @@
 # =============================================================================
-# aitc framework
+# Outer project repo -- the product aitc is building plus its human inputs.
+#
+# Normally named `disabled.gitignore` so the OS, VS Code, and git plugins do
+# not see this workspace as a git repo. push-project.py / pull-project.py
+# rename it to `.gitignore` only while they run.
+#
+# push-project.py is a dumb mirror: everything not matched below is pushed.
+# So this file is the ONLY thing keeping the framework tree and per-device /
+# transient / build state out of the project backup.
 # =============================================================================
-# The framework lives in its own repo (`push-aitc.py` / `pull-aitc.py`).
-# Project push/pull stores project state, not framework copies.
-/aitc/
-**/aitc/
+
+# -----------------------------------------------------------------------------
+# aitc framework -- its OWN repo (push-aitc.py / pull-aitc.py). Never part of
+# the project repo, and pull-project.py preserves ./aitc/ across a pull.
+# -----------------------------------------------------------------------------
+aitc/
 aitc.old/
 
-# =============================================================================
-# Regenerable per-device infrastructure and build products
-# =============================================================================
-/tools/
-/tools
-**/tools/
-**/tools
-/build/
-/build
-**/build/
-**/build
-/lib/
-/lib
-**/lib/
-**/lib
-**/released/
-**/released
+# -----------------------------------------------------------------------------
+# aitc operational state -- per-device, regenerated, never backed up here.
+#   state/   SQLite db, halt/punt/diagnosis files, pass flags
+#   reports/ job transcripts and mechanical logs
+#   tmp/     scratch and safe_delete tombstones
+#   tools/   provisioned compiler/runtime toolchains (large, per-device)
+# -----------------------------------------------------------------------------
+state/
+reports/
+tmp/
+tools/
 
-/tmp/
-/tmp
-**/tmp/
-**/tmp
-# Test scratch directories. Some tests stage scratch under `tests/.tmp_<stem>/`
-# rather than `./tmp/`; treat those as scratch too.
-**/tests/.tmp_*/
-**/tests/.tmp_*
-/reports/
-/reports
-**/reports/
-**/reports
-/sandboxes/
-/sandboxes
-**/sandboxes/
-**/sandboxes
+# -----------------------------------------------------------------------------
+# AI agent instruction files -- local to this checkout.
+# -----------------------------------------------------------------------------
+CLAUDE.md
+CODEX.md
+AGENTS.md
 
-# Local PowerShell cache sometimes created when running from this workspace.
-/Microsoft/
-
-# Local credentials. `push-project.py` can encrypt ./creds/ to docs/creds.zip.
-/creds/
-
-# Transient run controls and process state.
-/STOP.flag
-/_FINAL.flag
-/.orchestrator.lock
-orchestrator.log
-orchestrator.log.*
-
-# AI agent instructions are local-device guidance, not project state.
-/CLAUDE.md
-/CODEX.md
-/AGENTS.md
-/.claude/
-
-# =============================================================================
-# Python
-# =============================================================================
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-ENV/
-env/
-.egg-info/
-*.egg
-dist/
-*.whl
-
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Build output under ./proj/ (regenerable; the source that produces it IS
+# tracked). Covers the languages aitc can target.
+# -----------------------------------------------------------------------------
+# Rust
+target/
+**/*.rs.bk
 # C# / .NET
-# =============================================================================
 bin/
 obj/
 *.dll
-*.exe
 *.pdb
 *.user
-*.suo
-*.cache
-*.vspscc
-*.vssscc
 .vs/
-packages/
-*.nupkg
-project.lock.json
-
-# =============================================================================
-# Rust
-# =============================================================================
-target/
-Cargo.lock
-**/*.rs.bk
-
-# =============================================================================
 # Go
-# =============================================================================
 vendor/
-go.sum
-
-# =============================================================================
-# Node.js / JavaScript
-# =============================================================================
+# Node.js
 node_modules/
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
-yarn.lock
 
-# =============================================================================
-# Java / JVM
-# =============================================================================
-*.class
-*.jar
-*.war
-*.ear
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
 
-# =============================================================================
-# IDE and editors
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Editor / IDE
+# -----------------------------------------------------------------------------
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-.project
-.classpath
-.settings/
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # OS generated
-# =============================================================================
+# -----------------------------------------------------------------------------
 .DS_Store
-.DS_Store?
 ._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 desktop.ini
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Logs and temporary files
-# =============================================================================
+# -----------------------------------------------------------------------------
 *.log
 *.tmp
-*.temp
 *.bak
-*.backup
 
-# =============================================================================
-# Secrets
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Secrets -- never commit
+# -----------------------------------------------------------------------------
 .env
 .env.local
 .env.*.local
 *.pem
 *.key
-*.sqlite*
+creds/
 secrets.json
 credentials.json
-
-# =============================================================================
-# Published root release artifacts
-# =============================================================================
-# Keep only the root release directory so GitHub visitors can download final
-# binaries without building. Child released/ and every lib/ are regenerated by
-# Build/AggregateLib after pull.
-!/released/
-!/released/**

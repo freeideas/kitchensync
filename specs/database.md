@@ -1,8 +1,37 @@
 ﻿# Database
 
-Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQLite, rollback-journal mode, foreign keys enabled. Only `snapshot.db` is part of the peer state; SQLite sidecar files are not synced.
+Each peer stores its own snapshot in `{peer-root}/.kitchensync/snapshot.db`. SQLite, rollback-journal mode. Only `snapshot.db` is part of the peer state; SQLite sidecar files are not synced.
 
-At the start of a run, each peer's `snapshot.db` is downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). All reads and writes happen against this local copy. Concurrent runs are not coordinated. If two runs overlap, the last snapshot upload wins. Decisions from the losing run are re-discovered on the next run - correctness is preserved, but some work is repeated. After sync completes, the updated database is written back using TMP staging: upload to `{peer-root}/.kitchensync/TMP/<timestamp>/<uuid>/snapshot.db`, close the staged file, then replace `{peer-root}/.kitchensync/snapshot.db`. Replacement must work on transports whose `rename(src, dst)` rejects an existing `dst`; deleting the old snapshot immediately before the final rename is allowed. If the upload fails, the TMP staging file is left behind and cleaned up after `--xd` days like any other stale staging file. If a peer has no existing `snapshot.db`, a new one is created locally.
+At the start of a normal run, KitchenSync first recovers any incomplete
+`.kitchensync/SWAP/snapshot.db/` state. Then each peer's `snapshot.db` is
+downloaded to a local temporary directory (`{tmp}/{uuid}/snapshot.db`). In
+`--dry-run`, peer-side snapshot SWAP recovery is skipped and the live
+`.kitchensync/snapshot.db`, if present, is downloaded as-is. All reads and
+writes happen against the local copy. Concurrent runs are not coordinated. If
+two runs overlap, the last snapshot upload wins. Decisions from the losing run
+are re-discovered on the next run - correctness is preserved, but some work is
+repeated. After sync completes, the updated database is written back through
+`.kitchensync/SWAP/snapshot.db/`: write and close `new`, rename the live
+`snapshot.db` to `old` if it exists, rename `new` to `snapshot.db`, then delete
+`old`. Replacement must work on transports whose `rename(src, dst)` rejects an
+existing `dst`. If the upload fails after `old` exists, the SWAP state is left
+behind and recovered on the next normal run. If a peer has no existing
+`snapshot.db`, a new one is created locally.
+
+Snapshot SWAP recovery:
+
+- `old` exists and `snapshot.db` exists: delete `new` if present, then delete
+  `old`.
+- `old` exists, `new` exists, and `snapshot.db` is missing: rename `new` to
+  `snapshot.db`, then delete `old`.
+- `old` exists, `new` is missing, and `snapshot.db` is missing: rename `old` to
+  `snapshot.db`.
+- `old` is missing, `new` exists, and `snapshot.db` exists: delete `new`.
+- `old` is missing, `new` exists, and `snapshot.db` is missing: rename `new` to
+  `snapshot.db`.
+
+In `--dry-run`, local temp snapshot databases are still created and updated,
+but they are not uploaded back to peers.
 
 ## Schema
 
@@ -36,7 +65,7 @@ URLs are normalized before any comparison or lookup:
 - Bare paths (no scheme) are converted to `file://` URLs
 - `file://` URLs: resolve to absolute path (from cwd)
 - Percent-decode unreserved characters
-- Strip query-string parameters (per-URL settings like `?mc=5` are not part of the identity)
+- Strip query-string parameters (per-URL settings like `?timeout-conn=60` are not part of the identity)
 - SFTP URLs with no username: insert the current OS user
 
 Examples:
@@ -44,12 +73,12 @@ Examples:
 - `./data` -> `file:///home/user/data` (resolved from cwd)
 - `SFTP://Host:22/path/` -> `sftp://host/path`
 - `sftp://host//docs/` -> `sftp://host/docs`
-- `sftp://host/path?mc=5` -> `sftp://host/path`
+- `sftp://host/path?timeout-conn=60` -> `sftp://host/path`
 - `sftp://host/path` (running as `ace`) -> `sftp://ace@host/path`
 
 ## Tombstones
 
-When an entry is confirmed absent on a peer where a snapshot row exists with `deleted_time = NULL`, the row is retained and `deleted_time` is set to the current value of `last_seen` (a conservative estimate - the real deletion happened sometime after that). A row with `deleted_time IS NOT NULL` is a tombstone. If `deleted_time` is already set, repeated confirmation of absence leaves the existing tombstone unchanged (the operation is idempotent). Tombstones are purged when `deleted_time` is older than `--td` (tombstone retention days, default: 180).
+When an entry is confirmed absent on a peer where a snapshot row exists with `deleted_time = NULL`, the row is retained and `deleted_time` is set to the current value of `last_seen` (a conservative estimate - the real deletion happened sometime after that). A row with `deleted_time IS NOT NULL` is a tombstone. If `deleted_time` is already set, repeated confirmation of absence leaves the existing tombstone unchanged (the operation is idempotent). Tombstones with `deleted_time` older than `--keep-del-days` (default: 180) are eligible for the opportunistic snapshot cleanup described in `multi-tree-sync.md`.
 
 ## Path Hashing
 

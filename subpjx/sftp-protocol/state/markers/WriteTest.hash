@@ -1,9 +1,0 @@
-{
-  "schema": "aitc.hash.v1",
-  "job": "WriteTest",
-  "taken_at_utc": "2026-05-17T18:15:38Z",
-  "hashes": {
-    "SPEC.md": "5f397023465d179d45578dabe01b4f102799667dcbcfe7d26bb74731983570df",
-    "concrete_paths": "1e84ed343af5c3d445209c187f52d87f363ca6c3ec14aa09154f22b51ce0dbf5"
-  }
-}

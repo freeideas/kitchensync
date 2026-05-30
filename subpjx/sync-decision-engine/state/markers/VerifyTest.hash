@@ -1,9 +1,0 @@
-{
-  "schema": "aitc.hash.v1",
-  "job": "VerifyTest",
-  "taken_at_utc": "2026-05-17T19:11:59Z",
-  "hashes": {
-    "semantic_source": "9276e84a073a72ffccf1a0ee38c4bbecb4f0bd35341d5179fbcab0e9db700047",
-    "test": "2bb9ce6583ccfd3bce590e59828d430d685afcb28a8e9862c23d5b7cb90f0682"
-  }
-}
