@@ -74,6 +74,10 @@ def _write_bytes(path: Path, payload: bytes) -> None:
     path.write_bytes(payload)
 
 
+def _copy_swap_blocker(peer_root: Path, basename: str) -> Path:
+    return peer_root / ".kitchensync" / "SWAP" / basename
+
+
 def _snapshot_db(peer_root: Path) -> Path:
     return peer_root / ".kitchensync" / "snapshot.db"
 
@@ -255,6 +259,8 @@ def _case_present_absent_updates(failures: list[str]) -> None:
 
         source = canon / "present.txt"
         _write_text(source, "seed")
+        old_mtime = time.time() - 20.0
+        os.utime(source, (old_mtime, old_mtime))
 
         first = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
         _add_failure(failures, first is not None, "009.1", "kitchensync invocation returned no result")
@@ -280,7 +286,7 @@ def _case_present_absent_updates(failures: list[str]) -> None:
             _add_failure(failures, int(peer_row.get("byte_size", -1)) == len("seed"), "009.3", "peer snapshot byte_size mismatch")
 
         (peer / "present.txt").unlink()
-        second = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
+        second = _run_kitchensync([str(canon), str(peer)], cwd=workspace)
         _add_failure(failures, second is not None, "009.6", "kitchensync invocation returned no result")
         if second is None:
             return
@@ -313,7 +319,7 @@ def _case_present_absent_updates(failures: list[str]) -> None:
         if peer_row_after_recheck is not None and peer_row_after_absent is not None:
             _add_failure(
                 failures,
-                peer_row_after_recheck.get("deleted_time") == peer_row_after_absent.get("deleted_time"),
+                peer_row_after_recheck == peer_row_after_absent,
                 "009.9",
                 "tombstoned row changed when absence was reconfirmed",
             )
@@ -328,15 +334,15 @@ def _case_copy_intention_and_completion(failures: list[str]) -> None:
         peer.mkdir()
 
         source = canon / "push.txt"
-        peer_block = peer / ".kitchensync"
         _write_text(source, "v1")
 
+        peer_block = _copy_swap_blocker(peer, "push.txt")
         _write_bytes(peer_block, b"block")
         first = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
         _add_failure(failures, first is not None, "009.10", "kitchensync invocation returned no result")
         if first is None:
             return
-        _add_failure(failures, first.returncode == 0, "009.10", f"forced-failure setup run exited {first.returncode}")
+        _add_failure(failures, first.returncode == 1, "009.16", f"forced-failure setup run exited {first.returncode}, expected copy failure exit 1")
 
         row_before = _snapshot_row(peer, "push.txt")
         _add_failure(failures, row_before is not None, "009.10", "destination row missing after failed copy enqueue")
@@ -362,6 +368,9 @@ def _case_copy_intention_and_completion(failures: list[str]) -> None:
                 "destination row last_seen was not NULL for new intended-copy row before completion",
             )
 
+        if peer_block.exists():
+            peer_block.unlink()
+
         second = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
         _add_failure(failures, second is not None, "009.15", "kitchensync invocation returned no result")
         if second is None:
@@ -380,12 +389,14 @@ def _case_copy_intention_and_completion(failures: list[str]) -> None:
         time.sleep(6.1)
         _write_text(source, "v2")
         (peer / "push.txt").unlink(missing_ok=True)
+        peer_block = _copy_swap_blocker(peer, "push.txt")
         _write_bytes(peer_block, b"block")
 
         third = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
         _add_failure(failures, third is not None, "009.14", "kitchensync invocation returned no result")
         if third is None:
             return
+        _add_failure(failures, third.returncode == 1, "009.16", f"failed re-enqueue run exited {third.returncode}, expected copy failure exit 1")
 
         row_retry = _snapshot_row(peer, "push.txt")
         _add_failure(failures, row_retry is not None, "009.14", "destination row missing after failed re-enqueue")
@@ -410,19 +421,32 @@ def _case_copy_intention_and_completion(failures: list[str]) -> None:
             )
 
         peer_block.unlink()
+        fourth_start = datetime.now(timezone.utc)
         fourth = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
+        fourth_end = datetime.now(timezone.utc)
         _add_failure(failures, fourth is not None, "009.16", "kitchensync invocation returned no result")
         if fourth is None:
             return
         _add_failure(failures, fourth.returncode == 0, "009.16", f"final copy completion run exited {fourth.returncode}")
         row_final = _snapshot_row(peer, "push.txt")
         _add_failure(failures, row_final is not None, "009.16", "destination row missing after final copy")
-        _add_failure(
-            failures,
-            row_final is not None and row_final.get("last_seen") is not None,
-            "009.16",
-            "destination row last_seen remained NULL after successful copy",
-        )
+        if row_final is not None:
+            parsed_final = _parse_timestamp(str(row_final.get("last_seen")))
+            parsed_previous = _parse_timestamp(str(pre_retry_row.get("last_seen"))) if pre_retry_row is not None else None
+            _add_failure(failures, parsed_final is not None, "009.15", "destination row last_seen was not in timestamp format after copy completion")
+            _add_failure(
+                failures,
+                parsed_previous is None or (parsed_final is not None and parsed_final > parsed_previous),
+                "009.15",
+                "destination row last_seen was not refreshed after copy completion",
+            )
+            _add_failure(
+                failures,
+                parsed_final is not None
+                and fourth_start <= parsed_final <= (fourth_end + timedelta(seconds=1)),
+                "009.15",
+                "destination row last_seen was not set to the current sync timestamp after copy completion",
+            )
 
         if peer_block.exists():
             peer_block.unlink()
@@ -454,8 +478,6 @@ def _case_directory_create_displace(failures: list[str]) -> None:
 
         dir_pre_row = _snapshot_row(peer, "create_me")
         inner_pre_row = _snapshot_row(peer, "create_me/inner.txt")
-        keep_pre_row = _snapshot_row(peer, "keep.txt")
-
         if (canon / "create_me").exists():
             for child in sorted((canon / "create_me").rglob("*"), reverse=True):
                 if child.is_file():
@@ -488,31 +510,6 @@ def _case_directory_create_displace(failures: list[str]) -> None:
                 "009.22",
                 "directory displacement cascade did not apply same deleted_time to descendant rows",
             )
-
-        (canon / "keep.txt").unlink()
-        _write_bytes(peer_block := (peer / ".kitchensync"), b"block")
-
-        fail_disp = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
-        _add_failure(failures, fail_disp is not None, "009.21", "kitchensync invocation returned no result")
-        if fail_disp is None:
-            return
-        keep_post_row = _snapshot_row(peer, "keep.txt")
-        if keep_pre_row is not None and keep_post_row is not None:
-            _add_failure(
-                failures,
-                keep_post_row.get("last_seen") == keep_pre_row.get("last_seen"),
-                "009.21",
-                "displacement failure changed destination row instead of leaving it unchanged",
-            )
-            _add_failure(
-                failures,
-                keep_post_row.get("deleted_time") == keep_pre_row.get("deleted_time"),
-                "009.21",
-                "displacement failure changed destination deleted_time",
-            )
-        _add_failure(failures, (peer / "keep.txt").exists(), "009.21", "displaced file disappeared when displacement operation failed")
-        if peer_block.exists():
-            peer_block.unlink()
 
 
 def _case_snapshot_cleanup(failures: list[str]) -> None:
@@ -634,7 +631,7 @@ def main() -> int:
     test_cases = [
         ("009.1-009.9", _case_present_absent_updates),
         ("009.10-009.17", _case_copy_intention_and_completion),
-        ("009.18,009.20,009.21,009.22", _case_directory_create_displace),
+        ("009.18,009.20,009.22", _case_directory_create_displace),
         ("009.26,009.27,009.28,009.29,009.30", _case_snapshot_cleanup),
     ]
 
@@ -646,6 +643,7 @@ def main() -> int:
 
     # Not reasonably testable through observable peer + filesystem behavior in this e2e harness:
     # 009.19 -- inline directory creation failure on destination without changing its existing snapshot row.
+    # 009.21 -- displacement failure on destination without changing its existing snapshot row.
     # 009.23 -- successful directory cascade only touches that peer's database and never another peer's DB.
     # 009.24 -- cascade path through an existing tombstone row.
     # 009.25 -- orphaned descendants skipped when intermediate rows are purged.

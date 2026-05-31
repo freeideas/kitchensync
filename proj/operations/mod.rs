@@ -141,9 +141,15 @@ pub struct OperationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationErrorContext {
-    RecoverDirectorySwaps { directory: RelPath },
-    DisplaceToBak { path: RelPath },
-    CreateDirectory { path: RelPath },
+    RecoverDirectorySwaps {
+        directory: RelPath,
+    },
+    DisplaceToBak {
+        path: RelPath,
+    },
+    CreateDirectory {
+        path: RelPath,
+    },
     CleanupRetention {
         directory: RelPath,
         target: Option<CleanupTarget>,
@@ -275,19 +281,35 @@ impl OperationExecutor for DefaultOperationExecutor<'_> {
                     ));
                 }
             };
-            recover_swap_for_parent(&peer.transport, Some(directory), &basename, fresh_timestamp())
-                .map_err(|error| {
-                    op_error(
-                        peer.id,
-                        OperationErrorContext::RecoverDirectorySwaps {
-                            directory: directory.clone(),
-                        },
-                        error,
-                    )
-                })?;
+            recover_swap_for_parent(
+                &peer.transport,
+                Some(directory),
+                &basename,
+                fresh_timestamp(),
+            )
+            .map_err(|error| {
+                op_error(
+                    peer.id,
+                    OperationErrorContext::RecoverDirectorySwaps {
+                        directory: directory.clone(),
+                    },
+                    error,
+                )
+            })?;
             recovered += 1;
         }
-        let _ = peer.transport.delete_dir(&swap_root);
+        if peer.transport.delete_dir(&swap_root).is_ok() {
+            let metadata_root = child_path(directory, ".kitchensync").map_err(|error| {
+                op_error(
+                    peer.id,
+                    OperationErrorContext::RecoverDirectorySwaps {
+                        directory: directory.clone(),
+                    },
+                    error,
+                )
+            })?;
+            best_effort_remove_metadata_root(&peer.transport, &metadata_root);
+        }
 
         Ok(RecoveryReport {
             peer_id: peer.id,
@@ -396,6 +418,7 @@ impl OperationExecutor for DefaultOperationExecutor<'_> {
             &now,
             keep_bak_days,
             CleanupTargetKind::Bak,
+            false,
             &mut report,
         );
         cleanup_kind(
@@ -404,6 +427,7 @@ impl OperationExecutor for DefaultOperationExecutor<'_> {
             &now,
             keep_tmp_days,
             CleanupTargetKind::Tmp,
+            false,
             &mut report,
         );
 
@@ -605,11 +629,15 @@ fn execute_copy(
             Ok(path) => path,
             Err(error) => return failed(result, TransferPhase::ArchiveOld, error),
         };
-        if let Err(error) = destination_peer.transport.create_dir(&bak_dir).and_then(|()| {
-            destination_peer
-                .transport
-                .rename_no_overwrite(&swap.old_path, &bak_path)
-        }) {
+        if let Err(error) = destination_peer
+            .transport
+            .create_dir(&bak_dir)
+            .and_then(|()| {
+                destination_peer
+                    .transport
+                    .rename_no_overwrite(&swap.old_path, &bak_path)
+            })
+        {
             return failed(result, TransferPhase::ArchiveOld, error);
         }
     }
@@ -743,6 +771,7 @@ fn cleanup_kind(
     now: &Timestamp,
     keep_days: u32,
     kind: CleanupTargetKind,
+    dry_run: bool,
     report: &mut CleanupReport,
 ) {
     let root = match cleanup_root(directory, kind) {
@@ -755,9 +784,26 @@ fn cleanup_kind(
             return;
         }
     };
+    match transport.stat(&root) {
+        Ok(meta) if meta.kind == EntryKind::Directory => {}
+        Ok(_) => {
+            report.nonfatal_failures.push(CleanupFailure {
+                target: None,
+                error: TransportError::IoError,
+            });
+            return;
+        }
+        Err(TransportError::NotFound) => return,
+        Err(error) => {
+            report.nonfatal_failures.push(CleanupFailure {
+                target: None,
+                error,
+            });
+            return;
+        }
+    }
     let entries = match transport.list_dir(&root) {
         Ok(entries) => entries,
-        Err(TransportError::NotFound) => return,
         Err(error) => {
             report.nonfatal_failures.push(CleanupFailure {
                 target: None,
@@ -792,6 +838,10 @@ fn cleanup_kind(
         };
 
         if timestamp_is_expired(&target.timestamp, now, keep_days) {
+            if dry_run {
+                report.removed_targets.push(target);
+                continue;
+            }
             match delete_tree(transport, &target.path) {
                 Ok(()) => report.removed_targets.push(target),
                 Err(error) => report.nonfatal_failures.push(CleanupFailure {
@@ -833,10 +883,22 @@ fn best_effort_remove_swap_new(transport: &TransportHandle, swap: &SwapPaths) {
 
 fn cleanup_swap_dirs(transport: &TransportHandle, swap: &SwapPaths) -> Result<(), TransportError> {
     cleanup_swap_entry_dir(transport, swap)?;
-    match transport.delete_dir(&swap.swap_root) {
-        Ok(()) | Err(TransportError::NotFound) => Ok(()),
+    match transport.list_dir(&swap.swap_root) {
+        Ok(entries) if entries.is_empty() => match transport.delete_dir(&swap.swap_root) {
+            Ok(()) => {
+                best_effort_remove_metadata_root(transport, &swap.metadata_root);
+                Ok(())
+            }
+            Err(TransportError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        },
+        Ok(_) | Err(TransportError::NotFound) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn best_effort_remove_metadata_root(transport: &TransportHandle, metadata_root: &RelPath) {
+    let _ = transport.delete_dir(metadata_root);
 }
 
 fn cleanup_swap_entry_dir(
@@ -850,6 +912,7 @@ fn cleanup_swap_entry_dir(
 }
 
 struct SwapPaths {
+    metadata_root: RelPath,
     swap_root: RelPath,
     entry_dir: RelPath,
     new_path: RelPath,
@@ -858,11 +921,13 @@ struct SwapPaths {
 
 fn swap_paths(parent: Option<&RelPath>, basename: &str) -> Result<SwapPaths, TransportError> {
     let encoded = percent_encode_segment(basename);
+    let metadata_root = child_path_opt(parent, ".kitchensync")?;
     let swap_root = child_path_opt(parent, ".kitchensync/SWAP")?;
     let entry_dir = append_segment(&swap_root, &encoded)?;
     let new_path = append_segment(&entry_dir, "new")?;
     let old_path = append_segment(&entry_dir, "old")?;
     Ok(SwapPaths {
+        metadata_root,
         swap_root,
         entry_dir,
         new_path,
@@ -879,10 +944,7 @@ fn recovery_paths(
     Ok((swap.old_path, swap.new_path, target))
 }
 
-fn cleanup_root(
-    directory: &RelPath,
-    kind: CleanupTargetKind,
-) -> Result<RelPath, TransportError> {
+fn cleanup_root(directory: &RelPath, kind: CleanupTargetKind) -> Result<RelPath, TransportError> {
     match kind {
         CleanupTargetKind::Bak => child_path(directory, ".kitchensync/BAK"),
         CleanupTargetKind::Tmp => child_path(directory, ".kitchensync/TMP"),
@@ -982,6 +1044,9 @@ fn timestamp_is_expired(timestamp: &Timestamp, now: &Timestamp, keep_days: u32) 
 }
 
 fn parse_timestamp(value: &str) -> Option<Duration> {
+    if value.len() != 27 {
+        return None;
+    }
     let (date, rest) = value.split_once('_')?;
     let (time, fraction_z) = rest.rsplit_once('_')?;
     let fraction = fraction_z.strip_suffix('Z')?;
@@ -989,17 +1054,48 @@ fn parse_timestamp(value: &str) -> Option<Duration> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: i64 = date_parts.next()?.parse().ok()?;
     let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
     let mut time_parts = time.split('-');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next()?.parse().ok()?;
     let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
     let micros: u64 = fraction.parse().ok()?;
+    if hour < 0
+        || hour > 23
+        || minute < 0
+        || minute > 59
+        || second < 0
+        || second > 60
+        || micros > 999_999
+        || day > days_in_month(year, month)?
+    {
+        return None;
+    }
     let days = days_from_civil(year, month, day)?;
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
     if secs < 0 {
         return None;
     }
     Some(Duration::from_secs(secs as u64) + Duration::from_micros(micros))
+}
+
+fn days_in_month(year: i64, month: i64) -> Option<i64> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {

@@ -131,7 +131,11 @@ fn recover_directory_swaps_replays_staged_new_entry() {
     let config = make_run_config(false);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    write_text(&root, "dir/.kitchensync/SWAP/file%20name.txt/new", "recovered value");
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/new",
+        "recovered value",
+    );
 
     let directory = kitchensync::RelPath::new("dir").unwrap();
     let report = executor
@@ -153,7 +157,11 @@ fn recover_directory_swaps_restores_old_entry_when_only_old_exists() {
     let config = make_run_config(false);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    write_text(&root, "dir/.kitchensync/SWAP/file%20name.txt/old", "legacy value");
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/old",
+        "legacy value",
+    );
 
     let directory = kitchensync::RelPath::new("dir").unwrap();
     executor
@@ -172,8 +180,16 @@ fn recover_directory_swaps_old_new_target_archives_old_to_bak() {
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
     write_text(&root, "dir/file name.txt", "target");
-    write_text(&root, "dir/.kitchensync/SWAP/file%20name.txt/old", "old value");
-    write_text(&root, "dir/.kitchensync/SWAP/file%20name.txt/new", "replacement");
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/old",
+        "old value",
+    );
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/new",
+        "replacement",
+    );
 
     let directory = kitchensync::RelPath::new("dir").unwrap();
     executor
@@ -184,7 +200,44 @@ fn recover_directory_swaps_old_new_target_archives_old_to_bak() {
     let bak_root = root.join("dir/.kitchensync/BAK");
     let bak_dirs = immediate_subdirs(&bak_root);
     assert_eq!(bak_dirs.len(), 1);
-    assert_eq!(read_file_path(&bak_dirs[0].join("file name.txt")), "old value");
+    assert_eq!(
+        read_file_path(&bak_dirs[0].join("file name.txt")),
+        "old value"
+    );
+    assert!(!root.join("dir/.kitchensync/SWAP/file%20name.txt").exists());
+}
+
+#[test]
+fn recover_directory_swaps_old_and_new_without_target_replays_new_and_archives_old() {
+    let root = next_test_root("recover_swaps_old_new_notarget");
+    let peer = make_peer_session(16, &root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/old",
+        "legacy value",
+    );
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/new",
+        "replacement",
+    );
+
+    let directory = kitchensync::RelPath::new("dir").unwrap();
+    executor
+        .recover_directory_swaps(&peer, &directory)
+        .expect("old+new recovery should finalize new and archive old");
+
+    assert_eq!(read_text(&root, "dir/file name.txt"), "replacement");
+    let bak_root = root.join("dir/.kitchensync/BAK");
+    let bak_dirs = immediate_subdirs(&bak_root);
+    assert_eq!(bak_dirs.len(), 1);
+    assert_eq!(
+        read_file_path(&bak_dirs[0].join("file name.txt")),
+        "legacy value"
+    );
     assert!(!root.join("dir/.kitchensync/SWAP/file%20name.txt").exists());
 }
 
@@ -196,7 +249,11 @@ fn recover_directory_swaps_deletes_staged_new_when_target_exists() {
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
     write_text(&root, "dir/existing.txt", "current value");
-    write_text(&root, "dir/.kitchensync/SWAP/existing.txt/new", "staged replacement");
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/existing.txt/new",
+        "staged replacement",
+    );
 
     let directory = kitchensync::RelPath::new("dir").unwrap();
     let report = executor
@@ -216,7 +273,11 @@ fn recover_directory_swaps_is_noop_in_dry_run() {
     let config = make_run_config(true);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    write_text(&root, "dir/.kitchensync/SWAP/file%20name.txt/new", "not moved");
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/new",
+        "not moved",
+    );
 
     let directory = kitchensync::RelPath::new("dir").unwrap();
     let report = executor
@@ -226,7 +287,9 @@ fn recover_directory_swaps_is_noop_in_dry_run() {
     assert_eq!(report.recovered_entries, 0);
     assert!(report.dry_run);
     assert!(!root.join("dir/file name.txt").exists());
-    assert!(root.join("dir/.kitchensync/SWAP/file%20name.txt/new").exists());
+    assert!(root
+        .join("dir/.kitchensync/SWAP/file%20name.txt/new")
+        .exists());
 }
 
 #[test]
@@ -249,7 +312,9 @@ fn recover_directory_swaps_skips_snapshot_db_entry() {
 
     assert_eq!(report.peer_id, peer.id);
     assert_eq!(report.recovered_entries, 0);
-    assert!(root.join("dir/.kitchensync/SWAP/snapshot.db/stay.txt").exists());
+    assert!(root
+        .join("dir/.kitchensync/SWAP/snapshot.db/stay.txt")
+        .exists());
 }
 
 #[test]
@@ -271,10 +336,19 @@ fn displace_to_bak_moves_entry_to_nearby_bak() {
 
     assert_eq!(result.peer_id, peer.id);
     assert_eq!(result.original_path.as_str(), "sub/obsolete.txt");
-    assert_eq!(result.bak_path.as_str(), "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt");
+    assert_eq!(
+        result.bak_path.as_str(),
+        "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt"
+    );
     assert!(!result.dry_run);
     assert!(!root.join("sub/obsolete.txt").exists());
-    assert_eq!(read_text(&root, "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt"), "to be moved");
+    assert_eq!(
+        read_text(
+            &root,
+            "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt"
+        ),
+        "to be moved"
+    );
 }
 
 #[test]
@@ -317,8 +391,17 @@ fn displace_to_bak_moves_directory_without_recursing() {
         .expect("directory displacement should be one rename");
 
     assert!(!root.join("tree").exists());
-    assert_eq!(result.bak_path.as_str(), "tree/.kitchensync/BAK/2024-01-02_00-00-00_000000Z/tree");
-    assert_eq!(read_text(&root, "tree/.kitchensync/BAK/2024-01-02_00-00-00_000000Z/tree/child/leaf.txt"), "nested content");
+    assert_eq!(
+        result.bak_path.as_str(),
+        ".kitchensync/BAK/2024-01-02_00-00-00_000000Z/tree"
+    );
+    assert_eq!(
+        read_text(
+            &root,
+            ".kitchensync/BAK/2024-01-02_00-00-00_000000Z/tree/child/leaf.txt"
+        ),
+        "nested content"
+    );
 }
 
 #[test]
@@ -383,10 +466,26 @@ fn cleanup_retention_removes_expired_items_and_retains_valid() {
     let config = make_run_config(false);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    write_text(&root, "base/.kitchensync/BAK/2023-12-01_00-00-00_000000Z/old.txt", "old");
-    write_text(&root, "base/.kitchensync/BAK/2024-01-06_00-00-00_000000Z/new.txt", "keep");
-    write_text(&root, "base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp", "old");
-    write_text(&root, "base/.kitchensync/TMP/2024-01-06_00-00-00_000000Z/new.tmp", "keep");
+    write_text(
+        &root,
+        "base/.kitchensync/BAK/2023-12-01_00-00-00_000000Z/old.txt",
+        "old",
+    );
+    write_text(
+        &root,
+        "base/.kitchensync/BAK/2024-01-06_00-00-00_000000Z/new.txt",
+        "keep",
+    );
+    write_text(
+        &root,
+        "base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp",
+        "old",
+    );
+    write_text(
+        &root,
+        "base/.kitchensync/TMP/2024-01-06_00-00-00_000000Z/new.tmp",
+        "keep",
+    );
 
     let report = executor
         .cleanup_retention(
@@ -400,10 +499,18 @@ fn cleanup_retention_removes_expired_items_and_retains_valid() {
 
     assert!(!report.dry_run);
     assert!(report.nonfatal_failures.is_empty());
-    assert!(!root.join("base/.kitchensync/BAK/2023-12-01_00-00-00_000000Z").exists());
-    assert!(!root.join("base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z").exists());
-    assert!(root.join("base/.kitchensync/BAK/2024-01-06_00-00-00_000000Z/new.txt").exists());
-    assert!(root.join("base/.kitchensync/TMP/2024-01-06_00-00-00_000000Z/new.tmp").exists());
+    assert!(!root
+        .join("base/.kitchensync/BAK/2023-12-01_00-00-00_000000Z")
+        .exists());
+    assert!(!root
+        .join("base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z")
+        .exists());
+    assert!(root
+        .join("base/.kitchensync/BAK/2024-01-06_00-00-00_000000Z/new.txt")
+        .exists());
+    assert!(root
+        .join("base/.kitchensync/TMP/2024-01-06_00-00-00_000000Z/new.tmp")
+        .exists());
 }
 
 #[test]
@@ -413,7 +520,11 @@ fn cleanup_retention_is_noop_in_dry_run() {
     let config = make_run_config(true);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    write_text(&root, "base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp", "old");
+    write_text(
+        &root,
+        "base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp",
+        "old",
+    );
 
     let report = executor
         .cleanup_retention(
@@ -429,7 +540,9 @@ fn cleanup_retention_is_noop_in_dry_run() {
     assert!(report.removed_targets.is_empty());
     assert!(report.retained_targets.is_empty());
     assert!(report.nonfatal_failures.is_empty());
-    assert!(root.join("base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp").exists());
+    assert!(root
+        .join("base/.kitchensync/TMP/2023-12-01_00-00-00_000000Z/old.tmp")
+        .exists());
 }
 
 #[test]
@@ -439,7 +552,7 @@ fn cleanup_retention_reports_nonfatal_failures() {
     let config = make_run_config(false);
     let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
 
-    fs::write(root.join("base/.kitchensync/BAK"), "blocked").unwrap();
+    write_text(&root, "base/.kitchensync/BAK", "blocked");
 
     let report = executor
         .cleanup_retention(
@@ -451,8 +564,44 @@ fn cleanup_retention_reports_nonfatal_failures() {
         )
         .expect("cleanup keeps reporting on nonfatal failure");
 
-    assert!(!report.removed_targets.is_empty() || !report.retained_targets.is_empty() || !report.nonfatal_failures.is_empty());
-    assert!(report.nonfatal_failures.iter().any(|failure| failure.target.is_none()));
+    assert!(
+        !report.removed_targets.is_empty()
+            || !report.retained_targets.is_empty()
+            || !report.nonfatal_failures.is_empty()
+    );
+    assert!(report
+        .nonfatal_failures
+        .iter()
+        .any(|failure| failure.target.is_none()));
+}
+
+#[test]
+fn cleanup_retention_does_not_purge_swap_state() {
+    let root = next_test_root("cleanup_retention_preserves_swap");
+    let peer = make_peer_session(43, &root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(
+        &root,
+        "base/.kitchensync/SWAP/2023-12-01_00-00-00_000000Z/final.bin/old",
+        "stale swap",
+    );
+
+    let report = executor
+        .cleanup_retention(
+            &peer,
+            &kitchensync::RelPath::new("base").unwrap(),
+            kitchensync::Timestamp("2024-01-06_00-00-00_000000Z".to_string()),
+            2,
+            2,
+        )
+        .expect("cleanup should succeed without touching SWAP");
+
+    assert!(report.nonfatal_failures.is_empty());
+    assert!(root
+        .join("base/.kitchensync/SWAP/2023-12-01_00-00-00_000000Z/final.bin/old")
+        .exists());
 }
 
 #[test]
@@ -478,13 +627,54 @@ fn execute_copy_attempt_replaces_existing_destination_and_archives_old() {
     assert!(result.completed);
     assert_eq!(result.failed_phase, None);
     assert_eq!(result.bytes_copied, 11);
-    assert_eq!(read_text(&destination_root, "work/final.bin"), "new payload");
+    assert_eq!(
+        read_text(&destination_root, "work/final.bin"),
+        "new payload"
+    );
     assert!(destination_root.join("work/.kitchensync/SWAP").exists() == false);
 
     let bak_root = destination_root.join("work/.kitchensync/BAK");
     let bak_dirs = immediate_subdirs(&bak_root);
     assert_eq!(bak_dirs.len(), 1);
-    assert_eq!(read_file_path(&bak_dirs[0].join("final.bin")), "old destination");
+    assert_eq!(
+        read_file_path(&bak_dirs[0].join("final.bin")),
+        "old destination"
+    );
+}
+
+#[test]
+fn execute_copy_attempt_keeps_shared_swap_root_with_snapshot_staging() {
+    let source_root = next_test_root("copy_shared_swap_source");
+    let destination_root = next_test_root("copy_shared_swap_dest");
+    let source_peer = make_peer_session(52, &source_root);
+    let destination_peer = make_peer_session(53, &destination_root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(&source_root, "payload.bin", "new payload");
+    write_text(
+        &destination_root,
+        ".kitchensync/SWAP/snapshot.db/new",
+        "snapshot staging",
+    );
+
+    let result = executor.execute_copy_attempt(
+        &source_peer,
+        &kitchensync::RelPath::new("payload.bin").unwrap(),
+        &destination_peer,
+        &kitchensync::RelPath::new("final.bin").unwrap(),
+        &entry_meta("payload.bin", "new payload"),
+    );
+
+    assert!(result.completed);
+    assert_eq!(result.failed_phase, None);
+    assert_eq!(read_text(&destination_root, "final.bin"), "new payload");
+    assert!(destination_root
+        .join(".kitchensync/SWAP/snapshot.db/new")
+        .exists());
+    assert!(!destination_root
+        .join(".kitchensync/SWAP/final.bin")
+        .exists());
 }
 
 #[test]
@@ -532,7 +722,10 @@ fn execute_copy_attempt_reports_read_source_when_missing_source() {
     );
 
     assert!(!result.completed);
-    assert_eq!(result.failed_phase, Some(kitchensync::TransferPhase::ReadSource));
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::ReadSource)
+    );
     assert_eq!(result.error, Some(kitchensync::TransportError::NotFound));
     assert_eq!(result.bytes_copied, 0);
 }
@@ -558,10 +751,18 @@ fn execute_copy_attempt_reports_rename_final_when_destination_is_directory() {
     );
 
     assert!(!result.completed);
-    assert_eq!(result.failed_phase, Some(kitchensync::TransferPhase::RenameFinal));
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::RenameFinal)
+    );
     assert_eq!(result.bytes_copied, 11);
     assert!(destination_root.join("work/blocked").is_dir());
 }
+
+// `TransferPhase::MoveExistingToSwapOld` and `TransferPhase::Cleanup` are both
+// difficult to force through the public file:// transport without transport-level
+// failure injection; the integration tests above cover the remaining copy
+// transition obligations through observable public outcomes.
 
 #[test]
 fn execute_copy_attempt_reports_set_mod_time_failure() {
@@ -587,8 +788,14 @@ fn execute_copy_attempt_reports_set_mod_time_failure() {
     );
 
     assert!(result.completed);
-    assert_eq!(result.failed_phase, Some(kitchensync::TransferPhase::SetModTime));
-    assert_eq!(read_text(&destination_root, "work/final.bin"), "fresh payload");
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::SetModTime)
+    );
+    assert_eq!(
+        read_text(&destination_root, "work/final.bin"),
+        "fresh payload"
+    );
 }
 
 #[test]
@@ -602,7 +809,7 @@ fn execute_copy_attempt_reports_archive_old_when_bak_root_is_file() {
 
     write_text(&source_root, "payload.bin", "new payload");
     write_text(&destination_root, "work/final.bin", "old destination");
-    fs::write(destination_root.join("work/.kitchensync/BAK"), "blocked").unwrap();
+    write_text(&destination_root, "work/.kitchensync/BAK", "blocked");
 
     let result = executor.execute_copy_attempt(
         &source_peer,
@@ -613,9 +820,253 @@ fn execute_copy_attempt_reports_archive_old_when_bak_root_is_file() {
     );
 
     assert!(result.completed);
-    assert_eq!(result.failed_phase, Some(kitchensync::TransferPhase::ArchiveOld));
-    assert_eq!(read_text(&destination_root, "work/final.bin"), "new payload");
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::ArchiveOld)
+    );
+    assert_eq!(
+        read_text(&destination_root, "work/final.bin"),
+        "new payload"
+    );
     assert!(destination_root
         .join("work/.kitchensync/SWAP/final.bin/old")
         .exists());
+}
+
+#[test]
+fn execute_copy_attempt_recovers_existing_swap_old_before_replacement() {
+    let source_root = next_test_root("copy_move_existing_to_swap_old_source");
+    let destination_root = next_test_root("copy_move_existing_to_swap_old_dest");
+    let source_peer = make_peer_session(62, &source_root);
+    let destination_peer = make_peer_session(63, &destination_root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(&source_root, "payload.bin", "new payload");
+    write_text(&destination_root, "work/final.bin", "current destination");
+    fs::create_dir_all(destination_root.join("work/.kitchensync/SWAP/final.bin")).unwrap();
+    write_text(
+        &destination_root,
+        "work/.kitchensync/SWAP/final.bin/old",
+        "blocked swap old",
+    );
+
+    let result = executor.execute_copy_attempt(
+        &source_peer,
+        &kitchensync::RelPath::new("payload.bin").unwrap(),
+        &destination_peer,
+        &kitchensync::RelPath::new("work/final.bin").unwrap(),
+        &entry_meta("payload.bin", "new payload"),
+    );
+
+    assert!(result.completed);
+    assert_eq!(result.failed_phase, None);
+    assert_eq!(result.bytes_copied, 11);
+    assert_eq!(
+        read_text(&destination_root, "work/final.bin"),
+        "new payload"
+    );
+    assert!(!destination_root.join("work/.kitchensync/SWAP").exists());
+
+    let bak_root = destination_root.join("work/.kitchensync/BAK");
+    let bak_dirs = immediate_subdirs(&bak_root);
+    assert_eq!(bak_dirs.len(), 2);
+    let mut archived_values = bak_dirs
+        .iter()
+        .map(|dir| read_file_path(&dir.join("final.bin")))
+        .collect::<Vec<_>>();
+    archived_values.sort();
+    assert_eq!(
+        archived_values,
+        vec![
+            "blocked swap old".to_string(),
+            "current destination".to_string()
+        ]
+    );
+}
+
+#[test]
+fn execute_copy_attempt_reports_write_swap_new_when_swap_parent_is_file() {
+    let source_root = next_test_root("copy_write_swap_new_source");
+    let destination_root = next_test_root("copy_write_swap_new_dest");
+    let source_peer = make_peer_session(64, &source_root);
+    let destination_peer = make_peer_session(65, &destination_root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(&source_root, "payload.bin", "new payload");
+    fs::create_dir_all(destination_root.join("work/.kitchensync")).unwrap();
+    write_text(
+        &destination_root,
+        "work/.kitchensync/SWAP",
+        "blocked swap directory",
+    );
+
+    let result = executor.execute_copy_attempt(
+        &source_peer,
+        &kitchensync::RelPath::new("payload.bin").unwrap(),
+        &destination_peer,
+        &kitchensync::RelPath::new("work/final.bin").unwrap(),
+        &entry_meta("payload.bin", "new payload"),
+    );
+
+    assert!(!result.completed);
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::WriteSwapNew)
+    );
+    assert_eq!(result.bytes_copied, 0);
+    assert!(!destination_root.join("work/final.bin").exists());
+}
+
+#[test]
+fn displace_to_bak_reports_error_when_bak_target_is_blocked() {
+    let root = next_test_root("displace_to_bak_failure");
+    let peer = make_peer_session(66, &root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+    let timestamp = kitchensync::Timestamp("2024-01-01_00-00-00_000000Z".to_string());
+
+    write_text(&root, "sub/obsolete.txt", "to be moved");
+    fs::create_dir_all(root.join("sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z")).unwrap();
+    write_text(
+        &root,
+        "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt",
+        "blocked bak target",
+    );
+
+    let error = executor
+        .displace_to_bak(
+            &peer,
+            &kitchensync::RelPath::new("sub/obsolete.txt").unwrap(),
+            timestamp,
+        )
+        .expect_err("displacement should fail when bak target exists");
+
+    assert_eq!(error.peer_id, peer.id);
+    assert_eq!(
+        error.context,
+        kitchensync::operations::OperationErrorContext::DisplaceToBak {
+            path: kitchensync::RelPath::new("sub/obsolete.txt").unwrap()
+        }
+    );
+    assert!(root.join("sub/obsolete.txt").exists());
+    assert_eq!(
+        read_text(
+            &root,
+            "sub/.kitchensync/BAK/2024-01-01_00-00-00_000000Z/obsolete.txt"
+        ),
+        "blocked bak target"
+    );
+}
+
+#[test]
+fn recover_directory_swaps_reports_failure_when_bak_backup_is_blocked() {
+    let root = next_test_root("recover_swaps_bak_blocked");
+    let peer = make_peer_session(67, &root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+    let directory = kitchensync::RelPath::new("dir").unwrap();
+
+    write_text(
+        &root,
+        "dir/.kitchensync/SWAP/file%20name.txt/old",
+        "legacy value",
+    );
+    write_text(&root, "dir/file name.txt", "current value");
+    write_text(&root, "dir/.kitchensync/BAK", "blocked bak root");
+
+    let error = executor
+        .recover_directory_swaps(&peer, &directory)
+        .expect_err("recovery should fail when BAK directory cannot be created");
+
+    assert_eq!(error.peer_id, peer.id);
+    assert_eq!(
+        error.context,
+        kitchensync::operations::OperationErrorContext::RecoverDirectorySwaps {
+            directory: directory.clone()
+        }
+    );
+    assert_eq!(read_text(&root, "dir/file name.txt"), "current value");
+    assert!(root.join("dir/.kitchensync/SWAP/file%20name.txt").exists());
+}
+
+#[test]
+fn execute_copy_attempt_reports_swap_recovery_failure_before_replacement() {
+    let source_root = next_test_root("copy_swap_recovery_failure_source");
+    let destination_root = next_test_root("copy_swap_recovery_failure_dest");
+    let source_peer = make_peer_session(68, &source_root);
+    let destination_peer = make_peer_session(69, &destination_root);
+    let config = make_run_config(false);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(&source_root, "payload.bin", "new payload");
+    write_text(&destination_root, "work/final.bin", "current destination");
+    fs::create_dir_all(destination_root.join("work/.kitchensync/SWAP/final.bin")).unwrap();
+    write_text(
+        &destination_root,
+        "work/.kitchensync/SWAP/final.bin/old",
+        "blocked old",
+    );
+    write_text(
+        &destination_root,
+        "work/.kitchensync/BAK",
+        "blocked bak root",
+    );
+
+    let result = executor.execute_copy_attempt(
+        &source_peer,
+        &kitchensync::RelPath::new("payload.bin").unwrap(),
+        &destination_peer,
+        &kitchensync::RelPath::new("work/final.bin").unwrap(),
+        &entry_meta("payload.bin", "new payload"),
+    );
+
+    assert!(!result.completed);
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::WriteSwapNew)
+    );
+    assert_eq!(result.bytes_copied, 0);
+    assert_eq!(
+        read_text(&destination_root, "work/final.bin"),
+        "current destination"
+    );
+    assert!(!destination_root
+        .join("work/.kitchensync/SWAP/final.bin/new")
+        .exists());
+    assert_eq!(
+        read_text(&destination_root, "work/.kitchensync/SWAP/final.bin/old"),
+        "blocked old"
+    );
+}
+
+#[test]
+fn execute_copy_attempt_dry_run_reports_read_source_when_source_missing() {
+    let source_root = next_test_root("copy_dry_read_missing_source");
+    let destination_root = next_test_root("copy_dry_read_missing_dest");
+    let source_peer = make_peer_session(70, &source_root);
+    let destination_peer = make_peer_session(71, &destination_root);
+    let config = make_run_config(true);
+    let executor = kitchensync::operations::executor(&config, &NullSink, &NullSink);
+
+    write_text(&destination_root, "work/final.bin", "existing");
+
+    let result = executor.execute_copy_attempt(
+        &source_peer,
+        &kitchensync::RelPath::new("missing.bin").unwrap(),
+        &destination_peer,
+        &kitchensync::RelPath::new("work/final.bin").unwrap(),
+        &entry_meta("missing.bin", ""),
+    );
+
+    assert!(!result.completed);
+    assert_eq!(
+        result.failed_phase,
+        Some(kitchensync::TransferPhase::ReadSource)
+    );
+    assert_eq!(result.error, Some(kitchensync::TransportError::NotFound));
+    assert_eq!(result.bytes_copied, 0);
+    assert_eq!(read_text(&destination_root, "work/final.bin"), "existing");
+    assert!(!destination_root.join("work/.kitchensync").exists());
 }

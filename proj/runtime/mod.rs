@@ -5,9 +5,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use crate::{DiagnosticEvent, ProgressEvent};
+
 use crate::{
-    CopyResult, CopyTask, DiagnosticEvent, ProgressEvent, RunConfig, TransferPhase,
-    TransportError, Verbosity,
+    snapshot::fresh_timestamp, CopyResult, CopyTask, RunConfig, TransferPhase, TransportError,
+    Verbosity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +93,7 @@ impl CopyScheduler {
         progress: impl ProgressSink + Send + Sync + 'static,
     ) -> Self {
         Self {
-            config: SchedulerConfig {
-                max_copies: config.max_copies.max(1),
-                retries_copy: config.retries_copy.max(1),
-            },
+            config,
             shared: Arc::new(SchedulerShared::default()),
             diagnostics: Arc::new(diagnostics),
             progress: Arc::new(progress),
@@ -165,14 +164,20 @@ fn worker_loop(
         let mut queued = {
             let mut state = shared.state.lock().expect("copy scheduler poisoned");
             loop {
-                if let Some(task) = state.queue.pop_front() {
-                    state.active += 1;
-                    publish_copy_slot_trace(diagnostics, state.active, config.max_copies);
-                    break task;
+                if state.active < config.max_copies {
+                    if let Some(task) = state.queue.pop_front() {
+                        state.active += 1;
+                        publish_copy_slot_trace(diagnostics, state.active, config.max_copies);
+                        break task;
+                    }
                 }
 
                 if state.closed && state.active == 0 {
                     shared.available.notify_all();
+                    return;
+                }
+
+                if config.max_copies == 0 && state.closed {
                     return;
                 }
 
@@ -183,29 +188,39 @@ fn worker_loop(
             }
         };
 
+        publish_copy_started(progress, &queued.task);
         let outcome = operation.execute_copy_attempt(&queued.task, progress);
+        let progress_task = queued.task.clone();
 
-        let mut state = shared.state.lock().expect("copy scheduler poisoned");
-        state.active -= 1;
-        publish_copy_slot_trace(diagnostics, state.active, config.max_copies);
+        let finished_successfully = matches!(outcome, CopyAttemptOutcome::Success(_));
+        {
+            let mut state = shared.state.lock().expect("copy scheduler poisoned");
+            state.active -= 1;
+            publish_copy_slot_trace(diagnostics, state.active, config.max_copies);
 
-        match outcome {
-            CopyAttemptOutcome::Success(_) => {
-                state.summary.succeeded += 1;
-            }
-            CopyAttemptOutcome::Failure(failure) => {
-                queued.tries += 1;
-                publish_copy_failure(diagnostics, &queued.task, &failure);
+            match outcome {
+                CopyAttemptOutcome::Success(_) => {
+                    state.summary.succeeded += 1;
+                }
+                CopyAttemptOutcome::Failure(failure) => {
+                    queued.tries += 1;
+                    publish_copy_failure(diagnostics, &queued.task, &failure);
 
-                if queued.tries < config.retries_copy {
-                    state.queue.push_back(queued);
-                } else {
-                    state.summary.failed += 1;
+                    if queued.tries < config.retries_copy {
+                        state.queue.push_back(queued);
+                    } else {
+                        state.summary.failed += 1;
+                    }
                 }
             }
+
+            shared.available.notify_all();
         }
 
-        shared.available.notify_all();
+        if finished_successfully {
+            publish_copy_finished(progress, &progress_task);
+        }
+        publish_copy_removed(progress, &progress_task);
     }
 }
 
@@ -236,6 +251,47 @@ fn publish_copy_failure(
     }
 
     diagnostics.publish(DiagnosticEvent::Error { message });
+}
+
+fn publish_copy_started(progress: &dyn ProgressSink, task: &CopyTask) {
+    progress.publish(ProgressEvent::CopyStarted {
+        destination: copy_destination_key(task),
+        basename: copy_basename(task).to_string(),
+        total_bytes: copy_total_bytes(task),
+    });
+}
+
+fn publish_copy_finished(progress: &dyn ProgressSink, task: &CopyTask) {
+    progress.publish(ProgressEvent::CopyFinished {
+        destination: copy_destination_key(task),
+    });
+}
+
+fn publish_copy_removed(progress: &dyn ProgressSink, task: &CopyTask) {
+    progress.publish(ProgressEvent::CopyRemoved {
+        destination: copy_destination_key(task),
+    });
+}
+
+fn copy_destination_key(task: &CopyTask) -> String {
+    format!(
+        "{}:{}",
+        task.destination_peer_id,
+        render_rel_path(&task.destination_path)
+    )
+}
+
+fn copy_basename(task: &CopyTask) -> &str {
+    task.destination_path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&task.winning_meta.name)
+}
+
+fn copy_total_bytes(task: &CopyTask) -> Option<u64> {
+    u64::try_from(task.winning_meta.byte_size).ok()
 }
 
 pub fn stdout_diagnostic_sink(
@@ -275,7 +331,7 @@ impl DiagnosticSink for StdoutDiagnosticSink {
                 self.write_line(&message);
             }
             DiagnosticEvent::Trace { message } if self.verbosity == Verbosity::Trace => {
-                self.write_line(&message);
+                self.write_line(&format!("{} {message}", fresh_timestamp().0));
             }
             DiagnosticEvent::Info { message }
                 if matches!(

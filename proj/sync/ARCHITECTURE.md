@@ -10,19 +10,23 @@ outcome for each path, updates snapshot state at the required decision points,
 and requests inline operations or queued copies needed to make active peers
 match the selected outcome.
 
-`sync` is deliberately above transport, snapshot storage, safe replacement,
-copy scheduling, and rendering internals. It must be testable as a recursive
-combined-tree walk by using supplied peer sessions, snapshot stores, operation
-executors, copy schedulers, and output sinks.
+`sync` sits above transport, snapshot storage, safe replacement, copy
+scheduling, and rendering internals. Its behavior must be testable as a
+recursive combined-tree walk by supplying peer sessions, snapshot stores,
+operation executors, copy schedulers, and output sinks.
+
+This scope is not a leaf. The traversal and decision rules are large enough
+that immediate child modules are needed to keep implementation jobs narrow,
+but those children remain private to `sync`.
 
 ## Public Surface
 
-The parent exposes `sync` through one traversal API for a single run. The API
+The parent calls `sync` through one traversal API for a single run. The API
 accepts:
 
 - root-owned run configuration, including dry-run mode, retry limits, excludes,
-  retention settings, and copy limits;
-- connected peer sessions with canonical, subordinate, or contributing role
+  retention settings, and copy controls;
+- connected peer sessions with canon, subordinate, or contributing role
   information;
 - per-peer snapshot stores;
 - an operation executor for inline peer effects;
@@ -30,158 +34,164 @@ accepts:
 - diagnostic and progress sinks.
 
 The API returns whether traversal and all queued copy work completed without
-unrecovered failures, plus enough skipped-work and failure detail for the
-parent to map the run result. It does not expose traversal cursors, vote
-records, path groups, or child-module internals.
+unrecovered failures. Skipped-work and failure detail is emitted through the
+diagnostic sink rather than by exposing traversal cursors, vote records, path
+groups, or child-module internals.
 
-## Internal Split
-
-This module should not remain a single implementation leaf. The required work
-has separable traversal, classification, decision, effect dispatch, and
-snapshot-timing concerns. These are private children under `sync`; they are not
-visible to sibling modules. Shared contracts that later need sibling access
-should move to the narrowest common ancestor instead of exposing these private
-children.
+## Child Modules
 
 ### traversal
 
-Owns the recursive pre-order combined-tree walk. For each directory it:
-
-- reports the scanned directory to progress, using `.` for the root and
-  slash-separated relative paths elsewhere;
-- before listing in normal runs, asks operations to recover user-entry SWAP
-  state for each peer still participating at that directory;
-- starts listings on all peers participating at that directory before awaiting
-  any result;
-- retries each failed listing up to `RunConfig.retries_list` total attempts;
-- treats failed SWAP recovery as that peer's listing failure for the same
-  directory;
-- applies subtree-scoped listing failure rules, including canon failure rules;
-- builds candidate names from live listing names only;
-- includes subordinate-only listed names only when at least one contributing
-  peer remains, so they can be displaced for an absence outcome;
-- removes excluded names before snapshot lookup or decision-making;
-- processes candidates in deterministic case-insensitive lexicographic order,
-  using the original name as the tie-breaker;
-- after the directory's candidates are processed, asks operations to perform
-  BAK/TMP retention cleanup in normal runs.
-
-If a non-canon peer exhausts listing retries, `traversal` excludes that peer
-from decisions, operations, recursion, and snapshot updates for that directory
-subtree only. If the canon peer exhausts listing retries, it skips all
-decisions, operations, copies, cleanup-driven snapshot changes, recursion, and
-snapshot row changes under that subtree for every peer. If all active
-contributing peers fail at a directory, it skips decisions for that subtree and
-does not process subordinate-only entries there.
+Owns the recursive pre-order combined-tree walk, active peer set for each
+subtree, concurrent directory listing with retries, scanned-directory progress,
+candidate ordering, subtree-scoped listing failure handling, and normal-run
+SWAP recovery and BAK/TMP cleanup requests. It is carved because traversal
+order and peer participation rules must stay independent from per-path voting
+and from concrete peer mutations.
 
 ### excludes
 
-Owns the local exclude predicate used by traversal. Built-in excludes are
-`.kitchensync/`, `.git/`, symbolic links, special files, and other non-regular
-entries omitted by transport listing or stat behavior. Command-line excludes
-come from `RunConfig.excludes`; they match exact relative file paths and
-directory subtree prefixes.
-
-Excluded entries are nonexistent for the current run. They are not copied,
-created, displaced, deleted, recursed into, used for decisions, or used for
-snapshot updates. Existing peer contents at excluded paths are left untouched.
+Owns the built-in and command-line exclude predicate applied before snapshot
+lookup or decision-making. It is carved because exclude behavior is small but
+cross-cutting: excluded paths are treated as nonexistent for this run and must
+not be copied, displaced, recursed into, or used for snapshot updates.
 
 ### classify
 
-Owns normalized decision inputs for one candidate path. It combines live states
-from active peers with snapshot rows from active contributing peers. It keeps
-subordinate peer state available as target state but never lets subordinate
-live entries or snapshot history vote on the group outcome.
-
-Classification records represent live file, live directory, live absence,
-wrong type, unchanged file, modified file, new file, deletion vote,
-absent-unconfirmed file, no-vote, tombstone, and canon states. File
-classification uses byte size and the 5-second modification-time tolerance
-against snapshot rows. Directory classification ignores directory modification
-time.
-
-`classify` reads through `SnapshotStore` only. It does not know SQLite schema,
-path hashing, local database paths, or snapshot file lifecycle.
+Owns the normalized decision inputs for one candidate path by combining live
+entry metadata with per-peer snapshot rows. It is carved because file,
+directory, tombstone, absent-unconfirmed, deletion-vote, canon, and subordinate
+target states should be computed once before pure reconciliation rules run.
 
 ### decision
 
-Owns pure reconciliation rules. Given a classified path, peer roles, and run
-configuration, it selects one group outcome:
-
-- canon file, canon directory, or canon absence when a canon peer is active for
-  the directory;
-- file existence, chosen by newest contributing live file modification time
-  with 5-second tolerance and size tie-breaker;
-- directory existence when any contributing peer has a live directory;
-- absence when deletion estimates beat live files, when contributing snapshot
-  rows prove directory absence or tombstones, or when no contributing peer has
-  a vote or snapshot row;
-- file outcome for non-canon file-vs-directory conflicts, using normal file
-  rules over contributing live files;
-- skipped work when traversal failure rules prevent a safe decision.
-
-Decision records are side-effect-free. They name the selected source metadata,
-the peers that already match, the peers that need inline operations, the peers
-that need queued copies, peers eligible for recursion, and snapshot
-transitions that become valid only after specific observations or results.
+Owns side-effect-free reconciliation of a classified path into a group outcome:
+canon result, file result, directory result, absence, type-conflict result, or
+skipped work. It is carved so conflict rules, 5-second timestamp tolerance,
+size tie-breaking, deletion estimates, and subordinate non-voting behavior can
+be tested without transport, SQLite, operations, or scheduler dependencies.
 
 ### dispatch
 
-Owns sync-level execution of decision records. It sends deletion and type
-conflict displacements inline through operations, requests missing directory
-creation inline, enqueues eligible file copies as soon as traversal finds them,
-and waits for the copy scheduler to finish all queued work before `sync`
-returns success.
-
-Displacements are never placed in the file-copy queue. For directory existence,
-wrong-type entries are displaced before directory creation or recursion. For
-directory absence, live entries are displaced and that path is not recursed into
-on that peer. For file existence, wrong-type directories are displaced before
-copy planning, and copies are only enqueued for peers whose live file is absent
-or does not match the winner by byte size and 5-second modification-time
-tolerance.
-
-`dispatch` does not implement safe replacement, SWAP/BAK/TMP path sequencing,
-copy retry policy, copy-slot accounting, or transfer progress rendering. Those
-belong to operations and runtime.
+Owns execution of selected outcomes at the sync level by requesting inline
+displacements and directory creates, enqueuing eligible file copies promptly,
+and waiting for queued copy work before returning. It is carved because sync
+decides when effects are needed, while operations and runtime own how safe
+replacement, copy retries, copy slots, and progress rendering happen.
 
 ### snapshot_flow
 
-Owns the ordering of snapshot updates requested by traversal decisions and
-observed results. It maps sync events to `SnapshotStore` calls:
+Owns the ordering of snapshot-store updates triggered by observations,
+decisions, successful inline operations, and final copy results. It is carved
+because snapshot mutation timing is part of sync correctness, but SQLite
+schema, path hashing, timestamp generation, and physical snapshot lifecycle
+belong to the snapshot module.
 
-- confirmed-present listed files are upserted with current modification time,
-  byte size, fresh `last_seen`, and `deleted_time = NULL`;
-- intended destination copies are marked with the winning modification time,
-  winning byte size, and `deleted_time = NULL`, without changing `last_seen`
-  before the copy succeeds;
-- successful copy results set destination `last_seen` to a fresh timestamp;
-- failed copies leave destination `last_seen` unchanged and keep
-  `deleted_time = NULL`;
-- successful directory creation marks that directory present with fresh
-  `last_seen`;
-- confirmed absence marks existing non-tombstone rows deleted using the
-  previous `last_seen` as `deleted_time`;
-- existing tombstones remain unchanged;
-- successful displacement marks the displaced entry deleted, and displaced
-  directories request same-peer subtree cascade using the snapshot store;
-- failed displacement or directory creation leaves the affected rows
-  unchanged.
+## Internal Design
 
-`snapshot_flow` never updates rows for excluded paths, unreachable peers,
-peers excluded from a failed listing subtree, or any peer under a subtree
-skipped because canon listing failed. Opportunistic stale-row cleanup can be
-started or requested without delaying the first directory scan or first
-eligible copy, and decisions must not depend on that cleanup finishing.
+`traversal` starts at the sync root and walks directories in pre-order. For
+each directory it reports progress, optionally requests user-entry SWAP
+recovery in normal mode, starts all peer listings before awaiting any result,
+and retries each peer's listing up to `RunConfig.retries_list` total attempts.
+A failed SWAP recovery is handled as that peer's listing failure for that same
+directory.
+
+Listing failures are scoped to the affected subtree. A non-canon peer that
+exhausts listing retries is removed from decisions, operations, recursion, and
+snapshot updates only for that directory subtree. If the canon peer exhausts
+listing retries, `sync` skips decisions, operations, copies, cleanup-driven
+snapshot changes, recursion, and snapshot row changes under that subtree for
+all peers. If all active contributing peers fail at a directory, subordinate
+only entries under that subtree are not processed.
+
+Candidate names come only from live listings. Active contributing peer names
+are included, and subordinate peer names are included only when at least one
+active contributing peer remains so subordinate-only paths can be displaced for
+an absence outcome. Snapshot-only rows never add names to the traversal set.
+Candidates are processed in deterministic case-insensitive lexicographic order
+with the original case-sensitive name as the tie-breaker, and transport
+filenames are preserved when requesting operations and copies.
+
+`excludes` removes built-in and command-line excluded candidates before any
+snapshot lookup. Built-in excludes are `.kitchensync/`, `.git/`, symbolic
+links, special files, and other non-regular entries omitted by transport
+listing or stat behavior. Command-line excludes from `RunConfig.excludes`
+match exact relative file paths and directory subtree prefixes. Existing peer
+contents at excluded paths are left untouched.
+
+`classify` gathers live state and snapshot rows from active contributing peers
+for voting. Subordinate peers are retained as possible effect targets, but
+their live entries and snapshot history never affect the group outcome. File
+classification compares live files with non-tombstone snapshot rows by byte
+size and the 5-second modification-time tolerance; directory classification
+ignores directory modification time.
+
+`decision` applies canon behavior before normal bidirectional rules. With an
+active canon peer at the directory, the canon peer's live file, live directory,
+or absence is authoritative. Without canon, file winners are selected from
+contributing live files by newest modification time with 5-second tolerance,
+then larger size among tied candidates with different sizes. Existing data wins
+ties against deletion, and deletion wins only when its estimate is more than
+5 seconds newer than the newest live file.
+
+Directory existence wins when any active contributing peer has a live
+directory. Directory absence wins when no contributing peer has a live
+directory and contributing snapshot rows prove absence or tombstones; peers
+with no directory snapshot row do not block deletion. If no contributing peer
+has a live directory or any snapshot row for the path, absence is the outcome.
+For non-canon file-vs-directory conflicts, a file outcome wins and the file
+winner is chosen by the normal file rules over contributing live files only.
+
+`dispatch` applies every selected group outcome to all active peers at that
+directory level, including subordinate peers. Directory existence displaces
+wrong-type entries inline before creating or keeping the directory, and only
+peers where the directory exists or was successfully created participate in
+recursion. Directory or file absence displaces any live entry inline and does
+not recurse into a displaced directory on that peer.
+
+For file existence, `dispatch` records listed source states through
+`snapshot_flow`, asks operations to displace wrong-type directories inline,
+and enqueues copies for peers that lack the file or whose live file does not
+match the winner by byte size and the 5-second modification-time tolerance.
+Displacements are never queued as copy work. File-copy work is enqueued as soon
+as traversal finds eligible work, and `sync` waits for the copy scheduler to
+finish all queued work before returning success.
+
+## Snapshot Flow
+
+`snapshot_flow` reads and mutates snapshot rows only through `SnapshotStore`.
+It does not know SQLite schema, path hashing implementation details, local
+temporary database paths, or physical snapshot file lifecycle.
+
+Confirmed-present listed files are upserted with current modification time,
+byte size, fresh `last_seen`, and `deleted_time = NULL`. Intended destination
+copies are marked with the winning modification time, winning byte size, and
+`deleted_time = NULL`, but destination `last_seen` is not changed until the
+copy succeeds. Successful copy results set destination `last_seen` to a fresh
+timestamp; failed copies leave `last_seen` unchanged and keep
+`deleted_time = NULL`.
+
+Successful inline directory creation marks that directory present with fresh
+`last_seen`; failed creation leaves the existing row unchanged. Confirmed
+absence marks an existing non-tombstone row deleted using the row's previous
+`last_seen` as `deleted_time`; existing tombstones remain unchanged. Successful
+displacement marks the displaced entry deleted, and displaced directories
+request the snapshot store's same-peer subtree cascade. Failed displacement
+leaves the affected row and descendants unchanged.
+
+`snapshot_flow` never updates rows for excluded paths, unreachable peers, peers
+excluded from a failed listing subtree, or any peer under a subtree skipped
+because canon listing failed. Opportunistic stale-row cleanup may be started or
+requested without delaying the first directory scan or first eligible copy, and
+decisions must not depend on that cleanup finishing in the current run.
 
 ## Data Flow
 
 1. The parent prepares configuration, peer sessions, snapshot stores,
    operation executor, copy scheduler, and sinks, then calls `sync`.
-2. `traversal` walks directories in pre-order, maintaining the active peer set
-   for each subtree and applying listing failure rules.
-3. `excludes` removes built-in and command-line excluded candidates before any
-   snapshot lookup.
+2. `traversal` walks directories in pre-order while maintaining active peer
+   participation for each subtree.
+3. `excludes` removes excluded candidates before snapshot lookup.
 4. `classify` combines live entry metadata and snapshot rows for each
    surviving candidate path.
 5. `decision` selects the group outcome using canon, bidirectional,
@@ -190,9 +200,8 @@ eligible copy, and decisions must not depend on that cleanup finishing.
    after confirmed inline results.
 7. `dispatch` requests inline operations and enqueues copy work. The copy
    scheduler may run while traversal continues.
-8. After traversal completes, `sync` waits for the copy scheduler's final
-   results and asks `snapshot_flow` to apply successful-copy `last_seen`
-   updates.
+8. After traversal completes, `sync` waits for final copy results and asks
+   `snapshot_flow` to apply successful-copy `last_seen` updates.
 9. `sync` returns the combined traversal and copy completion result to the
    parent.
 
@@ -216,7 +225,7 @@ implementation details, safe-replacement implementation details, copy queue
 internals, terminal rendering, or sibling-module private data structures.
 
 No separate visible ancestor API is present in this task. Contract names in
-this document describe the behavioral dependencies already identified by the
+this document describe behavioral dependencies already identified by the
 parent architecture; concrete shared Rust types should be introduced at the
 narrowest ancestor only when implementation jobs require them.
 
@@ -255,13 +264,13 @@ dry-run mode.
 
 For creates, displacements, and copies, `sync` still calls the operation and
 copy-scheduler contracts with the dry-run run configuration. Operations own
-suppression of peer-side mutation, and runtime owns the copy-slot behavior.
+suppression of peer-side mutation, and runtime owns copy-slot behavior.
 
 ## Visibility Rules
 
-Only the top-level sync run API and its result/error contracts are visible to
-the parent. Private child modules under `sync` may share internal records with
-each other, but sibling modules must communicate with `sync` only through the
+Only the top-level sync run API and its result contract are visible to the
+parent. Private child modules under `sync` may share internal records with each
+other, but sibling modules must communicate with `sync` only through the
 parent-visible API.
 
 If later work proves that another first-layer module needs a `sync` internal

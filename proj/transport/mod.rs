@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,7 +49,8 @@ impl TransportFactory for DefaultTransportFactory {
     ) -> Result<TransportHandle, TransportError> {
         match url.scheme.as_str() {
             "file" => connect_local(url, root_mode),
-            "sftp" => connect_sftp(url, timeouts, root_mode),
+            "sftp" => connect_sftp(url, timeouts, root_mode)
+                .or_else(|_| connect_openssh_sftp(url, root_mode)),
             _ => Err(TransportError::IoError),
         }
     }
@@ -76,6 +78,7 @@ struct LocalBackend {
 
 impl TransportBackend for LocalBackend {
     fn list_dir(&self, path: &RelPath) -> Result<Vec<EntryMeta>, TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let directory = self.resolve(path);
         ensure_local_directory(&directory)?;
         let entries = fs::read_dir(directory).map_err(map_io_error)?;
@@ -94,12 +97,14 @@ impl TransportBackend for LocalBackend {
     }
 
     fn stat(&self, path: &RelPath) -> Result<EntryMeta, TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let full_path = self.resolve(path);
         let metadata = fs::symlink_metadata(&full_path).map_err(map_io_error)?;
         entry_meta_from_metadata(basename(path), metadata).ok_or(TransportError::NotFound)
     }
 
     fn open_read(&self, path: &RelPath) -> Result<TransportRead, TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let full_path = self.resolve(path);
         ensure_local_file(&full_path)?;
         let file = File::open(full_path).map_err(map_io_error)?;
@@ -107,6 +112,7 @@ impl TransportBackend for LocalBackend {
     }
 
     fn open_write(&self, path: &RelPath) -> Result<TransportWrite, TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let full_path = self.resolve(path);
         if fs::symlink_metadata(&full_path)
             .map(|metadata| metadata.file_type().is_symlink())
@@ -127,8 +133,11 @@ impl TransportBackend for LocalBackend {
     }
 
     fn rename_no_overwrite(&self, src: &RelPath, dst: &RelPath) -> Result<(), TransportError> {
+        self.ensure_no_symlink_parents(src)?;
+        self.ensure_no_symlink_parents(dst)?;
         let src = self.resolve(src);
         let dst = self.resolve(dst);
+        ensure_local_file_or_directory(&src)?;
         match fs::symlink_metadata(&dst) {
             Ok(_) => return Err(TransportError::IoError),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -138,20 +147,25 @@ impl TransportBackend for LocalBackend {
     }
 
     fn delete_file(&self, path: &RelPath) -> Result<(), TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let full_path = self.resolve(path);
         ensure_local_file(&full_path)?;
         fs::remove_file(full_path).map_err(map_io_error)
     }
 
     fn create_dir(&self, path: &RelPath) -> Result<(), TransportError> {
+        self.ensure_no_symlink_components(path)?;
         fs::create_dir_all(self.resolve(path)).map_err(map_io_error)
     }
 
     fn delete_dir(&self, path: &RelPath) -> Result<(), TransportError> {
+        self.ensure_no_symlink_parents(path)?;
+        ensure_local_directory(&self.resolve(path))?;
         fs::remove_dir(self.resolve(path)).map_err(map_io_error)
     }
 
     fn set_mod_time(&self, path: &RelPath, time: Timestamp) -> Result<(), TransportError> {
+        self.ensure_no_symlink_parents(path)?;
         let full_path = self.resolve(path);
         ensure_local_file_or_directory(&full_path)?;
         let system_time = parse_timestamp(&time).ok_or(TransportError::IoError)?;
@@ -164,6 +178,14 @@ impl LocalBackend {
     fn resolve(&self, path: &RelPath) -> PathBuf {
         resolve_local(&self.root, path.as_str())
     }
+
+    fn ensure_no_symlink_parents(&self, path: &RelPath) -> Result<(), TransportError> {
+        ensure_no_local_symlink_components(&self.root, path.as_str(), false)
+    }
+
+    fn ensure_no_symlink_components(&self, path: &RelPath) -> Result<(), TransportError> {
+        ensure_no_local_symlink_components(&self.root, path.as_str(), true)
+    }
 }
 
 struct SftpBackend {
@@ -172,15 +194,20 @@ struct SftpBackend {
     root: String,
 }
 
+#[derive(Debug)]
+struct OpenSshBackend {
+    target: String,
+    port: u16,
+    root: String,
+}
+
 impl TransportBackend for SftpBackend {
     fn list_dir(&self, path: &RelPath) -> Result<Vec<EntryMeta>, TransportError> {
         let directory = self.resolve(path);
-        let entries = self
-            .sftp
-            .lock()
-            .map_err(|_| TransportError::IoError)?
-            .readdir(Path::new(&directory))
-            .map_err(map_ssh_error)?;
+        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
+        ensure_remote_parent_components(&sftp, &directory)?;
+        ensure_remote_directory(&sftp, &directory)?;
+        let entries = sftp.readdir(Path::new(&directory)).map_err(map_ssh_error)?;
         let mut metas = Vec::new();
 
         for (path, stat) in entries {
@@ -199,12 +226,10 @@ impl TransportBackend for SftpBackend {
     }
 
     fn stat(&self, path: &RelPath) -> Result<EntryMeta, TransportError> {
-        let stat = self
-            .sftp
-            .lock()
-            .map_err(|_| TransportError::IoError)?
-            .lstat(Path::new(&self.resolve(path)))
-            .map_err(map_ssh_error)?;
+        let full_path = self.resolve(path);
+        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
+        ensure_remote_parent_components(&sftp, &full_path)?;
+        let stat = sftp.lstat(Path::new(&full_path)).map_err(map_ssh_error)?;
         entry_meta_from_sftp(basename(path), stat).ok_or(TransportError::NotFound)
     }
 
@@ -241,8 +266,20 @@ impl TransportBackend for SftpBackend {
         let src = self.resolve(src);
         let dst = self.resolve(dst);
         let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
-        if sftp.lstat(Path::new(&dst)).is_ok() {
-            return Err(TransportError::IoError);
+        ensure_remote_parent_components(&sftp, &src)?;
+        ensure_remote_parent_components(&sftp, &dst)?;
+        let src_stat = sftp.lstat(Path::new(&src)).map_err(map_ssh_error)?;
+        if !is_sftp_file(&src_stat) && !is_sftp_directory(&src_stat) {
+            return Err(TransportError::NotFound);
+        }
+        match sftp.lstat(Path::new(&dst)) {
+            Ok(_) => return Err(TransportError::IoError),
+            Err(error) => {
+                let category = map_ssh_error(error);
+                if category != TransportError::NotFound {
+                    return Err(category);
+                }
+            }
         }
         sftp.rename(Path::new(&src), Path::new(&dst), None)
             .map_err(map_ssh_error)
@@ -250,12 +287,10 @@ impl TransportBackend for SftpBackend {
 
     fn delete_file(&self, path: &RelPath) -> Result<(), TransportError> {
         let full_path = self.resolve(path);
-        self.ensure_remote_file(&full_path)?;
-        self.sftp
-            .lock()
-            .map_err(|_| TransportError::IoError)?
-            .unlink(Path::new(&full_path))
-            .map_err(map_ssh_error)
+        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
+        ensure_remote_parent_components(&sftp, &full_path)?;
+        ensure_remote_file(&sftp, &full_path)?;
+        sftp.unlink(Path::new(&full_path)).map_err(map_ssh_error)
     }
 
     fn create_dir(&self, path: &RelPath) -> Result<(), TransportError> {
@@ -263,11 +298,11 @@ impl TransportBackend for SftpBackend {
     }
 
     fn delete_dir(&self, path: &RelPath) -> Result<(), TransportError> {
-        self.sftp
-            .lock()
-            .map_err(|_| TransportError::IoError)?
-            .rmdir(Path::new(&self.resolve(path)))
-            .map_err(map_ssh_error)
+        let full_path = self.resolve(path);
+        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
+        ensure_remote_parent_components(&sftp, &full_path)?;
+        ensure_remote_directory(&sftp, &full_path)?;
+        sftp.rmdir(Path::new(&full_path)).map_err(map_ssh_error)
     }
 
     fn set_mod_time(&self, path: &RelPath, time: Timestamp) -> Result<(), TransportError> {
@@ -276,7 +311,9 @@ impl TransportBackend for SftpBackend {
             .map(|duration| duration.as_secs())
             .ok_or(TransportError::IoError)?;
         let full_path = self.resolve(path);
-        self.ensure_remote_file_or_directory(&full_path)?;
+        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
+        ensure_remote_parent_components(&sftp, &full_path)?;
+        ensure_remote_file_or_directory(&sftp, &full_path)?;
         let stat = ssh2::FileStat {
             size: None,
             uid: None,
@@ -285,10 +322,7 @@ impl TransportBackend for SftpBackend {
             atime: None,
             mtime: Some(seconds),
         };
-        self.sftp
-            .lock()
-            .map_err(|_| TransportError::IoError)?
-            .setstat(Path::new(&full_path), stat)
+        sftp.setstat(Path::new(&full_path), stat)
             .map_err(map_ssh_error)
     }
 }
@@ -320,23 +354,207 @@ impl SftpBackend {
 
     fn ensure_remote_file(&self, path: &str) -> Result<(), TransportError> {
         let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
-        let stat = sftp.lstat(Path::new(path)).map_err(map_ssh_error)?;
-        if is_sftp_file(&stat) {
-            Ok(())
-        } else {
-            Err(TransportError::NotFound)
+        ensure_remote_parent_components(&sftp, path)?;
+        ensure_remote_file(&sftp, path)
+    }
+}
+
+impl TransportBackend for OpenSshBackend {
+    fn list_dir(&self, path: &RelPath) -> Result<Vec<EntryMeta>, TransportError> {
+        let directory = self.resolve(path);
+        let script = format!(
+            "dir={}\n[ -d \"$dir\" ] || exit 44\nfor entry in \"$dir\"/* \"$dir\"/.[!.]* \"$dir\"/..?*; do\n  [ -e \"$entry\" ] || continue\n  [ -L \"$entry\" ] && continue\n  name=${{entry##*/}}\n  if [ -d \"$entry\" ]; then kind=d; size=-1; elif [ -f \"$entry\" ]; then kind=f; size=$(wc -c < \"$entry\" | tr -d ' '); else continue; fi\n  mtime=$(date -u -r \"$entry\" '+%Y-%m-%d_%H-%M-%S_000000Z' 2>/dev/null || printf '1970-01-01_00-00-00_000000Z')\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$name\" \"$kind\" \"$size\" \"$mtime\"\ndone\n",
+            shell_quote(&directory)
+        );
+        let output = self.run_script(&script, None)?;
+        let text = String::from_utf8(output).map_err(|_| TransportError::IoError)?;
+        let mut entries = Vec::new();
+        for line in text.lines() {
+            let parts = line.split('\t').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                return Err(TransportError::IoError);
+            }
+            let kind = match parts[1] {
+                "f" => EntryKind::File,
+                "d" => EntryKind::Directory,
+                _ => return Err(TransportError::IoError),
+            };
+            let byte_size = parts[2].parse::<i64>().map_err(|_| TransportError::IoError)?;
+            entries.push(EntryMeta {
+                name: parts[0].to_string(),
+                kind,
+                byte_size,
+                mod_time: Timestamp(parts[3].to_string()),
+            });
         }
+        Ok(entries)
     }
 
-    fn ensure_remote_file_or_directory(&self, path: &str) -> Result<(), TransportError> {
-        let sftp = self.sftp.lock().map_err(|_| TransportError::IoError)?;
-        let stat = sftp.lstat(Path::new(path)).map_err(map_ssh_error)?;
-        if is_sftp_file(&stat) || is_sftp_directory(&stat) {
-            Ok(())
-        } else {
-            Err(TransportError::NotFound)
+    fn stat(&self, path: &RelPath) -> Result<EntryMeta, TransportError> {
+        let full_path = self.resolve(path);
+        let name = basename(path);
+        let script = format!(
+            "entry={}\n[ -L \"$entry\" ] && exit 44\nif [ -d \"$entry\" ]; then kind=d; size=-1; elif [ -f \"$entry\" ]; then kind=f; size=$(wc -c < \"$entry\" | tr -d ' '); else exit 44; fi\nmtime=$(date -u -r \"$entry\" '+%Y-%m-%d_%H-%M-%S_000000Z' 2>/dev/null || printf '1970-01-01_00-00-00_000000Z')\nprintf '%s\\t%s\\t%s\\t%s\\n' {} \"$kind\" \"$size\" \"$mtime\"\n",
+            shell_quote(&full_path),
+            shell_quote(&name)
+        );
+        let output = self.run_script(&script, None)?;
+        let text = String::from_utf8(output).map_err(|_| TransportError::IoError)?;
+        let parts = text.trim_end().split('\t').collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(TransportError::IoError);
         }
+        let kind = match parts[1] {
+            "f" => EntryKind::File,
+            "d" => EntryKind::Directory,
+            _ => return Err(TransportError::IoError),
+        };
+        Ok(EntryMeta {
+            name: parts[0].to_string(),
+            kind,
+            byte_size: parts[2].parse::<i64>().map_err(|_| TransportError::IoError)?,
+            mod_time: Timestamp(parts[3].to_string()),
+        })
     }
+
+    fn open_read(&self, path: &RelPath) -> Result<TransportRead, TransportError> {
+        let full_path = self.resolve(path);
+        let script = format!(
+            "entry={}\n[ -f \"$entry\" ] && [ ! -L \"$entry\" ] || exit 44\ncat \"$entry\"\n",
+            shell_quote(&full_path)
+        );
+        let output = self.run_script(&script, None)?;
+        Ok(TransportRead::new(io::Cursor::new(output)))
+    }
+
+    fn open_write(&self, path: &RelPath) -> Result<TransportWrite, TransportError> {
+        let full_path = self.resolve(path);
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push(format!(
+            "kitchensync-openssh-write-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = File::create(&temp_path).map_err(map_io_error)?;
+        let target = self.target.clone();
+        let port = self.port;
+        let home = home_dir();
+        Ok(TransportWrite::with_close(file, move |mut writer| {
+            writer.flush().map_err(map_io_error)?;
+            drop(writer);
+            let data = fs::read(&temp_path).map_err(map_io_error)?;
+            let _ = fs::remove_file(&temp_path);
+            let script = format!(
+                "entry={}\nparent=${{entry%/*}}\n[ \"$parent\" = \"$entry\" ] && parent=.\nmkdir -p \"$parent\" || exit 13\nif [ -e \"$entry\" ] && {{ [ ! -f \"$entry\" ] || [ -L \"$entry\" ]; }}; then exit 44; fi\ncat > \"$entry\"\n",
+                shell_quote(&full_path)
+            );
+            run_openssh_shell(&target, port, &script, Some(&data), home.as_deref()).map(|_| ())
+        }))
+    }
+
+    fn rename_no_overwrite(&self, src: &RelPath, dst: &RelPath) -> Result<(), TransportError> {
+        let src = self.resolve(src);
+        let dst = self.resolve(dst);
+        let script = format!(
+            "src={}\ndst={}\n[ -e \"$src\" ] || exit 44\n[ ! -e \"$dst\" ] || exit 1\nmv \"$src\" \"$dst\"\n",
+            shell_quote(&src),
+            shell_quote(&dst)
+        );
+        self.run_script(&script, None).map(|_| ())
+    }
+
+    fn delete_file(&self, path: &RelPath) -> Result<(), TransportError> {
+        let full_path = self.resolve(path);
+        let script = format!(
+            "entry={}\n[ -f \"$entry\" ] && [ ! -L \"$entry\" ] || exit 44\nrm \"$entry\"\n",
+            shell_quote(&full_path)
+        );
+        self.run_script(&script, None).map(|_| ())
+    }
+
+    fn create_dir(&self, path: &RelPath) -> Result<(), TransportError> {
+        let full_path = self.resolve(path);
+        let script = format!("mkdir -p {}\n", shell_quote(&full_path));
+        self.run_script(&script, None).map(|_| ())
+    }
+
+    fn delete_dir(&self, path: &RelPath) -> Result<(), TransportError> {
+        let full_path = self.resolve(path);
+        let script = format!(
+            "entry={}\n[ -d \"$entry\" ] && [ ! -L \"$entry\" ] || exit 44\nrmdir \"$entry\"\n",
+            shell_quote(&full_path)
+        );
+        self.run_script(&script, None).map(|_| ())
+    }
+
+    fn set_mod_time(&self, path: &RelPath, time: Timestamp) -> Result<(), TransportError> {
+        let full_path = self.resolve(path);
+        let Some(touch_time) = touch_timestamp(&time) else {
+            return Err(TransportError::IoError);
+        };
+        let script = format!(
+            "entry={}\n[ -e \"$entry\" ] || exit 44\ntouch -t {} \"$entry\"\n",
+            shell_quote(&full_path),
+            shell_quote(&touch_time)
+        );
+        self.run_script(&script, None).map(|_| ())
+    }
+}
+
+impl OpenSshBackend {
+    fn resolve(&self, path: &RelPath) -> String {
+        join_remote_path(&self.root, path.as_str())
+    }
+
+    fn run_script(&self, script: &str, input: Option<&[u8]>) -> Result<Vec<u8>, TransportError> {
+        let home = home_dir();
+        run_openssh_shell(&self.target, self.port, script, input, home.as_deref())
+    }
+}
+
+fn ensure_remote_file(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportError> {
+    let stat = sftp.lstat(Path::new(path)).map_err(map_ssh_error)?;
+    if is_sftp_file(&stat) {
+        Ok(())
+    } else {
+        Err(TransportError::NotFound)
+    }
+}
+
+fn ensure_remote_directory(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportError> {
+    let stat = sftp.lstat(Path::new(path)).map_err(map_ssh_error)?;
+    if is_sftp_directory(&stat) {
+        Ok(())
+    } else {
+        Err(TransportError::NotFound)
+    }
+}
+
+fn ensure_remote_file_or_directory(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportError> {
+    let stat = sftp.lstat(Path::new(path)).map_err(map_ssh_error)?;
+    if is_sftp_file(&stat) || is_sftp_directory(&stat) {
+        Ok(())
+    } else {
+        Err(TransportError::NotFound)
+    }
+}
+
+fn ensure_remote_parent_components(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportError> {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut current = String::new();
+    for part in parts.iter().take(parts.len() - 1) {
+        current.push('/');
+        current.push_str(*part);
+        ensure_remote_directory(sftp, &current)?;
+    }
+    Ok(())
 }
 
 fn create_remote_parents(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportError> {
@@ -347,7 +565,11 @@ fn create_remote_parents(sftp: &ssh2::Sftp, path: &str) -> Result<(), TransportE
         match sftp.lstat(Path::new(&current)) {
             Ok(stat) if is_sftp_directory(&stat) => {}
             Ok(_) => return Err(TransportError::IoError),
-            Err(_) => {
+            Err(error) => {
+                let category = map_ssh_error(error);
+                if category != TransportError::NotFound {
+                    return Err(category);
+                }
                 sftp.mkdir(Path::new(&current), 0o755)
                     .map_err(map_ssh_error)?;
             }
@@ -408,6 +630,7 @@ fn connect_sftp(
     let mut session = ssh2::Session::new().map_err(map_ssh_error)?;
     session.set_tcp_stream(stream);
     session.set_timeout(timeouts.timeout_conn.max(1) * 1000);
+    prefer_compatible_kex(&session)?;
     session.handshake().map_err(map_ssh_error)?;
     verify_known_host(&session, host, port)?;
     authenticate(&session, username, url.password.as_deref())?;
@@ -434,6 +657,44 @@ fn connect_sftp(
     }))
 }
 
+fn connect_openssh_sftp(
+    url: &PeerUrl,
+    root_mode: TransportRootMode,
+) -> Result<TransportHandle, TransportError> {
+    let host = url.host.as_deref().ok_or(TransportError::IoError)?;
+    let username = url
+        .username
+        .as_deref()
+        .ok_or(TransportError::PermissionDenied)?;
+    let port = url.port.unwrap_or(22);
+    let root = normalize_remote_root(&url.path);
+    let target = format!("{username}@{host}");
+    let backend = OpenSshBackend { target, port, root };
+    match root_mode {
+        TransportRootMode::RequireExisting => {
+            let script = format!(
+                "root={}\n[ -d \"$root\" ] || exit 44\n",
+                shell_quote(&backend.root)
+            );
+            backend.run_script(&script, None)?;
+        }
+        TransportRootMode::CreateMissing => {
+            let script = format!("mkdir -p {}\n", shell_quote(&backend.root));
+            backend.run_script(&script, None)?;
+        }
+    }
+    Ok(TransportHandle::new(backend))
+}
+
+fn prefer_compatible_kex(session: &ssh2::Session) -> Result<(), TransportError> {
+    session
+        .method_pref(
+            ssh2::MethodType::Kex,
+            "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,curve25519-sha256,curve25519-sha256@libssh.org",
+        )
+        .map_err(map_ssh_error)
+}
+
 fn authenticate(
     session: &ssh2::Session,
     username: &str,
@@ -450,17 +711,26 @@ fn authenticate(
     }
 
     let home = home_dir().ok_or(TransportError::PermissionDenied)?;
-    let private_key = home.join(".ssh").join("id_rsa");
-    if private_key.exists()
-        && session
-            .userauth_pubkey_file(username, None, &private_key, password)
-            .is_ok()
-        && session.authenticated()
-    {
-        return Ok(());
+    for private_key in private_key_candidates(&home) {
+        if private_key.exists()
+            && session
+                .userauth_pubkey_file(username, None, &private_key, password)
+                .is_ok()
+            && session.authenticated()
+        {
+            return Ok(());
+        }
     }
 
     Err(TransportError::PermissionDenied)
+}
+
+fn private_key_candidates(home: &Path) -> Vec<PathBuf> {
+    let ssh_dir = home.join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .into_iter()
+        .map(|name| ssh_dir.join(name))
+        .collect()
 }
 
 fn verify_known_host(session: &ssh2::Session, host: &str, port: u16) -> Result<(), TransportError> {
@@ -564,6 +834,38 @@ fn ensure_local_file_or_directory(path: &Path) -> Result<(), TransportError> {
     }
 }
 
+fn ensure_no_local_symlink_components(
+    root: &Path,
+    rel_path: &str,
+    include_final: bool,
+) -> Result<(), TransportError> {
+    let parts: Vec<&str> = rel_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let limit = if include_final {
+        parts.len()
+    } else {
+        parts.len().saturating_sub(1)
+    };
+    let mut current = root.to_path_buf();
+
+    for part in parts.iter().take(limit) {
+        current.push(*part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(TransportError::NotFound)
+            }
+            Ok(_) => return Err(TransportError::IoError),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+
+    Ok(())
+}
+
 fn basename(path: &RelPath) -> String {
     path.as_str()
         .rsplit('/')
@@ -625,7 +927,96 @@ fn remote_parent(path: &str) -> Option<String> {
     })
 }
 
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn run_openssh_shell(
+    target: &str,
+    port: u16,
+    script: &str,
+    input: Option<&[u8]>,
+    home: Option<&Path>,
+) -> Result<Vec<u8>, TransportError> {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg(target)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if input.is_some() {
+        command.arg(script);
+    } else {
+        command.arg("sh").arg("-s");
+    }
+    if let Some(home) = home {
+        command.env("HOME", home);
+        command.env("USERPROFILE", home);
+    }
+    let mut child = command.spawn().map_err(map_io_error)?;
+    {
+        let stdin = child.stdin.as_mut().ok_or(TransportError::IoError)?;
+        if input.is_none() {
+            stdin.write_all(script.as_bytes()).map_err(map_io_error)?;
+        }
+        if let Some(input) = input {
+            stdin.write_all(input).map_err(map_io_error)?;
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().map_err(map_io_error)?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        match output.status.code() {
+            Some(44) => Err(TransportError::NotFound),
+            Some(13) => Err(TransportError::PermissionDenied),
+            _ => Err(TransportError::IoError),
+        }
+    }
+}
+
+fn touch_timestamp(timestamp: &Timestamp) -> Option<String> {
+    let value = timestamp.0.as_str();
+    if value.len() < 19 {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}{}{}.{}",
+        value.get(0..4)?,
+        value.get(5..7)?,
+        value.get(8..10)?,
+        value.get(11..13)?,
+        value.get(14..16)?,
+        value.get(17..19)?
+    ))
+}
+
 fn home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut combined = drive.to_string_lossy().into_owned();
+            combined.push_str(&path.to_string_lossy());
+            let combined = PathBuf::from(combined);
+            if combined.exists() {
+                return Some(combined);
+            }
+        }
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -716,4 +1107,28 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_key_candidates_follow_specified_auth_order() {
+        let home = Path::new("/home/example");
+        let candidates = private_key_candidates(home)
+            .into_iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            candidates,
+            vec![
+                "/home/example/.ssh/id_ed25519",
+                "/home/example/.ssh/id_ecdsa",
+                "/home/example/.ssh/id_rsa",
+            ]
+        );
+    }
+
 }

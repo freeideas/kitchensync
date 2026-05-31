@@ -68,6 +68,10 @@ or subordinate after snapshot existence is known.
   snapshot exists only when `.kitchensync/snapshot.db` existed on that peer after
   any normal-mode snapshot SWAP recovery and before local empty snapshot
   creation.
+- Treat the peer set supplied after startup snapshot loading as authoritative
+  for role resolution. If snapshot recovery or download caused peers to be
+  excluded, reapply the fewer-than-two-reachable and canon-unreachable startup
+  checks to the remaining pending sessions before resolving effective roles.
 - Apply effective roles after snapshot existence is known:
   - a declared canon peer is contributing and authoritative even when it had no
     snapshot;
@@ -127,10 +131,14 @@ codes. Those responsibilities belong to `runtime` and root startup glue.
 - Startup must fail after reachability if fewer than two peers are reachable.
 - Startup must fail after reachability if the declared canon peer is
   unreachable.
+- Startup must recheck the fewer-than-two-reachable and declared-canon
+  conditions after snapshot loading excludes any peer because snapshot recovery
+  or download failed.
 - Startup must fail after snapshot existence role resolution when no snapshot
   history exists anywhere and no canon peer is declared.
-- Startup must fail after role resolution when every reachable peer is
-  subordinate and therefore no peer can contribute decisions.
+- Startup must fail after role resolution when every remaining reachable peer is
+  subordinate and therefore no peer can contribute decisions. A canon peer
+  counts as contributing for this check.
 - Later transport failures after a winning URL has been selected are not handled
   as fallback reselection by this module.
 
@@ -147,6 +155,11 @@ resolve_roles(pending_sessions, snapshot_existence_by_peer)
   -> startup failure
   -> reachable PeerSession list
 ```
+
+`pending_sessions` passed to `resolve_roles` is the post-snapshot-loading
+reachable set. Callers must remove peers whose snapshot recovery or download
+failed before calling it; `resolve_roles` still enforces the startup reachability
+and canon checks on that reduced set.
 
 `PeerSession` is stable for the run and contains:
 

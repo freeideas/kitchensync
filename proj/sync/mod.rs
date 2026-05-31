@@ -1,17 +1,25 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::operations::{OperationError, OperationExecutor};
 use crate::runtime::{
     CopyAttemptFailure, CopyAttemptOutcome, CopyOperation, CopyScheduler, SchedulerSummary,
 };
-use crate::snapshot::{fresh_timestamp, SnapshotEntryKind, SnapshotRow, SnapshotStore};
-use crate::{
-    CopyResult, CopyTask, DiagnosticEvent, DiagnosticSink, EffectivePeerRole, EntryKind,
-    EntryMeta, PeerId, PeerSession, ProgressEvent, ProgressSink, RelPath, RunConfig, Timestamp,
-    TransferPhase, TransportError,
+use crate::snapshot::{
+    fresh_timestamp, SnapshotCleanupScope, SnapshotEntryKind, SnapshotListedPaths, SnapshotRow,
+    SnapshotStore,
 };
+use crate::{
+    CopyResult, CopyTask, DiagnosticEvent, DiagnosticSink, EffectivePeerRole, EntryKind, EntryMeta,
+    PeerId, PeerSession, ProgressEvent, ProgressSink, RelPath, RunConfig, Timestamp, TransferPhase,
+    TransportError,
+};
+
+mod excludes;
+
+use excludes::ExcludePredicate;
 
 const SUMMARY: &str =
     "sync: combined-tree traversal, reconciliation decisions, copy planning, and snapshot updates.";
@@ -27,11 +35,6 @@ pub fn run(run: SyncRun<'_>) -> SyncReport {
         return context.finish(SchedulerSummary::default());
     }
 
-    let active = (0..context.peers.len()).collect::<Vec<_>>();
-    let root = root_path();
-    context.walk_directory(root, active);
-    context.run.copy_scheduler.close();
-
     let operation = SchedulerCopyOperation::new(
         context.run.operations,
         context
@@ -41,7 +44,21 @@ pub fn run(run: SyncRun<'_>) -> SyncReport {
             .map(|peer| peer.session)
             .collect::<Vec<_>>(),
     );
-    let copies = context.run.copy_scheduler.run_until_complete(&operation);
+
+    let copies = thread::scope(|scope| {
+        let scheduler = context.run.copy_scheduler;
+        let operation_ref = &operation;
+        let copy_worker = scope.spawn(move || scheduler.run_until_complete(operation_ref));
+
+        let active = (0..context.peers.len()).collect::<Vec<_>>();
+        let root = root_path();
+        context.walk_directory(root, active);
+        context.cleanup_stale_snapshot_rows();
+        context.run.copy_scheduler.close();
+
+        copy_worker.join().expect("copy scheduler thread panicked")
+    });
+
     context.consume_copy_results(operation.into_results());
     context.finish(copies)
 }
@@ -129,10 +146,13 @@ pub enum SyncInputError {
 struct RunContext<'a> {
     run: SyncRun<'a>,
     peers: Vec<PeerSlot>,
+    excludes: ExcludePredicate,
     traversal: TraversalReport,
     skipped: Vec<SkippedSubtree>,
     failures: Vec<SyncFailure>,
     snapshot_failed: bool,
+    observed_live_paths: HashSet<RelPath>,
+    dry_run_created_directories: HashSet<(PeerId, RelPath)>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,13 +171,18 @@ impl<'a> RunContext<'a> {
                 role: peer.session.effective_role,
             })
             .collect();
+        let excludes = ExcludePredicate::from_config(run.config)
+            .expect("RunConfig excludes are validated before sync starts");
         Self {
             run,
             peers,
+            excludes,
             traversal: TraversalReport::default(),
             skipped: Vec::new(),
             failures: Vec::new(),
             snapshot_failed: false,
+            observed_live_paths: HashSet::new(),
+            dry_run_created_directories: HashSet::new(),
         }
     }
 
@@ -206,7 +231,7 @@ impl<'a> RunContext<'a> {
     fn walk_directory(&mut self, directory: RelPath, active_peers: Vec<usize>) {
         self.traversal.scanned_directories += 1;
         self.run.progress.publish(ProgressEvent::Scanning {
-            directory: directory.clone(),
+            directory: progress_directory(&directory),
         });
 
         let listed = self.prepare_and_list(&directory, &active_peers);
@@ -227,7 +252,7 @@ impl<'a> RunContext<'a> {
         let mut child_recursions = Vec::new();
         for name in names {
             let path = join_path(&directory, &name);
-            if self.is_excluded(&path) {
+            if self.is_excluded_path(&path, &listed) {
                 continue;
             }
 
@@ -246,30 +271,22 @@ impl<'a> RunContext<'a> {
             }
         }
 
-        if !self.run.config.dry_run {
-            self.cleanup_directory(&directory, &listed);
-        }
-
         for (child, child_active) in child_recursions {
             self.walk_directory(child, child_active);
+        }
+
+        if !self.run.config.dry_run {
+            self.cleanup_directory(&directory, &listed);
         }
     }
 
     fn prepare_and_list(&mut self, directory: &RelPath, active: &[usize]) -> DirectoryListing {
         let mut listing = DirectoryListing::default();
+        let mut listable = Vec::new();
+
         for &peer_index in active {
-            match self.prepare_one_peer(directory, peer_index) {
-                PeerDirectoryState::Listed(entries) => {
-                    listing.listed.push(ListedPeer {
-                        peer_index,
-                        entries: entries
-                            .into_iter()
-                            .filter(|entry| {
-                                matches!(entry.kind, EntryKind::File | EntryKind::Directory)
-                            })
-                            .collect(),
-                    });
-                }
+            match self.recover_before_listing(directory, peer_index) {
+                PeerDirectoryState::Ready => listable.push(peer_index),
                 PeerDirectoryState::FailedCanon(peer_id) => {
                     self.skipped.push(SkippedSubtree {
                         directory: directory.clone(),
@@ -281,51 +298,91 @@ impl<'a> RunContext<'a> {
                 PeerDirectoryState::FailedNonCanon => {}
             }
         }
-        listing
-    }
 
-    fn prepare_one_peer(&mut self, directory: &RelPath, peer_index: usize) -> PeerDirectoryState {
-        let peer = self.run.peers[peer_index].session;
-        let canon = self.peers[peer_index].role == EffectivePeerRole::Canon;
-        let attempts = self.run.config.retries_list.max(1);
-
-        for attempt in 1..=attempts {
-            if !self.run.config.dry_run {
-                if let Err(error) = self.run.operations.recover_directory_swaps(peer, directory) {
-                    if attempt == attempts {
-                        self.publish_error(format!(
-                            "failed SWAP recovery peer={} directory={} attempts={}",
-                            peer.id,
-                            render_path(directory),
-                            attempts
-                        ));
-                        self.failures.push(SyncFailure::SwapRecovery {
-                            peer_id: peer.id,
-                            directory: directory.clone(),
-                            attempts,
-                            canon,
-                            error: error.clone(),
-                        });
-                        return if canon {
-                            PeerDirectoryState::FailedCanon(peer.id)
-                        } else {
-                            PeerDirectoryState::FailedNonCanon
-                        };
-                    }
-                    continue;
+        let listed = self.list_ready_peers(directory, &listable);
+        for peer_listing in listed {
+            match peer_listing.result {
+                Ok(entries) => {
+                    self.record_observed_live_paths(directory, &entries);
+                    listing.listed.push(ListedPeer {
+                        peer_index: peer_listing.peer_index,
+                        entries,
+                    });
                 }
-            }
+                Err(error) => {
+                    let peer = self.run.peers[peer_listing.peer_index].session;
+                    if self.is_dry_run_created_directory(peer.id, &directory, &error) {
+                        listing.listed.push(ListedPeer {
+                            peer_index: peer_listing.peer_index,
+                            entries: Vec::new(),
+                        });
+                        continue;
+                    }
 
-            match peer.transport.list_dir(directory) {
-                Ok(entries) => return PeerDirectoryState::Listed(entries),
-                Err(error) if attempt == attempts => {
+                    let canon =
+                        self.peers[peer_listing.peer_index].role == EffectivePeerRole::Canon;
                     self.publish_error(format!(
                         "failed listing peer={} directory={} attempts={}",
                         peer.id,
                         render_path(directory),
-                        attempts
+                        peer_listing.attempts
                     ));
                     self.failures.push(SyncFailure::Listing {
+                        peer_id: peer.id,
+                        directory: directory.clone(),
+                        attempts: peer_listing.attempts,
+                        canon,
+                        error,
+                    });
+                    if canon {
+                        self.skipped.push(SkippedSubtree {
+                            directory: directory.clone(),
+                            reason: SkippedSubtreeReason::CanonListingUnavailable {
+                                peer_id: peer.id,
+                            },
+                        });
+                        listing.listed.clear();
+                        listing.skip_subtree = true;
+                        return listing;
+                    }
+                }
+            }
+        }
+
+        listing
+    }
+
+    fn record_observed_live_paths(&mut self, directory: &RelPath, entries: &[EntryMeta]) {
+        for entry in entries {
+            self.observed_live_paths
+                .insert(join_path(directory, &entry.name));
+        }
+    }
+
+    fn recover_before_listing(
+        &mut self,
+        directory: &RelPath,
+        peer_index: usize,
+    ) -> PeerDirectoryState {
+        let peer = self.run.peers[peer_index].session;
+        let canon = self.peers[peer_index].role == EffectivePeerRole::Canon;
+        let attempts = self.run.config.retries_list.max(1);
+
+        if self.run.config.dry_run {
+            return PeerDirectoryState::Ready;
+        }
+
+        for attempt in 1..=attempts {
+            match self.run.operations.recover_directory_swaps(peer, directory) {
+                Ok(_) => return PeerDirectoryState::Ready,
+                Err(error) if attempt == attempts => {
+                    self.publish_error(format!(
+                        "failed SWAP recovery peer={} directory={} attempts={}",
+                        peer.id,
+                        render_path(directory),
+                        attempts
+                    ));
+                    self.failures.push(SyncFailure::SwapRecovery {
                         peer_id: peer.id,
                         directory: directory.clone(),
                         attempts,
@@ -345,6 +402,48 @@ impl<'a> RunContext<'a> {
         PeerDirectoryState::FailedNonCanon
     }
 
+    fn list_ready_peers(
+        &self,
+        directory: &RelPath,
+        peer_indices: &[usize],
+    ) -> Vec<PeerListingResult> {
+        let attempts = self.run.config.retries_list.max(1);
+        thread::scope(|scope| {
+            let handles = peer_indices
+                .iter()
+                .copied()
+                .map(|peer_index| {
+                    let peer = self.run.peers[peer_index].session;
+                    scope.spawn(move || {
+                        let mut last_error = None;
+                        for attempt in 1..=attempts {
+                            match peer.transport.list_dir(directory) {
+                                Ok(entries) => {
+                                    return PeerListingResult {
+                                        peer_index,
+                                        attempts: attempt,
+                                        result: Ok(entries),
+                                    };
+                                }
+                                Err(error) => last_error = Some(error),
+                            }
+                        }
+                        PeerListingResult {
+                            peer_index,
+                            attempts,
+                            result: Err(last_error.unwrap_or(TransportError::IoError)),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("directory listing thread panicked"))
+                .collect()
+        })
+    }
+
     fn classify_candidate(&mut self, path: RelPath, listed: &[ListedPeer]) -> Candidate {
         let mut states = Vec::new();
         for listed_peer in listed {
@@ -356,7 +455,10 @@ impl<'a> RunContext<'a> {
                 .find(|entry| join_path(&parent_path(&path), &entry.name) == path)
                 .cloned();
             let snapshot = if contributes(role) {
-                match self.run.peers[listed_peer.peer_index].snapshot.lookup(&path) {
+                match self.run.peers[listed_peer.peer_index]
+                    .snapshot
+                    .lookup(&path)
+                {
                     Ok(row) => row,
                     Err(error) => {
                         self.snapshot_failed = true;
@@ -395,8 +497,7 @@ impl<'a> RunContext<'a> {
                         state.peer_index,
                         &candidate.path,
                         SnapshotEntryKind::Directory,
-                    )
-                    {
+                    ) {
                         continue;
                     }
                 }
@@ -449,6 +550,7 @@ impl<'a> RunContext<'a> {
                         recurse.push(state.peer_index);
                     }
                 }
+                Some(EntryKind::SymbolicLink) => {}
                 None => {
                     if self.create_directory(state.peer_index, &candidate.path, &directory_meta) {
                         recurse.push(state.peer_index);
@@ -466,8 +568,13 @@ impl<'a> RunContext<'a> {
                     self.displace(state.peer_index, &candidate.path, SnapshotEntryKind::File);
                 }
                 Some(EntryKind::Directory) => {
-                    self.displace(state.peer_index, &candidate.path, SnapshotEntryKind::Directory);
+                    self.displace(
+                        state.peer_index,
+                        &candidate.path,
+                        SnapshotEntryKind::Directory,
+                    );
                 }
+                Some(EntryKind::SymbolicLink) => {}
                 None => self.mark_absent(state.peer_index, &candidate.path),
             }
         }
@@ -496,16 +603,20 @@ impl<'a> RunContext<'a> {
         }
     }
 
-    fn create_directory(
-        &mut self,
-        peer_index: usize,
-        path: &RelPath,
-        meta: &EntryMeta,
-    ) -> bool {
+    fn create_directory(&mut self, peer_index: usize, path: &RelPath, meta: &EntryMeta) -> bool {
         let peer = self.run.peers[peer_index].session;
         match self.run.operations.create_directory(peer, path) {
             Ok(_) => {
-                self.upsert_confirmed_present(peer_index, path, meta);
+                let observed_meta = if self.run.config.dry_run {
+                    meta.clone()
+                } else {
+                    peer.transport.stat(path).unwrap_or_else(|_| meta.clone())
+                };
+                self.upsert_confirmed_present(peer_index, path, &observed_meta);
+                if self.run.config.dry_run {
+                    self.dry_run_created_directories
+                        .insert((peer.id, path.clone()));
+                }
                 true
             }
             Err(error) => {
@@ -540,6 +651,49 @@ impl<'a> RunContext<'a> {
         }
     }
 
+    fn cleanup_stale_snapshot_rows(&mut self) {
+        let listed_paths = KnownListedPaths {
+            observed: self.observed_live_paths.clone(),
+            excludes: self.excludes.clone(),
+            skipped: self
+                .skipped
+                .iter()
+                .map(|skip| skip.directory.clone())
+                .collect(),
+        };
+
+        for peer_index in 0..self.run.peers.len() {
+            let peer_id = self.run.peers[peer_index].session.id;
+            if let Err(error) =
+                self.run.peers[peer_index]
+                    .snapshot
+                    .cleanup_stale_rows(SnapshotCleanupScope {
+                        listed_paths: &listed_paths,
+                        keep_del_days: self.run.config.keep_del_days,
+                    })
+            {
+                self.snapshot_failed = true;
+                self.publish_error(format!(
+                    "snapshot stale-row cleanup failed peer={}: {:?}",
+                    peer_id, error
+                ));
+            }
+        }
+    }
+
+    fn is_dry_run_created_directory(
+        &self,
+        peer_id: PeerId,
+        directory: &RelPath,
+        error: &TransportError,
+    ) -> bool {
+        self.run.config.dry_run
+            && *error == TransportError::NotFound
+            && self
+                .dry_run_created_directories
+                .contains(&(peer_id, directory.clone()))
+    }
+
     fn consume_copy_results(&mut self, results: CopyResults) {
         for result in results.successes {
             if let Some(peer_index) = self
@@ -570,21 +724,15 @@ impl<'a> RunContext<'a> {
         }
     }
 
-    fn is_excluded(&self, path: &RelPath) -> bool {
-        let value = path.as_str();
-        if value == ".kitchensync" || value.starts_with(".kitchensync/") {
-            return true;
-        }
-        if value == ".git" || value.starts_with(".git/") {
-            return true;
-        }
+    fn is_excluded(&self, path: &RelPath, metadata: Option<&EntryMeta>) -> bool {
+        self.excludes.excludes_candidate(path, metadata)
+    }
 
-        self.run.config.excludes.iter().any(|excluded| {
-            value == excluded.as_str()
-                || value
-                    .strip_prefix(excluded.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+    fn is_excluded_path(&self, path: &RelPath, listed: &[ListedPeer]) -> bool {
+        self.is_excluded(path, None)
+            || listed_metadata(path, listed)
+                .into_iter()
+                .any(|metadata| self.is_excluded(path, Some(metadata)))
     }
 
     fn upsert_confirmed_present(&mut self, peer_index: usize, path: &RelPath, meta: &EntryMeta) {
@@ -634,7 +782,19 @@ impl<'a> RunContext<'a> {
     }
 
     fn mark_displaced(&mut self, peer_index: usize, path: &RelPath, kind: SnapshotEntryKind) {
-        if let Err(error) = self.run.peers[peer_index].snapshot.mark_displaced(path, kind) {
+        let Some(entry_kind) = entry_kind_from_snapshot_kind(kind) else {
+            self.snapshot_failed = true;
+            self.publish_error(format!(
+                "snapshot displaced update failed peer={} path={}: tombstone cannot be displaced",
+                self.peers[peer_index].id, path
+            ));
+            return;
+        };
+
+        if let Err(error) = self.run.peers[peer_index]
+            .snapshot
+            .mark_displaced(path, entry_kind)
+        {
             self.snapshot_failed = true;
             self.publish_error(format!(
                 "snapshot displaced update failed peer={} path={}: {:?}",
@@ -657,6 +817,32 @@ impl<'a> RunContext<'a> {
     }
 }
 
+struct KnownListedPaths {
+    observed: HashSet<RelPath>,
+    excludes: ExcludePredicate,
+    skipped: Vec<RelPath>,
+}
+
+fn entry_kind_from_snapshot_kind(kind: SnapshotEntryKind) -> Option<EntryKind> {
+    match kind {
+        SnapshotEntryKind::File => Some(EntryKind::File),
+        SnapshotEntryKind::Directory => Some(EntryKind::Directory),
+        SnapshotEntryKind::Tombstone => None,
+    }
+}
+
+impl SnapshotListedPaths for KnownListedPaths {
+    fn contains(&self, path: &RelPath) -> bool {
+        self.observed.contains(path)
+            || self.excludes.excludes_candidate(path, None)
+            || self.excludes.excludes_directory_subtree(path)
+            || self
+                .skipped
+                .iter()
+                .any(|directory| path_is_or_is_below(path, directory))
+    }
+}
+
 #[derive(Default)]
 struct DirectoryListing {
     listed: Vec<ListedPeer>,
@@ -669,9 +855,15 @@ struct ListedPeer {
 }
 
 enum PeerDirectoryState {
-    Listed(Vec<EntryMeta>),
+    Ready,
     FailedCanon(PeerId),
     FailedNonCanon,
+}
+
+struct PeerListingResult {
+    peer_index: usize,
+    attempts: usize,
+    result: Result<Vec<EntryMeta>, TransportError>,
 }
 
 #[derive(Clone)]
@@ -704,6 +896,7 @@ fn choose_decision(candidate: &Candidate) -> Decision {
         return match state.live.as_ref().map(|meta| meta.kind) {
             Some(EntryKind::File) => Decision::File { source: index },
             Some(EntryKind::Directory) => Decision::Directory,
+            Some(EntryKind::SymbolicLink) => Decision::Absence,
             None => Decision::Absence,
         };
     }
@@ -718,15 +911,27 @@ fn choose_decision(candidate: &Candidate) -> Decision {
     let file_candidates = contributing
         .iter()
         .copied()
-        .filter(|(_, state)| state.live.as_ref().is_some_and(|meta| meta.kind == EntryKind::File))
+        .filter(|(_, state)| {
+            state
+                .live
+                .as_ref()
+                .is_some_and(|meta| meta.kind == EntryKind::File)
+        })
         .collect::<Vec<_>>();
 
-    let directory_exists = contributing
-        .iter()
-        .any(|(_, state)| state.live.as_ref().is_some_and(|meta| meta.kind == EntryKind::Directory));
+    let directory_exists = contributing.iter().any(|(_, state)| {
+        state
+            .live
+            .as_ref()
+            .is_some_and(|meta| meta.kind == EntryKind::Directory)
+    });
 
     if !file_candidates.is_empty() {
         let winner = choose_file_winner(&file_candidates);
+        if directory_exists {
+            return Decision::File { source: winner.0 };
+        }
+
         let newest_file = winner
             .1
             .live
@@ -745,12 +950,13 @@ fn choose_decision(candidate: &Candidate) -> Decision {
     }
 }
 
-fn choose_file_winner<'a>(
-    candidates: &'a [(usize, &'a PeerState)],
-) -> (usize, &'a PeerState) {
+fn choose_file_winner<'a>(candidates: &'a [(usize, &'a PeerState)]) -> (usize, &'a PeerState) {
     let mut winner = candidates[0];
     for &(index, state) in candidates.iter().skip(1) {
-        let current = state.live.as_ref().expect("file candidate has live metadata");
+        let current = state
+            .live
+            .as_ref()
+            .expect("file candidate has live metadata");
         let best = winner
             .1
             .live
@@ -779,7 +985,7 @@ fn deletion_estimate(state: &PeerState) -> Option<&Timestamp> {
     if row.deleted_time.is_some() {
         return row.deleted_time.as_ref();
     }
-    if state.live.is_none() {
+    if state.live.is_none() && row.kind == SnapshotEntryKind::File {
         return row.last_seen.as_ref();
     }
     None
@@ -797,6 +1003,15 @@ fn candidate_names(listed: &[ListedPeer], peers: &[PeerSlot]) -> Vec<String> {
         }
     }
     names.into_iter().map(|name| name.0).collect()
+}
+
+fn listed_metadata<'a>(path: &RelPath, listed: &'a [ListedPeer]) -> Vec<&'a EntryMeta> {
+    let parent = parent_path(path);
+    listed
+        .iter()
+        .flat_map(|listed_peer| listed_peer.entries.iter())
+        .filter(|entry| join_path(&parent, &entry.name) == *path)
+        .collect()
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -830,7 +1045,10 @@ fn has_contributing_peer(listed: &[ListedPeer], peers: &[PeerSlot]) -> bool {
 }
 
 fn contributes(role: EffectivePeerRole) -> bool {
-    matches!(role, EffectivePeerRole::Canon | EffectivePeerRole::Contributing)
+    matches!(
+        role,
+        EffectivePeerRole::Canon | EffectivePeerRole::Contributing
+    )
 }
 
 fn file_matches(live: &EntryMeta, winner: &EntryMeta) -> bool {
@@ -874,7 +1092,11 @@ fn parse_timestamp(timestamp: &Timestamp) -> Option<SystemTime> {
     if seconds < 0 {
         return None;
     }
-    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64) + Duration::from_micros(micros as u64))
+    Some(
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(seconds as u64)
+            + Duration::from_micros(micros as u64),
+    )
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
@@ -892,6 +1114,10 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 
 fn root_path() -> RelPath {
     RelPath::new("").expect("RelPath root value must be supplied by the root contract")
+}
+
+fn progress_directory(directory: &RelPath) -> RelPath {
+    directory.clone()
 }
 
 fn join_path(parent: &RelPath, child: &str) -> RelPath {
@@ -920,6 +1146,16 @@ fn render_path(path: &RelPath) -> &str {
     } else {
         path.as_str()
     }
+}
+
+fn path_is_or_is_below(path: &RelPath, directory: &RelPath) -> bool {
+    let path = path.as_str();
+    let directory = directory.as_str();
+    directory.is_empty()
+        || path == directory
+        || path
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 struct SchedulerCopyOperation<'a> {
@@ -972,7 +1208,9 @@ impl<'a> SchedulerCopyOperation<'a> {
     }
 
     fn into_results(self) -> CopyResults {
-        self.results.into_inner().expect("copy result mutex poisoned")
+        self.results
+            .into_inner()
+            .expect("copy result mutex poisoned")
     }
 }
 
@@ -986,6 +1224,7 @@ impl CopyOperation for SchedulerCopyOperation<'_> {
         _progress: &dyn crate::runtime::ProgressSink,
     ) -> CopyAttemptOutcome {
         let Some(source_peer) = self.peers.get(&task.source_peer_id).copied() else {
+            self.record_failed_task(task, TransferPhase::ReadSource, TransportError::IoError);
             return CopyAttemptOutcome::Failure(CopyAttemptFailure {
                 phase: TransferPhase::ReadSource,
                 error: TransportError::IoError,
@@ -993,6 +1232,7 @@ impl CopyOperation for SchedulerCopyOperation<'_> {
             });
         };
         let Some(destination_peer) = self.peers.get(&task.destination_peer_id).copied() else {
+            self.record_failed_task(task, TransferPhase::WriteSwapNew, TransportError::IoError);
             return CopyAttemptOutcome::Failure(CopyAttemptFailure {
                 phase: TransferPhase::WriteSwapNew,
                 error: TransportError::IoError,
@@ -1010,7 +1250,9 @@ impl CopyOperation for SchedulerCopyOperation<'_> {
 
         if result.completed && result.error.is_none() {
             let mut results = self.results.lock().expect("copy result mutex poisoned");
-            results.terminal_failures.remove(&CopyTaskKey::from_result(&result));
+            results
+                .terminal_failures
+                .remove(&CopyTaskKey::from_result(&result));
             results.successes.push(result.clone());
             CopyAttemptOutcome::Success(result)
         } else {
@@ -1028,5 +1270,27 @@ impl CopyOperation for SchedulerCopyOperation<'_> {
                 )),
             })
         }
+    }
+}
+
+impl SchedulerCopyOperation<'_> {
+    fn record_failed_task(&self, task: &CopyTask, phase: TransferPhase, error: TransportError) {
+        self.results
+            .lock()
+            .expect("copy result mutex poisoned")
+            .terminal_failures
+            .insert(
+                CopyTaskKey::from_task(task),
+                CopyResult {
+                    source_peer_id: task.source_peer_id,
+                    source_path: task.source_path.clone(),
+                    destination_peer_id: task.destination_peer_id,
+                    destination_path: task.destination_path.clone(),
+                    bytes_copied: 0,
+                    completed: false,
+                    failed_phase: Some(phase),
+                    error: Some(error),
+                },
+            );
     }
 }

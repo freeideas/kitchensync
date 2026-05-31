@@ -1,19 +1,31 @@
 use std::env;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 
 use kitchensync::{
     peer::{connect_peers, resolve_roles, PeerStartupError, PendingPeerSession, SnapshotExistence},
-    DiagnosticEvent, DiagnosticSink, EffectivePeerRole, EntryMeta, RelPath, RunConfig, Timestamp,
-    TransportBackend, TransportError, TransportFactory, TransportHandle, TransportRead, TransportTimeouts,
-    TransportRootMode, Verbosity, PeerRole, PeerSpec, PeerUrl,
+    DiagnosticEvent, DiagnosticSink, EffectivePeerRole, EntryMeta, PeerRole, PeerSpec, PeerUrl,
+    RelPath, RunConfig, Timestamp, TransportBackend, TransportError, TransportFactory,
+    TransportHandle, TransportRead, TransportRootMode, TransportTimeouts, Verbosity,
 };
+
+// Not reasonably testable through the peer public API:
+// - SSH auth ordering is handled inside transport implementations.
+// - Host-key verification details are internal to transport/known-host plumbing.
 
 #[derive(Clone)]
 struct FakeTransportFactory {
-    policy: Arc<dyn Fn(&PeerUrl, TransportTimeouts, TransportRootMode) -> Result<(), TransportError> + Send + Sync>,
-    calls: Arc<Mutex<Vec<ConnectCall>>> ,
+    policy: Arc<
+        dyn Fn(&PeerUrl, TransportTimeouts, TransportRootMode) -> Result<(), TransportError>
+            + Send
+            + Sync,
+    >,
+    calls: Arc<Mutex<Vec<ConnectCall>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +176,12 @@ fn current_user() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn pending_session(id: usize, declared_role: PeerRole, normalized_path: &str, selected_path: &str) -> PendingPeerSession {
+fn pending_session(
+    id: usize,
+    declared_role: PeerRole,
+    normalized_path: &str,
+    selected_path: &str,
+) -> PendingPeerSession {
     PendingPeerSession {
         id: id as u64,
         invocation_index: id,
@@ -201,6 +218,93 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 #[test]
+fn connect_peers_starts_multiple_peer_candidates_concurrently() {
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let peak_concurrent_connections = Arc::new(AtomicUsize::new(0));
+    let factory = FakeTransportFactory::new({
+        let active_connections = Arc::clone(&active_connections);
+        let peak_concurrent_connections = Arc::clone(&peak_concurrent_connections);
+        move |_, _, _| {
+            let in_flight = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = peak_concurrent_connections.load(Ordering::SeqCst);
+            while in_flight > observed {
+                match peak_concurrent_connections.compare_exchange(
+                    observed,
+                    in_flight,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(30));
+            active_connections.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let diagnostics = RecordingDiagnostics::default();
+
+    let peer_specs = vec![
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "sftp",
+                Some("alice"),
+                Some("pw"),
+                Some("example.com"),
+                Some(22),
+                "/peer-a",
+                None,
+                None,
+            )],
+        },
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "sftp",
+                Some("bob"),
+                Some("pw"),
+                Some("example.com"),
+                Some(22),
+                "/peer-b",
+                None,
+                None,
+            )],
+        },
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "file",
+                None,
+                None,
+                None,
+                None,
+                "/tmp/peer-c",
+                None,
+                None,
+            )],
+        },
+    ];
+
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("three peers should connect");
+
+    assert_eq!(sessions.len(), 3);
+    assert!(
+        peak_concurrent_connections.load(Ordering::SeqCst) >= 2,
+        "connections should begin in parallel for multiple peer operands"
+    );
+    assert!(diagnostics.messages().is_empty());
+}
+
+#[test]
 fn connect_peers_prefers_first_usable_fallback_url_for_a_peer() {
     let factory = FakeTransportFactory::new(|url, _, _| match url.path.as_str() {
         "/first-primary" => Err(TransportError::NotFound),
@@ -214,18 +318,50 @@ fn connect_peers_prefers_first_usable_fallback_url_for_a_peer() {
         PeerSpec {
             role: PeerRole::Normal,
             urls: vec![
-                peer_url("sftp", Some("alice"), Some("pw"), Some("Example.Com"), Some(22), "/first-primary", None, None),
-                peer_url("SFTP", Some("alice"), Some("pw"), Some("Example.Com"), Some(22), "/first-fallback", None, None),
+                peer_url(
+                    "sftp",
+                    Some("alice"),
+                    Some("pw"),
+                    Some("Example.Com"),
+                    Some(22),
+                    "/first-primary",
+                    None,
+                    None,
+                ),
+                peer_url(
+                    "SFTP",
+                    Some("alice"),
+                    Some("pw"),
+                    Some("Example.Com"),
+                    Some(22),
+                    "/first-fallback",
+                    None,
+                    None,
+                ),
             ],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", Some("bob"), None, Some("other.example.com"), Some(22), "/second-root", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                Some("bob"),
+                None,
+                Some("other.example.com"),
+                Some(22),
+                "/second-root",
+                None,
+                None,
+            )],
         },
     ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("two peers should connect");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("two peers should connect");
 
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].id, 0);
@@ -239,8 +375,78 @@ fn connect_peers_prefers_first_usable_fallback_url_for_a_peer() {
     assert_eq!(calls.len(), 3);
     assert!(calls.iter().any(|call| call.url.path == "/first-primary"));
     assert!(calls.iter().any(|call| call.url.path == "/first-fallback"));
-    assert!(calls.iter().all(|call| call.root_mode == TransportRootMode::CreateMissing));
+    assert!(calls
+        .iter()
+        .all(|call| call.root_mode == TransportRootMode::CreateMissing));
     assert!(diagnostics.messages().is_empty());
+}
+
+#[test]
+fn connect_peers_does_not_try_fallback_when_primary_candidate_succeeds() {
+    let factory = FakeTransportFactory::new(|url, _, _| match url.path.as_str() {
+        "/primary" => Ok(()),
+        "/normal-secondary" => Ok(()),
+        _ => Err(TransportError::NotFound),
+    });
+    let diagnostics = RecordingDiagnostics::default();
+
+    let peer_specs = vec![
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![
+                peer_url(
+                    "sftp",
+                    Some("alice"),
+                    Some("pw"),
+                    Some("example.com"),
+                    Some(22),
+                    "/primary",
+                    None,
+                    None,
+                ),
+                peer_url(
+                    "sftp",
+                    Some("alice"),
+                    Some("pw"),
+                    Some("example.com"),
+                    Some(22),
+                    "/fallback",
+                    None,
+                    None,
+                ),
+            ],
+        },
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "sftp",
+                Some("bob"),
+                Some("pw2"),
+                Some("example.net"),
+                Some(22),
+                "/normal-secondary",
+                None,
+                None,
+            )],
+        },
+    ];
+
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("two peers should connect");
+
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].selected_url.path, "/primary");
+    assert_eq!(sessions[1].selected_url.path, "/normal-secondary");
+
+    let calls = factory.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().any(|call| call.url.path == "/primary"));
+    assert!(!calls.iter().any(|call| call.url.path == "/fallback"));
 }
 
 #[test]
@@ -248,9 +454,10 @@ fn connect_peers_normalizes_and_preserves_connection_identity() {
     let configured_user = current_user();
     let expected_user = configured_user.clone();
     let factory = FakeTransportFactory::new(move |url, _, _| {
-        if url.username.as_deref() == Some(expected_user.as_str())
+        if (url.username.as_deref() == Some(expected_user.as_str())
             && url.host.as_deref() == Some("example.com")
-            && url.path == "/repo/~space/test"
+            && url.path == "/repo/~space/test")
+            || url.path == "/second-root"
         {
             Ok(())
         } else {
@@ -259,27 +466,50 @@ fn connect_peers_normalizes_and_preserves_connection_identity() {
     });
     let diagnostics = RecordingDiagnostics::default();
 
-    let peer_specs = vec![PeerSpec {
-        role: PeerRole::Normal,
-        urls: vec![peer_url(
-            "SFTP",
-            None,
-            Some("secret"),
-            Some("EXAMPLE.COM"),
-            Some(22),
-            "/repo//%7Espace/test/",
-            Some(8),
-            Some(16),
-        )],
-    }];
+    let peer_specs = vec![
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "SFTP",
+                None,
+                Some("secret"),
+                Some("EXAMPLE.COM"),
+                Some(22),
+                "/repo//%7Espace/test/",
+                Some(8),
+                Some(16),
+            )],
+        },
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "sftp",
+                Some("other"),
+                None,
+                Some("other.example.com"),
+                None,
+                "/second-root",
+                None,
+                None,
+            )],
+        },
+    ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("peer should connect");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("peer should connect");
     let session = &sessions[0];
 
     assert_eq!(session.selected_url.scheme, "sftp");
     assert_eq!(session.selected_url.host.as_deref(), Some("example.com"));
-    assert_eq!(session.selected_url.username.as_deref(), Some(configured_user.as_str()));
+    assert_eq!(
+        session.selected_url.username.as_deref(),
+        Some(configured_user.as_str())
+    );
     assert_eq!(session.selected_url.port, None);
     assert_eq!(session.selected_url.path, "/repo/~space/test");
     assert_eq!(session.selected_url.timeout_conn, Some(8));
@@ -299,10 +529,14 @@ fn connect_peers_normalizes_and_preserves_connection_identity() {
     );
 
     let calls = factory.calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].timeouts.timeout_conn, 8);
-    assert_eq!(calls[0].timeouts.timeout_idle, 16);
-    assert_eq!(calls[0].root_mode, TransportRootMode::CreateMissing);
+    assert_eq!(calls.len(), 2);
+    let normalized_call = calls
+        .iter()
+        .find(|call| call.url.path == "/repo/~space/test")
+        .expect("normalized URL should be used for connection");
+    assert_eq!(normalized_call.timeouts.timeout_conn, 8);
+    assert_eq!(normalized_call.timeouts.timeout_idle, 16);
+    assert_eq!(normalized_call.root_mode, TransportRootMode::CreateMissing);
     assert!(diagnostics.messages().is_empty());
 }
 
@@ -320,20 +554,52 @@ fn connect_peers_reports_unreachable_peer_in_diagnostics() {
     let peer_specs = vec![
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/good-0", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/good-0",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/bad", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/bad",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/good-1", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/good-1",
+                None,
+                None,
+            )],
         },
     ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("two peers still reachable");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("two peers still reachable");
 
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].id, 0);
@@ -356,19 +622,51 @@ fn connect_peers_rejects_declared_canon_unreachable() {
     let peer_specs = vec![
         PeerSpec {
             role: PeerRole::Canon,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/unreachable", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/unreachable",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/reachable-a", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/reachable-a",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("a.example.com"), Some(22), "/reachable-b", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("a.example.com"),
+                Some(22),
+                "/reachable-b",
+                None,
+                None,
+            )],
         },
     ];
 
-    let result = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics));
+    let result = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ));
 
     assert!(matches!(
         result,
@@ -392,17 +690,43 @@ fn connect_peers_rejects_when_fewer_than_two_peers_are_reachable() {
     let peer_specs = vec![
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("example.com"), Some(22), "/good", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("example.com"),
+                Some(22),
+                "/good",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("sftp", None, None, Some("example.com"), Some(22), "/bad", None, None)],
+            urls: vec![peer_url(
+                "sftp",
+                None,
+                None,
+                Some("example.com"),
+                Some(22),
+                "/bad",
+                None,
+                None,
+            )],
         },
     ];
 
-    let result = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics));
+    let result = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ));
 
-    assert!(matches!(result, Err(PeerStartupError::TooFewReachablePeers)));
+    assert!(matches!(
+        result,
+        Err(PeerStartupError::TooFewReachablePeers)
+    ));
     assert_eq!(diagnostics.messages().len(), 1);
     assert!(diagnostics.messages()[0].contains("Peer 1 is unreachable"));
 }
@@ -445,8 +769,13 @@ fn connect_peers_uses_run_default_timeouts_when_peer_url_does_not_override() {
         },
     ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("both peers should connect");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("both peers should connect");
 
     assert_eq!(sessions.len(), 2);
     assert!(diagnostics.messages().is_empty());
@@ -480,16 +809,39 @@ fn connect_peers_converts_relative_file_peer_paths_to_absolute_identities() {
     let peer_specs = vec![
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("file", None, None, None, None, "fixture-peer/first", None, None)],
+            urls: vec![peer_url(
+                "file",
+                None,
+                None,
+                None,
+                None,
+                "fixture-peer/first",
+                None,
+                None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("file", None, None, None, None, "fixture-peer/second", None, None)],
+            urls: vec![peer_url(
+                "file",
+                None,
+                None,
+                None,
+                None,
+                "fixture-peer/second",
+                None,
+                None,
+            )],
         },
     ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("both peers should connect");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("both peers should connect");
 
     assert_eq!(sessions[0].selected_url.path, first_expected);
     assert_eq!(sessions[1].selected_url.path, second_expected);
@@ -516,16 +868,25 @@ fn connect_peers_uses_require_existing_root_mode_in_dry_run() {
     let peer_specs = vec![
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("file", None, None, None, None, "/tmp/a", None, None)],
+            urls: vec![peer_url(
+                "file", None, None, None, None, "/tmp/a", None, None,
+            )],
         },
         PeerSpec {
             role: PeerRole::Normal,
-            urls: vec![peer_url("file", None, None, None, None, "/tmp/b", None, None)],
+            urls: vec![peer_url(
+                "file", None, None, None, None, "/tmp/b", None, None,
+            )],
         },
     ];
 
-    let sessions = block_on(connect_peers(&run_config(true), &peer_specs, &factory, &diagnostics))
-        .expect("dry-run accepts existing roots");
+    let sessions = block_on(connect_peers(
+        &run_config(true),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("dry-run accepts existing roots");
 
     assert_eq!(sessions.len(), 2);
     assert!(factory
@@ -569,7 +930,13 @@ fn resolve_roles_applies_effective_role_rules() {
     assert!(!sessions[1].had_startup_snapshot);
     assert!(!sessions[2].had_startup_snapshot);
     assert_eq!(sessions[3].had_startup_snapshot, false);
-    assert_eq!(sessions.iter().map(|session| session.id).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 }
 
 #[test]
@@ -607,6 +974,20 @@ fn resolve_roles_rejects_when_no_contributing_peer_remains() {
 }
 
 #[test]
+fn resolve_roles_rechecks_reachability_threshold_after_snapshot_loading() {
+    let pending = vec![pending_session(0, PeerRole::Normal, "/alpha", "/alpha")];
+    let snapshots = vec![SnapshotExistence {
+        peer_id: 0,
+        existed: true,
+    }];
+
+    let err = resolve_roles(pending, &snapshots)
+        .expect_err("snapshot-filtered peers remain below threshold");
+
+    assert_eq!(err, PeerStartupError::TooFewReachablePeers);
+}
+
+#[test]
 fn peer_startup_error_messages_are_exact() {
     assert_eq!(
         PeerStartupError::FirstSyncNeedsCanon.to_string(),
@@ -622,32 +1003,61 @@ fn peer_startup_error_messages_are_exact() {
 fn connect_peers_normalization_removes_query_from_normalized_identity_only() {
     let configured_user = current_user();
     let factory = FakeTransportFactory::new(|url, _, _| {
-        assert_eq!(url.path, "/query/path?token=abc&mode=ro");
+        assert!(matches!(
+            url.path.as_str(),
+            "/query/path?token=abc&mode=ro" | "/second-root"
+        ));
         Ok(())
     });
     let diagnostics = RecordingDiagnostics::default();
 
-    let peer_specs = vec![PeerSpec {
-        role: PeerRole::Normal,
-        urls: vec![peer_url(
-            "SFTP",
-            None,
-            None,
-            Some("example.com"),
-            Some(22),
-            "/query%2Fpath?token=abc&mode=ro",
-            None,
-            None,
-        )],
-    }];
+    let peer_specs = vec![
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "SFTP",
+                None,
+                None,
+                Some("example.com"),
+                Some(22),
+                "/query/path?token=abc&mode=ro",
+                None,
+                None,
+            )],
+        },
+        PeerSpec {
+            role: PeerRole::Normal,
+            urls: vec![peer_url(
+                "sftp",
+                Some("other"),
+                None,
+                Some("other.example.com"),
+                None,
+                "/second-root",
+                None,
+                None,
+            )],
+        },
+    ];
 
-    let sessions = block_on(connect_peers(&run_config(false), &peer_specs, &factory, &diagnostics))
-        .expect("peer should connect");
+    let sessions = block_on(connect_peers(
+        &run_config(false),
+        &peer_specs,
+        &factory,
+        &diagnostics,
+    ))
+    .expect("peer should connect");
     let session = &sessions[0];
 
     assert_eq!(session.selected_url.path, "/query/path?token=abc&mode=ro");
     assert_eq!(session.normalized_identity.path, "/query/path");
-    assert_eq!(session.selected_url.identity, format!("sftp://{}@example.com/query/path?token=abc&mode=ro", configured_user));
+    assert_eq!(
+        session.selected_url.identity,
+        format!(
+            "sftp://{}@example.com/query/path?token=abc&mode=ro",
+            configured_user
+        )
+    );
     assert_eq!(
         session.normalized_identity.identity,
         format!("sftp://{}@example.com/query/path", configured_user)

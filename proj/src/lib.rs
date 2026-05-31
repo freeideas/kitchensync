@@ -108,6 +108,7 @@ pub struct RelPathError;
 pub enum EntryKind {
     File,
     Directory,
+    SymbolicLink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +256,12 @@ impl Read for TransportRead {
 pub struct TransportWrite {
     inner: Box<dyn Write + Send>,
     close: Option<Box<dyn FnOnce(Box<dyn Write + Send>) -> Result<(), TransportError> + Send>>,
+}
+
+impl fmt::Debug for TransportWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportWrite").finish_non_exhaustive()
+    }
 }
 
 impl TransportWrite {

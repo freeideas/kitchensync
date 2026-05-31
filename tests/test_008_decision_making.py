@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,7 @@ def _write_text(path: Path, value: str) -> None:
 
 
 def _set_mtime(path: Path, when: float) -> None:
-    path.utime((when, when), follow_symlinks=True)
+    os.utime(path, (when, when), follow_symlinks=True)
 
 
 def _run_kitchensync(
@@ -102,7 +103,8 @@ def _seed_sync(
     seed_name: str,
 ) -> subprocess.CompletedProcess[str] | None:
     for peer in peers:
-        _write_text(peer / seed_name, "seed")
+        if not (peer / seed_name).exists():
+            _write_text(peer / seed_name, "seed")
 
     peer_names = [
         f"+{peers[0].name}",
@@ -209,6 +211,61 @@ def _check_size_modified_008_2(failures: list[str]) -> None:
         _assert_text(failures, "008.2", peer_b / rel, "x" * 80)
 
 
+def _check_modified_selection_and_propagation_008_10_24(failures: list[str]) -> None:
+    """008.10, 008.24."""
+    with tempfile.TemporaryDirectory(prefix="ks_008_010") as raw_root:
+        root = Path(raw_root)
+        peer_a = root / "peer_a"
+        peer_b = root / "peer_b"
+        peer_a.mkdir()
+        peer_b.mkdir()
+
+        rel = "modified-live.txt"
+        _write_text(peer_a / rel, "base")
+        _write_text(peer_b / rel, "base")
+
+        if _seed_sync(failures, "008.10", root, [peer_a, peer_b], rel) is None:
+            return
+
+        base_mtime = (peer_a / rel).stat().st_mtime
+        _write_text(peer_a / rel, "winning-content")
+        _write_text(peer_b / rel, "loser-content")
+        _set_mtime(peer_a / rel, base_mtime + 8.0)
+        _set_mtime(peer_b / rel, base_mtime + 1.0)
+
+        if _run_and_check(failures, "008.10", root, [peer_a.name, peer_b.name]) is None:
+            return
+
+        _assert_text(failures, "008.10", peer_a / rel, "winning-content")
+        _assert_text(failures, "008.24", peer_b / rel, "winning-content")
+
+
+def _check_absence_only_votes_008_15(failures: list[str]) -> None:
+    """008.15."""
+    with tempfile.TemporaryDirectory(prefix="ks_008_015") as raw_root:
+        root = Path(raw_root)
+        peer_a = root / "peer_a"
+        peer_b = root / "peer_b"
+        peer_a.mkdir()
+        peer_b.mkdir()
+
+        rel = "absent-only.txt"
+        _write_text(peer_a / rel, "persist")
+        _write_text(peer_b / rel, "persist")
+
+        if _seed_sync(failures, "008.15", root, [peer_a, peer_b], rel) is None:
+            return
+
+        (peer_a / rel).unlink()
+        (peer_b / rel).unlink()
+
+        if _run_and_check(failures, "008.15", root, [peer_a.name, peer_b.name]) is None:
+            return
+
+        _assert_not_exists(failures, "008.15", peer_a / rel)
+        _assert_not_exists(failures, "008.15", peer_b / rel)
+
+
 def _check_mtime_modified_008_3(failures: list[str]) -> None:
     """008.3."""
     with tempfile.TemporaryDirectory(prefix="ks_008_003") as raw_root:
@@ -283,21 +340,37 @@ def _check_tie_rules_008_12_13_22(failures: list[str]) -> None:
         _set_mtime(peer_a / rel, base_mtime + 3.0)
         _set_mtime(peer_b / rel, base_mtime + 3.0)
 
-        if _run_and_check(failures, "008.22", root, [f"+{peer_a.name}", peer_b.name]) is None:
+        if _run_and_check(failures, "008.22", root, [peer_a.name, peer_b.name]) is None:
             return
 
         _assert_text(failures, "008.22", peer_a / rel, "much-longer-content")
         _assert_text(failures, "008.22", peer_b / rel, "much-longer-content")
 
-        max_mtime = (peer_a / rel).stat().st_mtime
-        _write_text(peer_a / rel, "older")
-        _set_mtime(peer_a / rel, max_mtime - 6.0)
+    with tempfile.TemporaryDirectory(prefix="ks_008_013") as raw_root:
+        root = Path(raw_root)
+        peer_a = root / "peer_a"
+        peer_b = root / "peer_b"
+        peer_a.mkdir()
+        peer_b.mkdir()
 
-        if _run_and_check(failures, "008.13", root, [f"+{peer_a.name}", peer_b.name]) is None:
+        rel = "newest.txt"
+        _write_text(peer_a / rel, "base")
+        _write_text(peer_b / rel, "base")
+
+        if _seed_sync(failures, "008.13", root, [peer_a, peer_b], rel) is None:
             return
 
-        _assert_text(failures, "008.13", peer_a / rel, "much-longer-content")
-        _assert_text(failures, "008.13", peer_b / rel, "much-longer-content")
+        base_mtime = (peer_a / rel).stat().st_mtime
+        _write_text(peer_a / rel, "older")
+        _write_text(peer_b / rel, "newer")
+        _set_mtime(peer_a / rel, base_mtime + 1.0)
+        _set_mtime(peer_b / rel, base_mtime + 7.0)
+
+        if _run_and_check(failures, "008.13", root, [peer_a.name, peer_b.name]) is None:
+            return
+
+        _assert_text(failures, "008.13", peer_a / rel, "newer")
+        _assert_text(failures, "008.13", peer_b / rel, "newer")
 
 
 def _check_deletion_vs_file_008_16_17_23(failures: list[str]) -> None:
@@ -413,6 +486,53 @@ def _check_directory_and_subordinate_008_32_33_35_39(failures: list[str]) -> Non
         _assert_not_exists(failures, "008.35", peer_c / sub_dir)
 
 
+def _check_directory_no_snapshot_peer_008_34(failures: list[str]) -> None:
+    """008.34."""
+    with tempfile.TemporaryDirectory(prefix="ks_008_034") as raw_root:
+        root = Path(raw_root)
+        peer_a = root / "peer_a"
+        peer_b = root / "peer_b"
+        peer_c = root / "peer_c"
+        peer_a.mkdir()
+        peer_b.mkdir()
+        peer_c.mkdir()
+
+        if _seed_sync(failures, "008.34", root, [peer_a, peer_b], "seed.txt") is None:
+            return
+
+        dead_dir = "ghost-dir"
+        (peer_a / dead_dir).mkdir()
+        (peer_b / dead_dir).mkdir()
+        _write_text(peer_a / dead_dir / "marker", "x")
+        _write_text(peer_b / dead_dir / "marker", "x")
+
+        if _run_and_check(failures, "008.34", root, [peer_a.name, peer_b.name]) is None:
+            return
+
+        (peer_a / dead_dir / "marker").unlink()
+        (peer_b / dead_dir / "marker").unlink()
+        peer_a_dir = peer_a / dead_dir
+        peer_b_dir = peer_b / dead_dir
+        peer_a_dir.rmdir()
+        peer_b_dir.rmdir()
+
+        if _run_and_check(failures, "008.34", root, [peer_a.name, peer_b.name]) is None:
+            return
+
+        _assert_not_exists(failures, "008.34", peer_a / dead_dir)
+        _assert_not_exists(failures, "008.34", peer_b / dead_dir)
+
+        if _run_and_check(
+            failures,
+            "008.34",
+            root,
+            [peer_a.name, peer_b.name, peer_c.name],
+        ) is None:
+            return
+
+        _assert_not_exists(failures, "008.34", peer_c / dead_dir)
+
+
 def _check_canon_rules_008_28_29_30(failures: list[str]) -> None:
     """008.28, 008.29, 008.30."""
     with tempfile.TemporaryDirectory(prefix="ks_008_028") as raw_root:
@@ -504,11 +624,14 @@ def main() -> int:
 
     _check_unchanged_008_1_9_27(failures)
     _check_size_modified_008_2(failures)
+    _check_modified_selection_and_propagation_008_10_24(failures)
+    _check_absence_only_votes_008_15(failures)
     _check_mtime_modified_008_3(failures)
     _check_new_entry_008_5_11_25(failures)
     _check_tie_rules_008_12_13_22(failures)
     _check_deletion_vs_file_008_16_17_23(failures)
     _check_directory_and_subordinate_008_32_33_35_39(failures)
+    _check_directory_no_snapshot_peer_008_34(failures)
     _check_canon_rules_008_28_29_30(failures)
     _check_conflict_rules_008_36_37_38(failures)
 

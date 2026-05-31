@@ -92,6 +92,9 @@ safe-replacement internals, or runtime rendering internals.
   recent deletion estimate against the newest live candidate modification time
   using the 5-second tolerance. Deletion wins only when the deletion estimate is
   more than 5 seconds newer.
+- If at least one contributing peer has a deletion vote for a file path and no
+  contributing peer has a live file candidate for that path, select absence as
+  the group outcome.
 - If no contributing peer votes for a file path because all contributing peers
   are absent with no snapshot row, select absence as the group outcome.
 - For directory decisions, ignore directory modification time. If any active

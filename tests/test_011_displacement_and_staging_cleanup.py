@@ -109,7 +109,7 @@ def _write_text(path: Path, value: str) -> None:
     path.write_text(value, encoding="utf-8")
 
 
-def _run_case(failures: list[str], label: str, fn: Callable[[], None]) -> None:
+def _run_case(label: str, failures: list[str], fn: Callable[[], None]) -> None:
     try:
         fn()
     except AssertionError as exc:
@@ -387,7 +387,7 @@ def check_swap_recovery_cases(failures: list[str]) -> None:
             failures,
             "011.18/011.19",
             root,
-            canon_target=None,
+            canon_target="new-recover",
             peer_target=None,
             target_name="swap-old-new.txt",
             swap_old="old-recover",
@@ -404,7 +404,7 @@ def check_swap_recovery_cases(failures: list[str]) -> None:
             failures,
             "011.20",
             root,
-            canon_target=None,
+            canon_target="restore-from-old",
             peer_target=None,
             target_name="swap-old-only.txt",
             swap_old="restore-from-old",
@@ -438,7 +438,7 @@ def check_swap_recovery_cases(failures: list[str]) -> None:
             failures,
             "011.22",
             root,
-            canon_target=None,
+            canon_target="rename-me",
             peer_target=None,
             target_name="swap-new-only.txt",
             swap_old=None,
@@ -462,6 +462,7 @@ def check_encoded_basename_swap_and_recovery_scope(failures: list[str]) -> None:
 
         encoded_name = "spaced name.txt"
         encoded_target = _swap_dir(peer, encoded_name)
+        _write_text(canon / encoded_name, "encoded-recovered")
         _prepare_swap_entry(peer, encoded_name, old=None, new="encoded-recovered")
         result = _run_kitchensync([f"+{canon}", str(peer)], cwd=root)
         _assert_exit_code_zero(failures, "011.11/011.12/011.13", result, [f"+{canon}", str(peer)])
@@ -480,7 +481,8 @@ def check_encoded_basename_swap_and_recovery_scope(failures: list[str]) -> None:
         )
         _fail(
             failures,
-            (peer / encoded_name).read_text(encoding="utf-8") == "encoded-recovered",
+            (peer / encoded_name).exists()
+            and (peer / encoded_name).read_text(encoding="utf-8") == "encoded-recovered",
             "011.12",
             "encoded SWAP new content was not promoted to target",
         )
@@ -574,7 +576,6 @@ def check_displacement_failure_behavior(failures: list[str]) -> None:
         canon, peer = _ensure_parent_prepared(root)
 
         _write_text(canon / "anchor.txt", "anchor")
-        _write_text(peer / "keep.txt", "peer-value")
         seed = _run_kitchensync([f"+{canon}", str(peer)], cwd=root)
         _assert_exit_code_zero(failures, "011.38/011.39/011.40", seed, [f"+{canon}", str(peer)])
         if seed is None or seed.returncode != 0:

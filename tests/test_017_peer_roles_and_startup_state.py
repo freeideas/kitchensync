@@ -93,9 +93,10 @@ def _assert_text(failures: list[str], req_id: str, path: Path, expected: str) ->
         return
 
     if path.read_text(encoding="utf-8") != expected:
+        actual = path.read_text(encoding="utf-8")
         failures.append(
             f"{req_id}: unexpected content at {path}; expected {expected!r}, "
-            f"got {path.read_text(encoding=\"utf-8\")!r}"
+            f"got {actual!r}"
         )
 
 

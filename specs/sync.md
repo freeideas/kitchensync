@@ -109,6 +109,12 @@ Percent-encode special characters in SFTP passwords (`@` -> `%40`, `:` -> `%3A`)
 4. `~/.ssh/id_ecdsa`
 5. `~/.ssh/id_rsa`
 
+Each listed credential source is a required part of the fallback chain, not an
+example. If one source is absent or rejected, KitchenSync must continue to the
+next source in this exact order. In particular, a host that accepts only
+`~/.ssh/id_ed25519` and does not accept `~/.ssh/id_rsa` must be reachable
+without an inline password or SSH agent.
+
 Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
 ## Canon Peer (`+`)

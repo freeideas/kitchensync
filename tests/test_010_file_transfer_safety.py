@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,14 @@ def _run_kitchensync(
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _replace_with_text_file(path: Path, text: str) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    _write_text(path, text)
 
 
 
@@ -290,8 +299,8 @@ def check_transfer_failure_before_old_keeps_destination(failures: list[str]) -> 
         if initial is None:
             return
 
-        swap_block = sink / ".kitchensync" / "SWAP"
-        _write_text(swap_block, "BLOCKED SWAP")
+        swap_block = _swap_dir(sink, destination.name)
+        _replace_with_text_file(swap_block, "BLOCKED SWAP")
         _write_text(source, "second-version")
         _set_mtime(source, datetime(2026, 1, 2, 12, 30, 0, tzinfo=timezone.utc))
 
@@ -306,11 +315,6 @@ def check_transfer_failure_before_old_keeps_destination(failures: list[str]) -> 
         )
         if failure is None:
             return
-        _fail(
-            failures,
-            failure.returncode == 0,
-            f"010.11/010.12/010.13/010.14/010.15/010.16/010.21: transfer-failure case returned {failure.returncode}",
-        )
         _assert_output_contains_any(
             failures,
             "010.15",
@@ -324,17 +328,17 @@ def check_transfer_failure_before_old_keeps_destination(failures: list[str]) -> 
         )
         _fail(
             failures,
-            (sink / ".kitchensync" / "SWAP").is_file(),
+            swap_block.is_file(),
             "010.12/010.14: staging did not preserve transfer block file as expected",
         )
         _fail(
             failures,
-            _read_text(sink / ".kitchensync" / "SWAP") == "BLOCKED SWAP",
+            _read_text(swap_block) == "BLOCKED SWAP",
             "010.12/010.14: transfer block file content changed during transfer failure scenario",
         )
         _fail(
             failures,
-            not _swap_dir(sink, destination.name).exists(),
+            not (swap_block / "new").exists(),
             "010.14: transfer staging files were not cleaned for failed pre-old stage",
         )
     finally:

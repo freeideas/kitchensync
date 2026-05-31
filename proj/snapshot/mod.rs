@@ -6,16 +6,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::{
-    EntryKind, EntryMeta, PeerId, PeerSession, RelPath, RetentionPolicy, Timestamp,
-    TransportError,
-};
+use crate::{EntryKind, EntryMeta, PeerId, PeerSession, RelPath, Timestamp, TransportError};
 
-const SUMMARY: &str = "snapshot: SQLite peer history, path hashing, tombstones, and snapshot upload lifecycle.";
+const SUMMARY: &str =
+    "snapshot: SQLite peer history, path hashing, tombstones, and snapshot upload lifecycle.";
 
 const LIVE_DB: &str = ".kitchensync/snapshot.db";
 const SWAP_NEW: &str = ".kitchensync/SWAP/snapshot.db/new";
@@ -54,6 +52,7 @@ pub enum SnapshotStartupMode {
 pub enum SnapshotEntryKind {
     File,
     Directory,
+    Tombstone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +67,7 @@ pub struct SnapshotRow {
 
 pub struct SnapshotCleanupScope<'a> {
     pub listed_paths: &'a dyn SnapshotListedPaths,
-    pub retention: RetentionPolicy,
+    pub keep_del_days: u32,
 }
 
 pub trait SnapshotListedPaths {
@@ -192,7 +191,9 @@ impl SnapshotStore {
     }
 
     pub fn lookup(&self, path: &RelPath) -> Result<Option<SnapshotRow>, SnapshotError> {
-        reject_root_path(self.peer, path)?;
+        if path.as_str().is_empty() {
+            return Ok(None);
+        }
         let id = path_id(path.as_str());
         let stored = self
             .connection
@@ -210,18 +211,22 @@ impl SnapshotStore {
             .optional()
             .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
 
-        Ok(stored.map(|(mod_time, byte_size, last_seen, deleted_time)| SnapshotRow {
-            path: path.clone(),
-            kind: if byte_size == -1 {
-                SnapshotEntryKind::Directory
-            } else {
-                SnapshotEntryKind::File
+        Ok(stored.map(
+            |(mod_time, byte_size, last_seen, deleted_time)| SnapshotRow {
+                path: path.clone(),
+                kind: if deleted_time.is_some() {
+                    SnapshotEntryKind::Tombstone
+                } else if byte_size == -1 {
+                    SnapshotEntryKind::Directory
+                } else {
+                    SnapshotEntryKind::File
+                },
+                mod_time: Timestamp(mod_time),
+                byte_size,
+                last_seen: last_seen.map(Timestamp),
+                deleted_time: deleted_time.map(Timestamp),
             },
-            mod_time: Timestamp(mod_time),
-            byte_size,
-            last_seen: last_seen.map(Timestamp),
-            deleted_time: deleted_time.map(Timestamp),
-        }))
+        ))
     }
 
     pub fn upsert_confirmed_present(
@@ -263,8 +268,12 @@ impl SnapshotStore {
                 "UPDATE snapshot SET last_seen = ?2 WHERE id = ?1",
                 params![path_id(path.as_str()), last_seen.0],
             )
+            .map(|changed| {
+                if changed > 0 {
+                    self.had_changes = true;
+                }
+            })
             .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
-        self.had_changes = true;
         Ok(last_seen)
     }
 
@@ -277,45 +286,55 @@ impl SnapshotStore {
                  WHERE id = ?1 AND deleted_time IS NULL",
                 params![path_id(path.as_str())],
             )
+            .map(|changed| {
+                if changed > 0 {
+                    self.had_changes = true;
+                }
+            })
             .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
-        self.had_changes = true;
         Ok(())
     }
 
-    pub fn mark_displaced(
-        &mut self,
-        path: &RelPath,
-        kind: SnapshotEntryKind,
-    ) -> Result<(), SnapshotError> {
+    pub fn mark_displaced(&mut self, path: &RelPath, kind: EntryKind) -> Result<(), SnapshotError> {
         reject_root_path(self.peer, path)?;
+        let peer = self.peer;
         let id = path_id(path.as_str());
-        let deletion_estimate = self
+        let transaction = self
             .connection
+            .transaction()
+            .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
+        let deletion_estimate = transaction
             .query_row(
                 "SELECT last_seen FROM snapshot WHERE id = ?1 AND deleted_time IS NULL",
                 params![id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
-            .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?
+            .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?
             .flatten();
 
-        self.connection
+        let mut changed = transaction
             .execute(
                 "UPDATE snapshot
                  SET deleted_time = last_seen
                  WHERE id = ?1 AND deleted_time IS NULL",
                 params![id],
             )
-            .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
+            .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
 
-        if kind == SnapshotEntryKind::Directory {
+        if kind == EntryKind::Directory {
             if let Some(deletion_estimate) = deletion_estimate {
-                self.cascade_displaced_directory(&id, &deletion_estimate)?;
+                changed +=
+                    cascade_displaced_directory(peer, &transaction, &id, &deletion_estimate)?;
             }
         }
 
-        self.had_changes = true;
+        transaction
+            .commit()
+            .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
+        if changed > 0 {
+            self.had_changes = true;
+        }
         Ok(())
     }
 
@@ -323,7 +342,7 @@ impl SnapshotStore {
         &mut self,
         scope: SnapshotCleanupScope<'_>,
     ) -> Result<(), SnapshotError> {
-        let cutoff = retention_cutoff(scope.retention.keep_del_days);
+        let cutoff = retention_cutoff(scope.keep_del_days);
         let rows = self.all_rows_for_cleanup()?;
         let mut removed_any = false;
 
@@ -386,6 +405,12 @@ impl SnapshotStore {
         let byte_size = match meta.kind {
             EntryKind::Directory => -1,
             EntryKind::File => meta.byte_size,
+            EntryKind::SymbolicLink => {
+                return Err(invalid(
+                    self.peer,
+                    SnapshotDatabaseError::UnsupportedObjects,
+                ));
+            }
         };
         self.connection
             .execute(
@@ -411,48 +436,6 @@ impl SnapshotStore {
             )
             .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
         self.had_changes = true;
-        Ok(())
-    }
-
-    fn cascade_displaced_directory(
-        &mut self,
-        root_id: &str,
-        deletion_estimate: &str,
-    ) -> Result<(), SnapshotError> {
-        let mut stack = vec![root_id.to_string()];
-
-        while let Some(parent) = stack.pop() {
-            let children = {
-                let mut statement = self
-                    .connection
-                    .prepare(
-                        "SELECT id, byte_size FROM snapshot
-                         WHERE parent_id = ?1 AND deleted_time IS NULL",
-                    )
-                    .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
-                let rows = statement
-                    .query_map(params![parent], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
-                rows
-            };
-
-            for (child_id, byte_size) in children {
-                self.connection
-                    .execute(
-                        "UPDATE snapshot SET deleted_time = ?2
-                         WHERE id = ?1 AND deleted_time IS NULL",
-                        params![child_id, deletion_estimate],
-                    )
-                    .map_err(|_| invalid(self.peer, SnapshotDatabaseError::Corrupt))?;
-                if byte_size == -1 {
-                    stack.push(child_id);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -594,8 +577,8 @@ fn download_live_snapshot(peer: &PeerSession, local_db: &Path) -> Result<(), Sna
 }
 
 fn create_empty_database(peer: &PeerSession, path: &Path) -> Result<(), SnapshotError> {
-    let connection = Connection::open(path)
-        .map_err(|_| local(peer, SnapshotLocalOperation::CreateDatabase))?;
+    let connection =
+        Connection::open(path).map_err(|_| local(peer, SnapshotLocalOperation::CreateDatabase))?;
     initialize_schema(&connection)
         .map_err(|_| local(peer, SnapshotLocalOperation::CreateDatabase))?;
     connection
@@ -606,6 +589,9 @@ fn create_empty_database(peer: &PeerSession, path: &Path) -> Result<(), Snapshot
 
 fn open_and_validate(peer: PeerId, path: &Path) -> Result<Connection, SnapshotError> {
     let connection = Connection::open(path)
+        .map_err(|_| local_peer(peer, SnapshotLocalOperation::OpenDatabase))?;
+    connection
+        .execute_batch("PRAGMA journal_mode = DELETE;")
         .map_err(|_| local_peer(peer, SnapshotLocalOperation::OpenDatabase))?;
     validate_schema(peer, &connection)?;
     Ok(connection)
@@ -759,6 +745,49 @@ fn indexed_snapshot_columns(
     Ok(columns)
 }
 
+fn cascade_displaced_directory(
+    peer: PeerId,
+    transaction: &Transaction<'_>,
+    root_id: &str,
+    deletion_estimate: &str,
+) -> Result<usize, SnapshotError> {
+    let mut changed = 0usize;
+    let mut stack = vec![root_id.to_string()];
+
+    while let Some(parent) = stack.pop() {
+        let children = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, byte_size FROM snapshot
+                     WHERE parent_id = ?1 AND deleted_time IS NULL",
+                )
+                .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
+            let rows = statement
+                .query_map(params![parent], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?
+        };
+
+        for (child_id, byte_size) in children {
+            changed += transaction
+                .execute(
+                    "UPDATE snapshot SET deleted_time = ?2
+                     WHERE id = ?1 AND deleted_time IS NULL",
+                    params![child_id, deletion_estimate],
+                )
+                .map_err(|_| invalid(peer, SnapshotDatabaseError::Corrupt))?;
+            if byte_size == -1 {
+                stack.push(child_id);
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
 fn quote_sql_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -838,6 +867,20 @@ fn format_timestamp(time: SystemTime) -> String {
 }
 
 fn parse_timestamp(value: &str) -> Option<SystemTime> {
+    if value.len() != 27
+        || value.get(4..5)? != "-"
+        || value.get(7..8)? != "-"
+        || value.get(10..11)? != "_"
+        || value.get(13..14)? != "-"
+        || value.get(16..17)? != "-"
+        || value.get(19..20)? != "_"
+        || value.get(26..27)? != "Z"
+        || !value.as_bytes().iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 26) || byte.is_ascii_digit()
+        })
+    {
+        return None;
+    }
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d_%H-%M-%S_%fZ")
         .ok()
         .map(|datetime| DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc))

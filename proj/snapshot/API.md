@@ -22,8 +22,7 @@ The public API uses root-owned contracts rather than redefining them:
   `-1`.
 - `Timestamp`: UTC value formatted as `YYYY-MM-DD_HH-mm-ss_ffffffZ`.
 - `TransportError`: normalized transport error category.
-- `RetentionPolicy` or the equivalent root run-config field containing
-  `keep_del_days`.
+- Root run configuration field containing the `keep_del_days` retention value.
 
 ## Public Types
 
@@ -61,11 +60,13 @@ recovery and never uploads updated local snapshots.
 pub enum SnapshotEntryKind {
     File,
     Directory,
+    Tombstone,
 }
 ```
 
 Public row classification returned from lookup. Directory rows correspond to
-stored byte size `-1`; file rows carry the stored file byte size.
+stored byte size `-1`; file rows carry the stored file byte size. Tombstone rows
+represent deletion-only snapshot facts and require `deleted_time`.
 
 ```rust
 pub struct SnapshotRow {
@@ -85,12 +86,13 @@ stored path identifiers.
 ```rust
 pub struct SnapshotCleanupScope<'a> {
     pub listed_paths: &'a dyn SnapshotListedPaths,
-    pub retention: RetentionPolicy,
+    pub keep_del_days: u32,
 }
 ```
 
 Inputs for opportunistic stale-row cleanup. `listed_paths` answers whether a
-row is still present in any peer listing known to the caller.
+row is still present in any peer listing known to the caller. `keep_del_days`
+is copied from the root-owned run configuration.
 
 ```rust
 pub trait SnapshotListedPaths {
@@ -222,7 +224,7 @@ impl SnapshotStore {
     pub fn mark_displaced(
         &mut self,
         path: &RelPath,
-        kind: SnapshotEntryKind,
+        kind: EntryKind,
     ) -> Result<(), SnapshotError>;
 
     pub fn cleanup_stale_rows(
@@ -277,7 +279,8 @@ exist, it leaves the store unchanged.
 ### `mark_displaced`
 
 Records a successful BAK displacement. The displaced row's `deleted_time` is
-copied from its previous `last_seen`. When `kind` is `Directory`, the same
+copied from its previous `last_seen`. `kind` is the root-owned file/directory
+entry kind for the displaced peer entry. When `kind` is `Directory`, the same
 deletion estimate cascades through non-tombstone descendants reachable through
 that directory in this peer's database. The cascade must not pass through an
 already tombstoned or purged intermediate row.
@@ -285,7 +288,7 @@ already tombstoned or purged intermediate row.
 ### `cleanup_stale_rows`
 
 Opportunistically removes stale rows according to the provided retention
-policy. Cleanup may delete tombstones older than `keep_del_days`. It may delete
+value. Cleanup may delete tombstones older than `keep_del_days`. It may delete
 obsolete non-tombstone rows only when they no longer appear in any peer listing
 and their `last_seen` is older than `keep_del_days` or `NULL`. Correctness must
 not depend on this method being called or completing in the current run.

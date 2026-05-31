@@ -309,12 +309,8 @@ def _case_builtin_and_cli_excludes(failures: list[str]) -> None:
 
         _write_text(canon / "visible.txt", "visible")
         _write_text(canon / "parent" / "keep.txt", "keep")
-        _write_text(canon / "parent" / "skip.txt", "skip")
         _write_text(canon / ".git" / "ignored.txt", "ignore")
         _write_text(canon / ".kitchensync" / "forbidden.txt", "hidden")
-        _write_text(canon / "skip_file.txt", "skip")
-        _write_text(canon / "skip_dir" / "nested.txt", "skip-dir")
-        _write_text(canon / "absent.txt", "only-a")
         _write_text(canon / "ghost.txt", "v1")
         _write_text(peer_b / "ghost.txt", "v1")
 
@@ -332,6 +328,10 @@ def _case_builtin_and_cli_excludes(failures: list[str]) -> None:
         ghost_before_p1 = _snapshot_row_signature(canon, "ghost.txt")
         ghost_before_p2 = _snapshot_row_signature(peer_b, "ghost.txt")
 
+        _write_text(canon / "parent" / "skip.txt", "skip")
+        _write_text(canon / "skip_file.txt", "skip")
+        _write_text(canon / "skip_dir" / "nested.txt", "skip-dir")
+        _write_text(canon / "absent.txt", "only-a")
         _write_text(canon / "ghost.txt", "v2")
 
         sync = _run_and_check(
@@ -425,11 +425,12 @@ def _case_builtin_and_cli_excludes(failures: list[str]) -> None:
             "existing .kitchensync content should be left untouched",
         )
 
-        _assert_not_exists(
+        _assert_text_equals(
             failures,
             "007.16",
             peer_b / "ghost.txt",
-            "excluded path should be treated as nonexistent, so copy must not occur",
+            "v1",
+            "existing excluded path should be left untouched, so copy must not occur",
         )
 
         ghost_after_p1 = _snapshot_row_signature(canon, "ghost.txt")
@@ -808,7 +809,7 @@ def _case_unreachable_peer(failures: list[str]) -> None:
             "007.32/007.33/007.34",
             ["--verbosity", "error", f"+{peer_a}", str(peer_b), str(unreachable_file)],
             cwd=root,
-            required_output=("error",),
+            required_output=("unreachable",),
         )
         if unreachable is None or unreachable.returncode != 0:
             return

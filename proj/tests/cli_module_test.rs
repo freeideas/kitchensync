@@ -25,9 +25,20 @@ fn expect_invalid(result: CliInvocation) -> String {
 }
 
 fn local_file_identity(env: &CliParseEnv, peer: &str) -> String {
-    let absolute_peer = env.current_dir.join(peer).to_string_lossy().replace('\\', "/");
+    let absolute_peer = env
+        .current_dir
+        .join(peer)
+        .to_string_lossy()
+        .replace('\\', "/");
     format!("file://{absolute_peer}")
 }
+
+fn unix_file_identity(peer: &str) -> String {
+    format!("file://{peer}")
+}
+
+// Not reasonably testable through `parse_invocation`:
+// - exact process exit status and stdout/stderr routing belong to `run_process`.
 
 #[test]
 fn parse_invocation_empty_args_returns_help() {
@@ -84,8 +95,14 @@ fn parse_invocation_applies_default_configuration() {
 
     assert_eq!(request.peers[0].role, PeerRole::Normal);
     assert_eq!(request.peers[1].role, PeerRole::Normal);
-    assert_eq!(request.peers[0].urls[0].identity, local_file_identity(&env, "left"));
-    assert_eq!(request.peers[1].urls[0].identity, local_file_identity(&env, "right"));
+    assert_eq!(
+        request.peers[0].urls[0].identity,
+        local_file_identity(&env, "left")
+    );
+    assert_eq!(
+        request.peers[1].urls[0].identity,
+        local_file_identity(&env, "right")
+    );
 }
 
 #[test]
@@ -143,27 +160,157 @@ fn parse_invocation_accepts_global_options_and_preserves_exclude_order() {
 fn parse_invocation_rejects_missing_option_value() {
     let env = cli_env();
 
-    let message = expect_invalid(parse_invocation(["--max-copies", "left", "right"], &env));
+    let message = expect_invalid(parse_invocation(["--max-copies"], &env));
 
     assert!(message.contains("missing value for --max-copies"));
+}
+
+#[test]
+fn parse_invocation_rejects_missing_value_for_all_value_options() {
+    let env = cli_env();
+
+    for option in [
+        "--max-copies",
+        "--retries-copy",
+        "--retries-list",
+        "--timeout-conn",
+        "--timeout-idle",
+        "--keep-tmp-days",
+        "--keep-bak-days",
+        "--keep-del-days",
+    ] {
+        let message = expect_invalid(parse_invocation([option], &env));
+        assert!(message.contains(&format!("missing value for {option}")));
+    }
 }
 
 #[test]
 fn parse_invocation_rejects_zero_for_positive_integer_options() {
     let env = cli_env();
 
-    let message = expect_invalid(parse_invocation(["--retries-copy", "0", "left", "right"], &env));
+    let message = expect_invalid(parse_invocation(
+        ["--retries-copy", "0", "left", "right"],
+        &env,
+    ));
 
     assert!(message.contains("requires a positive integer"));
+}
+
+#[test]
+fn parse_invocation_rejects_zero_for_all_positive_integer_options() {
+    let env = cli_env();
+
+    for option in [
+        "--max-copies",
+        "--retries-copy",
+        "--retries-list",
+        "--timeout-conn",
+        "--timeout-idle",
+        "--keep-tmp-days",
+        "--keep-bak-days",
+        "--keep-del-days",
+    ] {
+        let message = expect_invalid(parse_invocation([option, "0", "left", "right"], &env));
+        assert!(message.contains("requires a positive integer"));
+    }
 }
 
 #[test]
 fn parse_invocation_rejects_invalid_verbosity() {
     let env = cli_env();
 
-    let message = expect_invalid(parse_invocation(["--verbosity", "noisy", "left", "right"], &env));
+    let message = expect_invalid(parse_invocation(
+        ["--verbosity", "noisy", "left", "right"],
+        &env,
+    ));
 
     assert!(message.contains("unsupported verbosity"));
+}
+
+#[test]
+fn parse_invocation_accepts_all_verbosity_values() {
+    let env = cli_env();
+
+    assert_eq!(
+        expect_run(parse_invocation(
+            ["--verbosity", "error", "left", "right"],
+            &env
+        ))
+        .config
+        .verbosity,
+        Verbosity::Error
+    );
+    assert_eq!(
+        expect_run(parse_invocation(
+            ["--verbosity", "info", "left", "right"],
+            &env
+        ))
+        .config
+        .verbosity,
+        Verbosity::Info
+    );
+    assert_eq!(
+        expect_run(parse_invocation(
+            ["--verbosity", "debug", "left", "right"],
+            &env
+        ))
+        .config
+        .verbosity,
+        Verbosity::Debug
+    );
+    assert_eq!(
+        expect_run(parse_invocation(
+            ["--verbosity", "trace", "left", "right"],
+            &env
+        ))
+        .config
+        .verbosity,
+        Verbosity::Trace
+    );
+}
+
+#[test]
+fn parse_invocation_rejects_negative_positive_integer_option_values() {
+    let env = cli_env();
+
+    for option in [
+        "--max-copies",
+        "--retries-copy",
+        "--retries-list",
+        "--timeout-conn",
+        "--timeout-idle",
+        "--keep-tmp-days",
+        "--keep-bak-days",
+        "--keep-del-days",
+    ] {
+        let message = expect_invalid(parse_invocation([option, "-1", "left", "right"], &env));
+        assert!(message.contains("requires a positive integer"));
+    }
+}
+
+#[test]
+fn parse_invocation_rejects_unsupported_peer_url_form() {
+    let env = cli_env();
+
+    let message = expect_invalid(parse_invocation(
+        ["http://left.example/path", "right", "third"],
+        &env,
+    ));
+
+    assert!(message.contains("unsupported"));
+}
+
+#[test]
+fn parse_invocation_accepts_excludes_after_peer_operands() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(
+        ["left", "right", "-x", "cache", "-x", "tmp"],
+        &env,
+    ));
+
+    assert_eq!(request.config.excludes[0].as_str(), "cache");
+    assert_eq!(request.config.excludes[1].as_str(), "tmp");
 }
 
 #[test]
@@ -176,10 +323,24 @@ fn parse_invocation_rejects_invalid_excludes() {
 }
 
 #[test]
+fn parse_invocation_rejects_excludes_with_disallowed_path_characters() {
+    let env = cli_env();
+
+    let leading_slash = expect_invalid(parse_invocation(["-x", "/bad", "left", "right"], &env));
+    assert!(leading_slash.contains("invalid exclude path"));
+
+    let backslash = expect_invalid(parse_invocation(["-x", "a\\b", "left", "right"], &env));
+    assert!(backslash.contains("invalid exclude path"));
+}
+
+#[test]
 fn parse_invocation_rejects_multiple_explicit_canon_peers() {
     let env = cli_env();
 
-    let message = expect_invalid(parse_invocation(["+left", "+right", "third", "fourth"], &env));
+    let message = expect_invalid(parse_invocation(
+        ["+left", "+right", "third", "fourth"],
+        &env,
+    ));
 
     assert!(message.contains("more than one canon peer"));
 }
@@ -188,11 +349,20 @@ fn parse_invocation_rejects_multiple_explicit_canon_peers() {
 fn parse_invocation_preserves_peer_and_fallback_order() {
     let env = cli_env();
 
-    let request = expect_run(parse_invocation(["+[left,right]", "-third", "fourth"], &env));
+    let request = expect_run(parse_invocation(
+        ["+[left,right]", "-third", "fourth"],
+        &env,
+    ));
 
     assert_eq!(request.peers[0].role, PeerRole::Canon);
-    assert_eq!(request.peers[0].urls[0].identity, local_file_identity(&env, "left"));
-    assert_eq!(request.peers[0].urls[1].identity, local_file_identity(&env, "right"));
+    assert_eq!(
+        request.peers[0].urls[0].identity,
+        local_file_identity(&env, "left")
+    );
+    assert_eq!(
+        request.peers[0].urls[1].identity,
+        local_file_identity(&env, "right")
+    );
     assert_eq!(request.peers[1].role, PeerRole::Subordinate);
     assert_eq!(request.peers[2].role, PeerRole::Normal);
 }
@@ -201,7 +371,10 @@ fn parse_invocation_preserves_peer_and_fallback_order() {
 fn parse_invocation_normalizes_file_url_identity() {
     let env = cli_env();
 
-    let request = expect_run(parse_invocation(["left//inner///", "FILE://localhost//C:/right///"], &env));
+    let request = expect_run(parse_invocation(
+        ["left//inner///", "FILE://localhost//C:/right///"],
+        &env,
+    ));
 
     let left = &request.peers[0].urls[0];
     let right = &request.peers[1].urls[0];
@@ -212,6 +385,57 @@ fn parse_invocation_normalizes_file_url_identity() {
     assert_eq!(right.scheme, "file");
     assert_eq!(right.path, "C:/right");
     assert_eq!(right.identity, "file://C:/right");
+}
+
+#[test]
+fn parse_invocation_normalizes_unix_absolute_local_path() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(["/tmp/data/path", "left"], &env));
+
+    assert_eq!(
+        request.peers[0].urls[0].identity,
+        unix_file_identity("/tmp/data/path")
+    );
+}
+
+#[test]
+fn parse_invocation_removes_trailing_slash_from_local_path() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(["/tmp/data/path/", "left"], &env));
+
+    assert_eq!(
+        request.peers[0].urls[0].identity,
+        unix_file_identity("/tmp/data/path")
+    );
+}
+
+#[test]
+fn parse_invocation_preserves_non_default_sftp_port() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(
+        ["sftp://user@host:2222/path?timeout-conn=9", "left", "right"],
+        &env,
+    ));
+
+    let peer = &request.peers[0].urls[0];
+
+    assert_eq!(peer.port, Some(2222));
+    assert_eq!(peer.identity, "sftp://user@host:2222/path");
+}
+
+#[test]
+fn parse_invocation_percent_decodes_unreserved_file_path_characters() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(["left%7Epath", "right"], &env));
+
+    assert_eq!(
+        request.peers[0].urls[0].identity,
+        local_file_identity(&env, "left~path")
+    );
 }
 
 #[test]
@@ -248,12 +472,56 @@ fn parse_invocation_normalizes_sftp_identity_and_url_settings() {
     assert_eq!(second.timeout_idle, Some(8));
 
     assert_eq!(third.username.as_deref(), Some("alice"));
-    assert_eq!(third.password.as_deref(), Some("p@ss"));
+    assert_eq!(third.password.as_deref(), Some("p%40ss"));
     assert_eq!(third.host.as_deref(), Some("otherhost"));
     assert_eq!(third.path, "/ROOT");
     assert_eq!(third.identity, "sftp://alice@otherhost/ROOT");
     assert_eq!(third.timeout_conn, Some(2));
     assert_eq!(third.timeout_idle, Some(9));
+}
+
+#[test]
+fn parse_invocation_rejects_role_prefixes_inside_fallback_group() {
+    let env = cli_env();
+
+    let request = parse_invocation(["[+left,right]", "third", "fourth"], &env);
+    assert!(matches!(request, CliInvocation::Invalid { .. }));
+}
+
+#[test]
+fn parse_invocation_rejects_invalid_fallback_group_syntax() {
+    let env = cli_env();
+
+    let request = parse_invocation(["[left,right", "third", "fourth"], &env);
+    assert!(matches!(request, CliInvocation::Invalid { .. }));
+}
+
+#[test]
+fn parse_invocation_parses_fallback_group_with_windows_paths() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(
+        ["left", "[right,C:/tmp/fallback]", "third"],
+        &env,
+    ));
+
+    assert_eq!(
+        request.peers[1].urls[0].identity,
+        local_file_identity(&env, "right")
+    );
+    assert_eq!(request.peers[1].urls[1].identity, "file://C:/tmp/fallback");
+}
+
+#[test]
+fn parse_invocation_rejects_unsupported_url_query_parameter_in_any_position() {
+    let env = cli_env();
+
+    let message = expect_invalid(parse_invocation(["left?max-copies=3", "right"], &env));
+    assert!(message.contains("unsupported URL query parameter"));
+
+    let non_numeric_message =
+        expect_invalid(parse_invocation(["left?unsupported=value", "right"], &env));
+    assert!(non_numeric_message.contains("unsupported URL query parameter"));
 }
 
 #[test]
@@ -265,6 +533,24 @@ fn parse_invocation_rejects_unsupported_or_missing_per_url_query_values() {
 
     let missing_value = expect_invalid(parse_invocation(["left?timeout-idle=", "right"], &env));
     assert!(missing_value.contains("missing value for URL query parameter"));
+
+    let non_integer = expect_invalid(parse_invocation(
+        ["left?timeout-conn=not-a-number", "right"],
+        &env,
+    ));
+    assert!(non_integer.contains("requires a positive integer"));
+
+    let non_positive = expect_invalid(parse_invocation(["left?timeout-idle=0", "right"], &env));
+    assert!(non_positive.contains("requires a positive integer"));
+}
+
+#[test]
+fn parse_invocation_accepts_absolute_local_and_windows_paths_without_fallback() {
+    let env = cli_env();
+
+    let request = expect_run(parse_invocation(["left", "C:/tmp/fallback", "right"], &env));
+
+    assert_eq!(request.peers[1].urls[0].identity, "file://C:/tmp/fallback");
 }
 
 #[test]

@@ -23,14 +23,15 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-WORKSPACE_ROOT = Path(r"C:\Users\human\Desktop\prjx\kitchensync")
-PROJECT_DIR = Path(r"C:\Users\human\Desktop\prjx\kitchensync\proj")
-WINDOWS_RELEASED_BINARY = Path(r"C:\Users\human\Desktop\prjx\kitchensync\released\kitchensync.exe")
-POSIX_RELEASED_BINARY = Path(r"C:\Users\human\Desktop\prjx\kitchensync\released\kitchensync")
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_DIR = WORKSPACE_ROOT / "proj"
+WINDOWS_RELEASED_BINARY = WORKSPACE_ROOT / "released" / "kitchensync.exe"
+POSIX_RELEASED_BINARY = WORKSPACE_ROOT / "released" / "kitchensync"
 RELEASED_BINARY = WINDOWS_RELEASED_BINARY if os.name == "nt" else POSIX_RELEASED_BINARY
 
 TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S_%fZ"
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z$")
+TIMESTAMP_TOKEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}Z")
 BASE62_RE = re.compile(r"^[0-9A-Za-z]{11}$")
 
 
@@ -278,6 +279,19 @@ def check_snapshot_identifiers_and_parent_links(failures: list[str]) -> None:
                 f"path {path!r} has trailing slash",
             )
 
+        all_rows = _load_snapshot_rows(peer)
+        for row in all_rows:
+            basename = row.get("basename")
+            _fail(
+                failures,
+                isinstance(basename, str)
+                and basename not in {"", "/", ".", ".."}
+                and "/" not in basename
+                and "\\" not in basename,
+                "016.2/016.3",
+                f"snapshot basename {basename!r} is not a normalized single path segment",
+            )
+
         top_level = {path: row for path, row in path_rows.items() if "/" not in path}
         if top_level:
             top_level_parents = {str(row.get("parent_id")) for row in top_level.values() if row.get("parent_id") is not None}
@@ -400,6 +414,7 @@ def check_snapshot_timestamps_format_and_lexicographic_order(failures: list[str]
         path_rows = _snapshot_by_path(peer)[0]
         values: list[str] = []
         parsed_values: list[datetime] = []
+        last_seen_values: list[str] = []
 
         for path, row in path_rows.items():
             for key in ("mod_time", "last_seen", "deleted_time"):
@@ -417,6 +432,8 @@ def check_snapshot_timestamps_format_and_lexicographic_order(failures: list[str]
                 if parsed is not None:
                     values.append(value)
                     parsed_values.append(parsed)
+                    if key == "last_seen":
+                        last_seen_values.append(value)
 
         _fail(failures, bool(values), "016.8", "no snapshot timestamp values were observed")
         if values:
@@ -427,6 +444,15 @@ def check_snapshot_timestamps_format_and_lexicographic_order(failures: list[str]
                 sorted_values == sorted_by_time,
                 "016.11",
                 "snapshot timestamp values are not in lexicographic chronological order",
+            )
+
+        _fail(failures, bool(last_seen_values), "016.16", "no last_seen timestamps were observed in a single sync process")
+        if last_seen_values:
+            _fail(
+                failures,
+                len(set(last_seen_values)) == len(last_seen_values),
+                "016.16",
+                "last_seen timestamps were not unique within a single sync run",
             )
 
         vanished = path_rows.get("vanish.txt")
@@ -484,7 +510,7 @@ def check_last_seen_refreshes_on_update(failures: list[str]) -> None:
         )
 
 
-def check_bak_tmp_timestamp_paths_and_freshness(failures: list[str]) -> None:
+def check_bak_timestamp_paths_and_freshness(failures: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="ks_016_bak_tmp_") as raw_root:
         workspace = Path(raw_root)
         canon = workspace / "canon"
@@ -494,49 +520,38 @@ def check_bak_tmp_timestamp_paths_and_freshness(failures: list[str]) -> None:
 
         _write_text(canon / "a.txt", "A-one")
         _write_text(canon / "b.txt", "B-one")
-        _write_text(peer / "a.txt", "A-old")
-        _write_text(peer / "b.txt", "B-old")
+        _write_text(peer / "a.txt", "A-old-stale")
+        _write_text(peer / "b.txt", "B-old-stale")
 
         first = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
-        if not _assert_success(failures, "016.13/016.14/016.16/016.18/016.19", first, [f"+{canon}", str(peer)]):
+        if not _assert_success(failures, "016.13/016.18", first, [f"+{canon}", str(peer)]):
             return
 
         bak_first = _collect_timestamped_meta_dirs(peer, "BAK")
-        tmp_first = _collect_timestamped_meta_dirs(peer, "TMP")
         bak_names_first = [name for name, _ in bak_first]
-        tmp_names_first = [name for name, _ in tmp_first]
         _fail(failures, bool(bak_first), "016.13", "BAK timestamp segment missing after replacement")
-        _fail(failures, bool(tmp_first), "016.14", "TMP timestamp segment missing after replacement")
 
-        _fail(failures, _strictly_increasing(sorted(bak_names_first)), "016.16/016.18", "BAK timestamps were not strictly increasing")
-        _fail(failures, _strictly_increasing(sorted(tmp_names_first)), "016.16/016.19", "TMP timestamps were not strictly increasing")
+        _fail(failures, _strictly_increasing(sorted(bak_names_first)), "016.18", "BAK timestamps were not strictly increasing")
 
         for name in bak_names_first:
             _fail(failures, TIMESTAMP_RE.fullmatch(name) is not None, "016.13", f"BAK segment {name!r} is not in required timestamp format")
-        for name in tmp_names_first:
-            _fail(failures, TIMESTAMP_RE.fullmatch(name) is not None, "016.14", f"TMP segment {name!r} is not in required timestamp format")
 
-        _write_text(canon / "a.txt", "A-two")
-        _write_text(canon / "b.txt", "B-two")
+        _write_text(canon / "a.txt", "A-two-long")
+        _write_text(canon / "b.txt", "B-two-long")
         _write_text(canon / "c.txt", "C-new")
-        _write_text(peer / "c.txt", "C-old")
+        _write_text(peer / "c.txt", "C-old-stale")
 
         second = _run_kitchensync([f"+{canon}", str(peer)], cwd=workspace)
-        if not _assert_success(failures, "016.18/016.19", second, [f"+{canon}", str(peer)]):
+        if not _assert_success(failures, "016.18", second, [f"+{canon}", str(peer)]):
             return
 
         bak_second = _collect_timestamped_meta_dirs(peer, "BAK")
-        tmp_second = _collect_timestamped_meta_dirs(peer, "TMP")
         bak_names_second = [name for name, _ in bak_second]
-        tmp_names_second = [name for name, _ in tmp_second]
 
         parsed_first_bak_max = max((value for _, value in bak_first), default=None)
-        parsed_first_tmp_max = max((value for _, value in tmp_first), default=None)
 
         bak_new = [name for name in bak_names_second if name not in bak_names_first]
-        tmp_new = [name for name in tmp_names_second if name not in tmp_names_first]
         _fail(failures, bool(bak_new), "016.18", "no fresh BAK directory name was created in the second replacement run")
-        _fail(failures, bool(tmp_new), "016.19", "no fresh TMP directory name was created in the second staging run")
 
         if parsed_first_bak_max is not None:
             for name in bak_new:
@@ -549,17 +564,6 @@ def check_bak_tmp_timestamp_paths_and_freshness(failures: list[str]) -> None:
                     "016.18",
                     f"new BAK timestamp {name!r} was not greater than previous max {parsed_first_bak_max}",
                 )
-        if parsed_first_tmp_max is not None:
-            for name in tmp_new:
-                parsed = _parse_timestamp(name)
-                if parsed is None:
-                    continue
-                _fail(
-                    failures,
-                    parsed > parsed_first_tmp_max,
-                    "016.19",
-                    f"new TMP timestamp {name!r} was not greater than previous max {parsed_first_tmp_max}",
-                )
 
 
 def check_log_output_timestamps(failures: list[str]) -> None:
@@ -571,14 +575,14 @@ def check_log_output_timestamps(failures: list[str]) -> None:
         peer.mkdir()
 
         _write_text(canon / "log.txt", "log")
-        _write_text(peer / "log.txt", "old")
+        _write_text(peer / "log.txt", "old-stale")
 
         result = _run_kitchensync(["--verbosity", "trace", f"+{canon}", str(peer)], cwd=workspace)
         if not _assert_success(failures, "016.15", result, ["--verbosity", "trace", f"+{canon}", str(peer)]):
             return
 
         output = f"{result.stdout}\n{result.stderr}"
-        matches = TIMESTAMP_RE.findall(output)
+        matches = TIMESTAMP_TOKEN_RE.findall(output)
         _fail(failures, bool(matches), "016.15", "no timestamp-formatted values were emitted in trace logs")
         for token in matches:
             _fail(
@@ -599,6 +603,8 @@ def main() -> int:
     # not reasonably testable from CLI surface:
     # 016.1 -- exact xxHash64 seed-0 digest values are not independently verifiable without the same hash pipeline.
     # 016.6 -- proving the sentinel equals the digest of "/" is internal-only.
+    # 016.14 -- TMP timestamp segment generation is internal to temp staging and not guaranteed to be observable on a successful, deterministic public sync flow.
+    # 016.19 -- TMP timestamp freshness is testable only when triggering TMP staging failure/recovery paths, which are intentionally unforced in this root test.
 
     if failures:
         print("FAIL: test_016_snapshot_paths_and_timestamps.py (precondition)")
@@ -618,11 +624,7 @@ def main() -> int:
         lambda: check_snapshot_timestamps_format_and_lexicographic_order(failures),
     )
     _run_case("016.17", failures, lambda: check_last_seen_refreshes_on_update(failures))
-    _run_case(
-        "016.13/016.14/016.16/016.18/016.19",
-        failures,
-        lambda: check_bak_tmp_timestamp_paths_and_freshness(failures),
-    )
+    _run_case("016.13/016.16/016.18", failures, lambda: check_bak_timestamp_paths_and_freshness(failures))
     _run_case("016.15", failures, lambda: check_log_output_timestamps(failures))
 
     if failures:

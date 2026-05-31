@@ -84,6 +84,12 @@ If displacement fails, the entry remains in place, an error result is returned, 
 
 `cleanup_retention` is run for a directory after sync processes that directory's entry union in a normal run. It checks `.kitchensync/` at the current directory even though `.kitchensync/` is excluded from sync decisions.
 
+Any TMP staging this module creates for temporary metadata or cleanup work must
+live under the current directory's `.kitchensync/TMP/<timestamp>/` hierarchy and
+must include a distinct UUID component for each transfer or cleanup unit that
+needs collision isolation. TMP staging must never replace a live user path and
+must use a fresh `Timestamp` value for each new `<timestamp>` directory.
+
 Cleanup purges expired timestamp directories under:
 
 - `.kitchensync/BAK/<timestamp>/` when the timestamp is older than `--keep-bak-days`;

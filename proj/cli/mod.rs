@@ -100,6 +100,7 @@ fn parse_run(args: Vec<String>, env: &CliParseEnv) -> Result<RunRequest, String>
         let arg = &args[index];
         match arg.as_str() {
             "--dry-run" => {
+                reject_global_option_after_peer(&peer_operands, "--dry-run")?;
                 options.dry_run = true;
                 index += 1;
             }
@@ -109,30 +110,39 @@ fn parse_run(args: Vec<String>, env: &CliParseEnv) -> Result<RunRequest, String>
                 index += 2;
             }
             "--max-copies" => {
+                reject_global_option_after_peer(&peer_operands, "--max-copies")?;
                 options.max_copies = parse_next_usize(&args, &mut index, "--max-copies")?;
             }
             "--retries-copy" => {
+                reject_global_option_after_peer(&peer_operands, "--retries-copy")?;
                 options.retries_copy = parse_next_usize(&args, &mut index, "--retries-copy")?;
             }
             "--retries-list" => {
+                reject_global_option_after_peer(&peer_operands, "--retries-list")?;
                 options.retries_list = parse_next_usize(&args, &mut index, "--retries-list")?;
             }
             "--timeout-conn" => {
+                reject_global_option_after_peer(&peer_operands, "--timeout-conn")?;
                 options.timeout_conn = parse_next_u32(&args, &mut index, "--timeout-conn")?;
             }
             "--timeout-idle" => {
+                reject_global_option_after_peer(&peer_operands, "--timeout-idle")?;
                 options.timeout_idle = parse_next_u32(&args, &mut index, "--timeout-idle")?;
             }
             "--keep-tmp-days" => {
+                reject_global_option_after_peer(&peer_operands, "--keep-tmp-days")?;
                 options.keep_tmp_days = parse_next_u32(&args, &mut index, "--keep-tmp-days")?;
             }
             "--keep-bak-days" => {
+                reject_global_option_after_peer(&peer_operands, "--keep-bak-days")?;
                 options.keep_bak_days = parse_next_u32(&args, &mut index, "--keep-bak-days")?;
             }
             "--keep-del-days" => {
+                reject_global_option_after_peer(&peer_operands, "--keep-del-days")?;
                 options.keep_del_days = parse_next_u32(&args, &mut index, "--keep-del-days")?;
             }
             "--verbosity" => {
+                reject_global_option_after_peer(&peer_operands, "--verbosity")?;
                 let value = option_value(&args, index, "--verbosity")?;
                 options.verbosity = parse_verbosity(value)?;
                 index += 2;
@@ -183,6 +193,14 @@ fn parse_run(args: Vec<String>, env: &CliParseEnv) -> Result<RunRequest, String>
         peers,
         excludes,
     })
+}
+
+fn reject_global_option_after_peer(peers: &[String], option: &str) -> Result<(), String> {
+    if peers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{option} must appear before peer operands"))
+    }
 }
 
 fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -259,14 +277,13 @@ fn parse_peer_operand(operand: &str, env: &CliParseEnv) -> Result<PeerSpec, Stri
         if inner.is_empty() {
             return Err(format!("invalid fallback group: {operand}"));
         }
-        inner
-            .split(',')
-            .map(str::trim)
+        split_fallback_group(inner)
+            .into_iter()
             .map(|url| {
                 if url.is_empty() || url.starts_with('+') || url.starts_with('-') {
                     Err(format!("invalid fallback URL in peer operand: {operand}"))
                 } else {
-                    Ok(url.to_string())
+                    Ok(url)
                 }
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -280,6 +297,10 @@ fn parse_peer_operand(operand: &str, env: &CliParseEnv) -> Result<PeerSpec, Stri
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(PeerSpec { role, urls })
+}
+
+fn split_fallback_group(inner: &str) -> Vec<String> {
+    inner.split(',').map(str::to_string).collect()
 }
 
 fn parse_peer_url(input: &str, env: &CliParseEnv) -> Result<PeerUrl, String> {
@@ -317,6 +338,9 @@ fn split_query(input: &str) -> Result<(&str, Option<u32>, Option<u32>), String> 
         if value.is_empty() {
             return Err(format!("missing value for URL query parameter: {name}"));
         }
+        if name != "timeout-conn" && name != "timeout-idle" {
+            return Err(format!("unsupported URL query parameter: {name}"));
+        }
         let parsed = value
             .parse::<u32>()
             .map_err(|_| format!("URL query parameter {name} requires a positive integer"))?;
@@ -336,7 +360,7 @@ fn split_query(input: &str) -> Result<(&str, Option<u32>, Option<u32>), String> 
                     return Err("duplicate URL query parameter: timeout-idle".to_string());
                 }
             }
-            _ => return Err(format!("unsupported URL query parameter: {name}")),
+            _ => unreachable!("unsupported query parameters are rejected before value parsing"),
         }
     }
 
@@ -371,11 +395,23 @@ fn parse_file_url(
     if input.len() < "file://".len() {
         return Err(format!("invalid file URL: {input}"));
     }
-    let mut path = &input["file://".len()..];
-    if path.starts_with("localhost/") {
-        path = &path["localhost".len()..];
-    }
+    let path = strip_localhost_file_authority(&input["file://".len()..]);
     normalized_file_url(path, timeout_conn, timeout_idle, env)
+}
+
+fn strip_localhost_file_authority(path: &str) -> &str {
+    const LOCALHOST: &str = "localhost";
+
+    if path.eq_ignore_ascii_case("localhost") {
+        ""
+    } else if path.len() > LOCALHOST.len()
+        && path[..LOCALHOST.len()].eq_ignore_ascii_case(LOCALHOST)
+        && path.as_bytes()[LOCALHOST.len()] == b'/'
+    {
+        &path[LOCALHOST.len()..]
+    } else {
+        path
+    }
 }
 
 fn parse_bare_file_url(
@@ -397,9 +433,13 @@ fn normalized_file_url(
         return Err("file URL path is empty".to_string());
     }
     let decoded = percent_decode_unreserved(input_path);
-    let local_path = strip_file_url_drive_prefix(&decoded);
+    let collapsed_input = collapse_slashes(&decoded);
+    let local_path = strip_file_url_drive_prefix(&collapsed_input);
     let collapsed = collapse_slashes(local_path);
     let trimmed = trim_trailing_slash(&collapsed);
+    if trimmed.is_empty() {
+        return Err("file URL path is empty".to_string());
+    }
     let absolute = absolute_local_path(&env.current_dir, trimmed);
     let path = normalize_file_identity_path(&absolute.to_string_lossy().replace('\\', "/"));
     let identity = format!("file://{path}");
@@ -522,11 +562,11 @@ fn parse_sftp_url(
                     return Err(format!("invalid SFTP userinfo: {input}"));
                 }
                 (
-                    Some(percent_decode_userinfo(user)),
-                    Some(percent_decode_userinfo(password)),
+                    Some(percent_decode_unreserved(user)),
+                    Some(percent_decode_unreserved(password)),
                 )
             }
-            None => (Some(percent_decode_userinfo(value)), None),
+            None => (Some(percent_decode_unreserved(value)), None),
         },
         None => (Some(env.current_user.clone()), None),
     };
@@ -536,6 +576,9 @@ fn parse_sftp_url(
     let decoded_path = percent_decode_unreserved(raw_path);
     let collapsed_path = collapse_slashes(&decoded_path);
     let path = trim_trailing_slash(&collapsed_path).to_string();
+    if !path.starts_with('/') {
+        return Err(format!("SFTP URL requires an absolute path: {input}"));
+    }
     let identity_port = port
         .filter(|port| *port != 22)
         .map(|port| format!(":{port}"))
@@ -619,12 +662,6 @@ fn is_windows_drive_root(path: &str) -> bool {
 fn percent_decode_unreserved(input: &str) -> String {
     percent_decode_with(input, |byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-    })
-}
-
-fn percent_decode_userinfo(input: &str) -> String {
-    percent_decode_with(input, |byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'@' | b':')
     })
 }
 

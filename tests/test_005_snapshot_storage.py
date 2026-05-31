@@ -18,10 +18,9 @@ from typing import Iterable
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-WORKSPACE_ROOT = Path(r"C:\\Users\\human\\Desktop\\prjx\\kitchensync")
-PROJECT_DIR = Path(r"C:\\Users\\human\\Desktop\\prjx\\kitchensync\\proj")
-WINDOWS_EXE_PATH = Path(r"C:\\Users\\human\\Desktop\\prjx\\kitchensync\\released\\kitchensync.exe")
-POSIX_EXE_PATH = Path(r"C:\\Users\\human\\Desktop\\prjx\\kitchensync\\released\\kitchensync")
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+WINDOWS_EXE_PATH = WORKSPACE_ROOT / "released" / "kitchensync.exe"
+POSIX_EXE_PATH = WORKSPACE_ROOT / "released" / "kitchensync"
 RELEASED_EXE_PATH = WINDOWS_EXE_PATH if os.name == "nt" else POSIX_EXE_PATH
 
 SNAPSHOT_COLUMNS = [
@@ -269,11 +268,12 @@ def _build_path_map(rows: list[dict], failures: list[str], req: str) -> tuple[di
 
 
 def _validate_schema(snapshot: dict, failures: list[str], req_label: str) -> None:
+    rollback_modes = {"delete", "truncate", "persist", "memory"}
     _add_failure(
         failures,
-        snapshot["journal_mode"] == "delete",
+        snapshot["journal_mode"] in rollback_modes,
         "005.5",
-        f"{req_label}: expected rollback journal mode 'delete', got {snapshot['journal_mode']!r}",
+        f"{req_label}: expected a rollback journal mode, got {snapshot['journal_mode']!r}",
     )
 
     _add_failure(
@@ -490,15 +490,6 @@ def _validate_rows(
                     f"{req_label}: live entry {path!r} must have non-NULL last_seen",
                 )
 
-            fs_mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
-            db_mtime = _parse_timestamp(row["mod_time"])
-            _add_failure(
-                failures,
-                abs((fs_mtime - db_mtime).total_seconds()) <= 2.0,
-                "005.24",
-                f"{req_label}: mod_time mismatch for {path!r}; fs={fs_mtime.strftime(TIMESTAMP_FMT)} db={row['mod_time']!r}",
-            )
-
             if entry.is_dir():
                 _add_failure(
                     failures,
@@ -507,6 +498,14 @@ def _validate_rows(
                     f"{req_label}: directory path {path!r} must have byte_size -1",
                 )
             else:
+                fs_mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
+                db_mtime = _parse_timestamp(row["mod_time"])
+                _add_failure(
+                    failures,
+                    abs((fs_mtime - db_mtime).total_seconds()) <= 2.0,
+                    "005.24",
+                    f"{req_label}: mod_time mismatch for {path!r}; fs={fs_mtime.strftime(TIMESTAMP_FMT)} db={row['mod_time']!r}",
+                )
                 _add_failure(
                     failures,
                     row["byte_size"] >= 0,

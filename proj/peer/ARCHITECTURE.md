@@ -103,24 +103,29 @@ The main connection flow is:
 
 The role-resolution flow is separate:
 
-1. Receive pending sessions and snapshot-existence results keyed by peer id or
-   normalized peer identity from startup snapshot loading.
-2. Treat snapshot existence as true only when `.kitchensync/snapshot.db` existed
+1. Receive the post-snapshot-loading pending session set and
+   snapshot-existence results for those peers from startup snapshot loading.
+   This set is authoritative; callers must remove any peer whose snapshot
+   recovery or download failed before role resolution.
+2. Before assigning effective roles, reapply the startup reachability checks to
+   that authoritative set: fail if fewer than two peers remain reachable or if
+   the declared canon peer is no longer present.
+3. Treat snapshot existence as true only when `.kitchensync/snapshot.db` existed
    on that peer after normal-mode snapshot SWAP recovery and before local empty
    snapshot creation.
-3. Resolve effective roles:
+4. Resolve effective roles:
    - a declared canon peer is contributing and authoritative even without a
      snapshot;
    - a declared subordinate peer is subordinate;
    - a reachable non-canon peer without snapshot history is automatically
      subordinate for this run;
    - a reachable normal peer with snapshot history is contributing.
-4. If no reachable peer has snapshot data and no canon peer is declared, return
+5. If no reachable peer has snapshot data and no canon peer is declared, return
    the exact startup failure `First sync? Mark the authoritative peer with a
    leading +`.
-5. If no contributing peer remains, return the exact startup failure
+6. If no contributing peer remains, return the exact startup failure
    `No contributing peer reachable - cannot make sync decisions`.
-6. Return final `PeerSession` values in invocation order, including subordinate
+7. Return final `PeerSession` values in invocation order, including subordinate
    peers.
 
 ## Dependencies

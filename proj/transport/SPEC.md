@@ -10,19 +10,19 @@ The transport module is responsible for observable parity between local filesyst
 
 - Provide a `TransportFactory` or equivalent constructor surface for the peer module to obtain a connected `TransportHandle` for a selected `file://` or `sftp://` URL, using the requested peer-root construction mode.
 - During connection construction, require the selected peer root to exist or create the missing root and parents according to the `TransportRootMode` chosen by `peer`.
-- Treat a connected handle as rooted at the selected peer root. All operation paths are root-relative `RelPath` values or module-internal metadata paths derived from them.
+- Treat a connected handle as rooted at the selected peer root for its whole lifetime. All public operation paths are root-relative `RelPath` values, including `.kitchensync/` metadata paths supplied by snapshot or operations code; transport path conversion must not reinterpret them as absolute paths or allow access outside the selected root.
 - Implement `list_dir(path)` for immediate children only. Each returned child must include the reported name, entry kind, modification time, and byte size. Regular files report their byte size in bytes; directories report byte size `-1`.
 - Omit symbolic links, devices, FIFOs, sockets, and other non-regular entry types from `list_dir` results. The omission is silent and must be consistent across local and SFTP transports.
 - Implement `stat(path)` for existing regular files and directories, returning modification time, byte size, and entry kind. Missing paths, symbolic links, special files, and other non-regular entry types must return `TransportError::not_found`.
-- Implement streaming reads with `open_read(path)`, chunk reads, EOF reporting, and `close_read(handle)`. The module must not require callers to buffer an entire file before bytes can be read.
-- Implement streaming writes with `open_write(path)`, chunk writes, and `close_write(handle)`. Opening a write must create the destination file and any missing parent directories needed for that file. Closing a write must flush/finalize the file so the written bytes are visible at the target path.
+- Implement streaming reads with `open_read(path)`, chunk reads, EOF reporting, and `close_read(handle)`. The module must not require callers to buffer an entire file before bytes can be read. Closing or dropping a read stream must release the backing local or SFTP file resource.
+- Implement streaming writes with `open_write(path)`, chunk writes, and `close_write(handle)`. Opening a write must create or truncate the destination file and create any missing parent directories needed for that file. Closing a write must flush/finalize the file so the written bytes are visible at the target path, and any finalization failure must be reported as `TransportError` instead of being hidden behind drop behavior.
 - Implement `rename(src, dst)` as a same-filesystem move that succeeds only when `dst` does not already exist. If a host API would overwrite by default, the transport implementation must prevent overwrite and report a normalized error instead.
 - Implement `delete_file(path)` for regular files, `create_dir(path)` for a directory plus any missing parents, and `delete_dir(path)` for an empty directory.
 - Implement `set_mod_time(path, time)` for files and directories using the shared `Timestamp` value supplied by callers.
 - Preserve filename spelling and case exactly as the filesystem reports it. The transport module must not fold case, normalize names for decision-making, or hide case collisions.
 - Apply SFTP connection timeout and idle keep-alive settings supplied by the peer module when constructing SFTP handles. SFTP connection drops, channel failures, and timeouts after connection must surface as `TransportError::io_error`.
 - Map local OS errors and SFTP protocol/library errors into only the root categories `not_found`, `permission_denied`, or `io_error`. Callers outside this module must never need to match on platform error codes, SSH errors, SFTP status codes, or library-specific variants.
-- Close or release transport read/write/session resources when handles are closed or dropped, without requiring sync, snapshot, operations, or runtime code to know scheme-specific cleanup details.
+- Close or release transport session resources when handles are closed or dropped, without requiring sync, snapshot, operations, or runtime code to know scheme-specific cleanup details. Dropping a write stream may release backend resources, but callers must have an explicit close/finalize path for failures that affect correctness.
 
 ## Boundaries
 

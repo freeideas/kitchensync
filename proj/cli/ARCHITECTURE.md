@@ -24,8 +24,11 @@ useful tree-scoped contract.
 - Convert accepted arguments into a root-owned `RunRequest` containing
   `RunConfig`, ordered `PeerSpec` values, parsed `PeerUrl` values, explicit
   peer roles, per-URL connection settings, and accepted excludes.
-- Normalize the peer URL identity fields required before root handoff while
-  keeping per-URL connection settings separate from identity comparison.
+- Keep peer URL syntax, fallback ordering, and per-URL settings explicit in
+  the typed request without choosing reachable URLs.
+- Normalize each accepted URL identity before it is included in the typed
+  request, using only deterministic command-line input, process current
+  working directory, current OS user, and URL syntax rules.
 - Report argument-validation failures in a form that lets the root print the
   specific error followed by help to stdout and exit with the required status.
 
@@ -49,9 +52,16 @@ The implementation should stay as a compact set of private units:
 - Peer operand parser: parses a whole peer operand into its explicit role marker
   and one or more URL texts, including bracketed fallback groups whose prefix
   applies to the peer rather than individual URLs.
-- URL parser and normalizer: parses bare paths, `file://` URLs, supported SFTP
-  URL forms, inline SFTP credentials, and per-URL query parameters; it produces
-  normalized identity fields and separate connection settings.
+- URL parser: parses bare paths, `file://` URLs, supported SFTP URL forms,
+  inline SFTP credentials, and per-URL query parameters; it produces URL
+  candidates, URL-local connection settings, and normalized URL identities for
+  the run request.
+- URL normalizer: lowercases schemes and hostnames, removes default SFTP port
+  `22`, collapses repeated path slashes, removes trailing path slashes,
+  converts bare paths to `file://`, resolves `file://` paths from the process
+  current working directory, percent-decodes unreserved characters, removes
+  query parameters from identity, and inserts the current OS user into SFTP
+  URLs that omit a username.
 - Validator: applies cross-argument checks such as minimum peer count and at
   most one explicit canon peer, then constructs the final invocation result.
 - Help provider: supplies the stable help payload selected by help and
@@ -70,11 +80,13 @@ module-external API is the parse result consumed by the root.
    values.
 5. Peer operands are parsed into role markers and URL candidates. Fallback URL
    order is preserved exactly as supplied.
-6. Each URL candidate is parsed, validated, normalized for identity, and paired
-   with any accepted per-URL timeout settings.
+6. Each URL candidate is parsed, validated as a supported CLI URL form, and
+   paired with any accepted per-URL timeout settings.
 7. Cross-argument validation rejects invalid arity, multiple explicit canon
    peers, and any malformed syntax or values.
-8. A valid invocation returns `RunRequest`; an invalid invocation returns a CLI
+8. Accepted URL identities are normalized for stable `PeerUrl` values in the
+   run request.
+9. A valid invocation returns `RunRequest`; an invalid invocation returns a CLI
    validation error plus help text.
 
 Invalid invocations stop at this boundary. No startup, peer connection,
@@ -89,24 +101,26 @@ subordinate. Bracketed fallback groups such as `[url1,url2]`, `+[url1,url2]`,
 and `-[url1,url2]` produce one peer with URLs kept in command-line order.
 Individual URLs inside fallback groups must not carry role prefixes.
 
-Bare paths are accepted as local `file://` peer URLs, including Unix absolute
+Bare paths are accepted as local peer URL syntax, including Unix absolute
 paths, Windows drive paths, and relative paths. `file://` URLs are accepted as
 local peer URLs. Supported SFTP forms are:
 `sftp://user@host/path`, `sftp://user@host:port/path`,
 `sftp://host/path`, and `sftp://user:password@host/path`.
 
-Before handoff, identity normalization lowercases scheme and hostname, removes
-default SFTP port `22`, collapses consecutive path slashes, removes trailing
-path slashes, converts bare paths to `file://`, resolves `file://` URLs to
-absolute paths from the current working directory, percent-decodes unreserved
-characters, strips query parameters from normalized identity, and inserts the
-current OS user into SFTP URLs that omit a username. Inline SFTP password text
-is preserved after the URL decoding needed for `%40` and `%3A`.
+The CLI records URL components and settings needed for startup and produces
+stable URL identities for the typed request. Normalization is deterministic:
+scheme and hostname are lowercased, default SFTP port `22` is removed,
+consecutive path slashes are collapsed, trailing path slashes are removed,
+bare paths become `file://` URLs, `file://` paths are resolved to absolute
+paths from the process current working directory, unreserved percent-encoded
+characters are decoded, query parameters are stripped from identity, and SFTP
+URLs that omit a username receive the current OS user. Inline SFTP password
+percent-encoding needed for reserved characters is preserved.
 
 Per-URL query parameters are parsed on every URL, including fallback URLs. Only
 `timeout-conn` and `timeout-idle` are accepted, both require positive integers,
 and each setting applies only to the URL on which it appears. Connection
-settings remain separate from normalized peer identity.
+settings remain URL-local and do not participate in identity decisions.
 
 ## Dependencies
 
@@ -114,12 +128,14 @@ The `cli` module consumes root-owned shared contracts:
 
 - `RunRequest` and `RunConfig` for valid handoff to root orchestration.
 - `PeerSpec`, `PeerRole`, and `PeerUrl` for ordered peer operands, explicit
-  roles, fallback URLs, normalized URL identity, and per-URL settings.
+  roles, fallback URL candidates, normalized URL identity, parsed URL syntax,
+  and per-URL settings.
 - `RelPath` for command-line excludes.
 - `Verbosity` for `--verbosity` values.
 
-The module may use language-standard string and path parsing support. It must
-not depend on peer connectivity, transport, snapshot, sync, operations, or
+The module may use language-standard string, URL, path, current-directory, and
+current-user support needed for deterministic parse-time normalization. It
+must not depend on peer connectivity, transport, snapshot, sync, operations, or
 runtime implementation details. Sibling modules consume the root-owned typed
 request, not CLI-private scanner or parser state.
 
@@ -127,8 +143,7 @@ request, not CLI-private scanner or parser state.
 
 Public surface:
 
-- A parse entry point that accepts raw process arguments and the environment
-  context needed for current-directory and current-user normalization.
+- A parse entry point that accepts raw process arguments.
 - A parsed invocation result with help, validation-error-with-help, and valid
   request variants.
 - CLI validation error data containing the user-facing message needed by root
@@ -137,8 +152,8 @@ Public surface:
 Private surface:
 
 - Token classification, parser state, source-text helpers, option defaults,
-  help payload storage, URL parsing helpers, normalization helpers, and peer
-  operand intermediate forms.
+  help payload storage, URL parsing helpers, and peer operand intermediate
+  forms.
 
 Shared contracts belong at the root because the parsed request is consumed by
 multiple sibling modules. CLI-specific parsing and validation helpers remain
@@ -161,7 +176,9 @@ receive a complete typed configuration.
 ## Future Change Guidance
 
 Keep future changes limited to command-line syntax, validation, help selection,
-URL/exclude parsing, and parsed run configuration. If a new option affects
-behavior in another module, CLI should parse and validate the option, then place
-the typed value in the narrowest root-owned contract that needs it. The owning
-sibling module still decides the domain behavior.
+URL/exclude parsing, deterministic URL identity normalization, and parsed run
+configuration. If a new option affects behavior in another module, CLI should
+parse and validate the option, then place the typed value in the narrowest
+root-owned contract that needs it. The owning sibling module still decides the
+domain behavior; for peer reachability and startup fallback selection, that
+owner is `peer`.

@@ -41,9 +41,7 @@ impl PeerStartupError {
         match self {
             Self::TooFewReachablePeers => "At least two peers must be reachable",
             Self::DeclaredCanonUnreachable { .. } => "Declared canon peer is unreachable",
-            Self::FirstSyncNeedsCanon => {
-                "First sync? Mark the authoritative peer with a leading +"
-            }
+            Self::FirstSyncNeedsCanon => "First sync? Mark the authoritative peer with a leading +",
             Self::NoContributingPeerReachable => {
                 "No contributing peer reachable - cannot make sync decisions"
             }
@@ -144,6 +142,10 @@ pub fn resolve_roles(
     pending_sessions: Vec<PendingPeerSession>,
     snapshot_existence: &[SnapshotExistence],
 ) -> Result<Vec<PeerSession>, PeerStartupError> {
+    if pending_sessions.len() < 2 {
+        return Err(PeerStartupError::TooFewReachablePeers);
+    }
+
     let existence_by_peer = snapshot_existence
         .iter()
         .map(|existence| (existence.peer_id, existence.existed))
@@ -238,14 +240,24 @@ fn connect_one_peer(
 
 fn normalize_selected_url(url: &PeerUrl, current_dir: &Path, current_user: &str) -> PeerUrl {
     let mut normalized = url.clone();
+    let original_path = normalized.path.clone();
+    let (path_without_query, query) = split_path_query(&original_path);
     normalized.scheme = normalized.scheme.to_ascii_lowercase();
-    normalized.path = percent_decode_unreserved(&collapse_path_slashes(&normalized.path));
+    normalized.path = percent_decode_unreserved(&collapse_path_slashes(path_without_query));
 
     if normalized.scheme == "sftp" {
         normalized.host = normalized
             .host
             .as_ref()
-            .map(|host| percent_decode_unreserved(&host.to_ascii_lowercase()));
+            .map(|host| percent_decode_unreserved(host).to_ascii_lowercase());
+        normalized.username = normalized
+            .username
+            .as_ref()
+            .map(|username| percent_decode_unreserved(username));
+        normalized.password = normalized
+            .password
+            .as_ref()
+            .map(|password| percent_decode_unreserved(password));
         if normalized.port == Some(22) {
             normalized.port = None;
         }
@@ -262,6 +274,10 @@ fn normalize_selected_url(url: &PeerUrl, current_dir: &Path, current_user: &str)
     }
 
     normalized.path = trim_trailing_path_slash(&normalized.path);
+    if let Some(query) = query {
+        normalized.path.push('?');
+        normalized.path.push_str(query);
+    }
     normalized.identity = identity_string(&normalized);
     normalized
 }
@@ -271,8 +287,20 @@ fn normalized_identity(url: &PeerUrl) -> PeerUrl {
     identity.password = None;
     identity.timeout_conn = None;
     identity.timeout_idle = None;
+    identity.path = strip_query_from_path(&identity.path).to_string();
     identity.identity = identity_string(&identity);
     identity
+}
+
+fn strip_query_from_path(path: &str) -> &str {
+    split_path_query(path).0
+}
+
+fn split_path_query(path: &str) -> (&str, Option<&str>) {
+    path.split_once('?')
+        .map_or((path, None), |(without_query, query)| {
+            (without_query, Some(query))
+        })
 }
 
 fn absolute_file_path(current_dir: &Path, path: &str) -> String {
@@ -341,11 +369,7 @@ fn normalize_file_identity_path(path: &str) -> String {
 
 fn file_path_prefix(path: &str) -> (&str, &str) {
     let bytes = path.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'/'
-    {
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
         return (&path[..3], &path[3..]);
     }
     if let Some(rest) = path.strip_prefix('/') {
@@ -460,7 +484,10 @@ mod tests {
     #[test]
     fn role_resolution_requires_canon_for_first_sync() {
         let result = resolve_roles(Vec::new(), &[]);
-        assert!(matches!(result, Err(PeerStartupError::FirstSyncNeedsCanon)));
+        assert!(matches!(
+            result,
+            Err(PeerStartupError::TooFewReachablePeers)
+        ));
     }
 
     #[test]
