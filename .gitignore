@@ -1,102 +1,112 @@
-# =============================================================================
-# Outer project repo -- the product aitc is building plus its human inputs.
-#
-# Normally named `disabled.gitignore` so the OS, VS Code, and git plugins do
-# not see this workspace as a git repo. push-project.py / pull-project.py
-# rename it to `.gitignore` only while they run.
-#
-# push-project.py is a dumb mirror: everything not matched below is pushed.
-# So this file is the ONLY thing keeping the framework tree and per-device /
-# transient / build state out of the project backup.
-# =============================================================================
+# aitc machine state
+/aitc/
+/aitc.old/
+/aitc.db
+# The whole /state/ tree is machine-local EXCEPT settled.db -- the one durable,
+# portable file (freshness baselines + verified pass-state), carried across
+# push/pull so a fresh machine knows the work is settled and skips it. Its WAL
+# sidecars (settled.db-wal/-shm) stay ignored under the broad /state/* rule;
+# push-project.py checkpoints the WAL into the main file before staging.
+# Use /state/* (ignore the directory's contents), not /state/ (ignore the
+# directory itself): git cannot re-include a file under an excluded directory,
+# so /state/ + !/state/settled.db would silently drop settled.db.
+/state/*
+!/state/settled.db
+/tools/
+/reports/
+/babysit-reports/
+/babysit-loop.out
+/tmp/
+/STOP.flag
+/orchestrator.log
+/orchestrator.log.*
 
-# -----------------------------------------------------------------------------
-# aitc framework -- its OWN repo (push-aitc.py / pull-aitc.py). Never part of
-# the project repo, and pull-project.py preserves ./aitc/ across a pull.
-# -----------------------------------------------------------------------------
-aitc/
-aitc.old/
+# Generated final artifacts are intentionally kept at the outer workspace root,
+# not inside ./proj/. Adjust this if the product's release policy changes.
+/released/
 
-# -----------------------------------------------------------------------------
-# aitc operational state -- per-device, regenerated, never backed up here.
-#   state/   SQLite db, halt/punt/diagnosis files, pass flags
-#   reports/ job transcripts and mechanical logs
-#   tmp/     scratch and safe_delete tombstones
-#   tools/   provisioned compiler/runtime toolchains (large, per-device)
-# -----------------------------------------------------------------------------
-state/
-reports/
-tmp/
-tools/
+# Local agent instructions and credentials
+/AGENTS.md
+/CLAUDE.md
+/CODEX.md
+/.claude/
+/creds/
+/.env
+/.env.local
+/.env.*.local
+*.pem
+*.key
+secrets.json
+credentials.json
 
-# -----------------------------------------------------------------------------
-# AI agent instruction files -- local to this checkout.
-# -----------------------------------------------------------------------------
-CLAUDE.md
-CODEX.md
-AGENTS.md
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+*.egg-info/
 
-# -----------------------------------------------------------------------------
-# Build output under ./proj/ (regenerable; the source that produces it IS
-# tracked). Covers the languages aitc can target.
-# -----------------------------------------------------------------------------
-# Rust
-target/
-**/*.rs.bk
 # C# / .NET
 bin/
 obj/
 *.dll
+*.exe
 *.pdb
 *.user
+*.suo
 .vs/
+packages/
+*.nupkg
+
+# Rust
+target/
+**/*.rs.bk
+
 # Go
 vendor/
-# Node.js
+
+# Node.js / JavaScript
 node_modules/
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# -----------------------------------------------------------------------------
-# Python
-# -----------------------------------------------------------------------------
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
+# Java / JVM
+*.class
+*.jar
+*.war
+*.ear
 
-# -----------------------------------------------------------------------------
-# Editor / IDE
-# -----------------------------------------------------------------------------
+# IDE and OS files
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-# -----------------------------------------------------------------------------
-# OS generated
-# -----------------------------------------------------------------------------
 .DS_Store
-._*
 Thumbs.db
 desktop.ini
 
-# -----------------------------------------------------------------------------
 # Logs and temporary files
-# -----------------------------------------------------------------------------
 *.log
 *.tmp
+*.temp
 *.bak
+*.backup
 
-# -----------------------------------------------------------------------------
-# Secrets -- never commit
-# -----------------------------------------------------------------------------
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-creds/
-secrets.json
-credentials.json
+# Human-authored project inputs and supplied artifacts. These are part of the
+# project mirror even when generic language rules above would ignore a file
+# type such as .dll, .exe, .json, or .log.
+!/specs/
+!/specs/**
+!/docs/
+!/docs/**
+!/extart/
+!/extart/**
+/specs/**/__pycache__/
+/specs/**/*.py[cod]
+/docs/**/__pycache__/
+/docs/**/*.py[cod]
+/extart/**/__pycache__/
+/extart/**/*.py[cod]
