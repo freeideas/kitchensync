@@ -87,8 +87,6 @@ directory level must be issued concurrently, not sequentially. The
 implementation starts listing operations for every reachable peer at that
 directory level before awaiting any listing result.
 
-The currently scanned directory is tracked for the live terminal status screen.
-
 ## Copy Queue Tries
 
 Queued file-copy work carries its own try count. The queue implementation is
@@ -105,36 +103,29 @@ and is not requeued.
 Try limits are global behavior. They apply the same way to local copies, SFTP
 copies, and mixed-scheme copies.
 
-## Live Terminal Status
+## Progress Output
 
-During sync execution, KitchenSync displays a live text status screen similar
-to package installers and updaters on Linux. The display may use horizontal
-bars, percentages, counts, and concise labels.
+During sync execution, KitchenSync emits one plain line per action to stdout, in
+the order the actions happen. There is no live status screen, progress bar,
+percentage, scanned-directory indicator, or terminal control sequence. Output is
+identical whether or not stdout is a terminal.
 
-The screen must update at most once per second. Faster internal events are
-coalesced into the next refresh.
+Each line is an action letter, a single space, then the slash-separated relative
+path from the sync root:
 
-At any moment, the screen shows one row for each active file copy, up to the
-configured `--max-copies` limit. Each active-copy row starts with the basename of the
-file being copied, not the full path. After the basename, show a horizontal
-progress bar that grows toward completion as bytes are copied. When the file is
-fully copied, its bar reaches the end before the row disappears or is replaced
-by another active copy.
+```text
+C path/to/file.ext
+X path/to/file.ext
+```
 
-The bottom line of the screen is always the directory currently being scanned.
-For the root directory, display `Scanning: .`. For other directories, display
-the full slash-separated relative directory path from the sync root.
+- `C <relpath>` - the file is being copied from one peer to one or more other
+  peers. One line per path, regardless of how many peers receive it.
+- `X <relpath>` - the path is being deleted (displaced to BAK/) on one or more
+  peers. One line per path. Files and directories use the same letter.
 
-The live screen may also show completed and failed copy counts, plus an overall
-percentage when a meaningful denominator is known. These summaries must not
-displace the active-copy rows or the bottom scanning line.
-
-When stdout is not an interactive terminal, KitchenSync must not emit terminal
-control sequences. In that mode, it emits plain line-oriented progress at no
-more than once per second, with the same information in a readable form.
-
-Errors and final completion messages must remain visible after the live screen
-finishes.
+No line is emitted for directory creation, listing, snapshot work, or BAK/TMP
+cleanup. These lines are `info`-level. Errors and the final completion message
+are separate output and remain visible.
 
 ## Trace Logging
 

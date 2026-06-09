@@ -1,0 +1,15 @@
+[package]
+name = "syncengine"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"copyqueue" = { path = "../CopyQueue" }
+"output" = { path = "../Output" }
+"snapshot" = { path = "../Snapshot" }
+"transport" = { path = "../Transport" }
+"syncengine_decisionrules" = { path = "subpjx/DecisionRules" }
+"syncengine_displacement" = { path = "subpjx/Displacement" }

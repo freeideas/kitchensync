@@ -21,6 +21,17 @@ Tests observe the process exit code, stdout, stderr, and filesystem changes
 under the peer directories they create. All diagnostics and progress output go
 to stdout; stderr remains empty.
 
+### Released artifacts
+
+The build writes its shipped artifact under `./released/`. `./released/`
+contains exactly one file:
+
+- `released/kitchensync.exe` - the CLI executable described above. The `.exe`
+  suffix is used on every platform, including Linux and macOS where it is not
+  conventional.
+
+The build produces this file and tests invoke it directly from `./released/`.
+
 ## Why KitchenSync?
 
 **Concurrent by design.** Peers are listed in parallel, decisions are made once,

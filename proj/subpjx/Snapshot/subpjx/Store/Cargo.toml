@@ -1,0 +1,12 @@
+[package]
+name = "snapshot_store"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"snapshot_clock" = { path = "../Clock" }
+"snapshot_identity" = { path = "../Identity" }
+"rusqlite" = "0.31"

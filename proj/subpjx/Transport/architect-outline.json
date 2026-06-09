@@ -1,0 +1,103 @@
+{
+  "decision": "split",
+  "architecture_notes": [
+    "Facade plus backend adapters: the parent keeps the uniform trait, picks a peer's winning URL across primary and fallbacks, applies the dry-run reachability rule, and delegates each connect and filesystem operation to the per-scheme backend that owns it.",
+    "LocalBackend and SftpBackend implement the same operation set for their scheme, so the shared operation line-items (022.2 through 022.18) are assigned to both; the identical-results invariants 022.1 and 022.19 stay a parent integration concern.",
+    "UrlNormalize is a pure, transport-free string and path transform with no dependency on the backends."
+  ],
+  "children": [
+    {
+      "name": "UrlNormalize",
+      "responsibility": "Turn a peer URL into its deterministic canonical identity: lowercase scheme and host, drop default SFTP port 22, collapse and trim slashes, convert a bare path to an absolute file:// URL, percent-decode unreserved characters, strip the query string, and insert the current OS user for an SFTP URL that omits one.",
+      "reqs": [
+        "003.1",
+        "003.2",
+        "003.3",
+        "003.4",
+        "003.5",
+        "003.6",
+        "003.7",
+        "003.8",
+        "003.9",
+        "003.10",
+        "003.11",
+        "003.12",
+        "003.13",
+        "003.14",
+        "003.15",
+        "003.16"
+      ]
+    },
+    {
+      "name": "LocalBackend",
+      "responsibility": "Implement the uniform filesystem operation set over a local file:// peer, create its root and parents in a normal run while honoring the dry-run no-create rule, and map native errors into the not-found, permission-denied, and I/O-error categories.",
+      "reqs": [
+        "005.9",
+        "005.11",
+        "005.12",
+        "005.13",
+        "005.14",
+        "024.11",
+        "022.2",
+        "022.3",
+        "022.4",
+        "022.5",
+        "022.6",
+        "022.7",
+        "022.8",
+        "022.9",
+        "022.10",
+        "022.11",
+        "022.12",
+        "022.13",
+        "022.14",
+        "022.15",
+        "022.16",
+        "022.17",
+        "022.18"
+      ]
+    },
+    {
+      "name": "SftpBackend",
+      "responsibility": "Connect an sftp:// peer by trying credential sources in the fixed order, verifying the host key against known_hosts, and bounding the handshake by the connection timeout, then implement the same filesystem operation set over that connection with the same error categories and dry-run-aware root handling.",
+      "reqs": [
+        "004.1",
+        "004.2",
+        "004.3",
+        "004.4",
+        "004.5",
+        "004.6",
+        "004.7",
+        "004.8",
+        "004.9",
+        "004.10",
+        "005.6",
+        "005.7",
+        "005.8",
+        "005.10",
+        "005.11",
+        "005.12",
+        "005.13",
+        "005.14",
+        "024.11",
+        "022.2",
+        "022.3",
+        "022.4",
+        "022.5",
+        "022.6",
+        "022.7",
+        "022.8",
+        "022.9",
+        "022.10",
+        "022.11",
+        "022.12",
+        "022.13",
+        "022.14",
+        "022.15",
+        "022.16",
+        "022.17",
+        "022.18"
+      ]
+    }
+  ]
+}

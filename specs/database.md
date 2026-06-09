@@ -18,6 +18,15 @@ existing `dst`. If the upload fails after `old` exists, the SWAP state is left
 behind and recovered on the next normal run. If a peer has no existing
 `snapshot.db`, a new one is created locally.
 
+Before uploading a local temporary `snapshot.db` to any peer, KitchenSync must
+finish all database work against that file: every transaction is committed or
+rolled back, every statement/cursor/reader is finalized, and every database
+connection to that local file is closed. The upload reads only the closed
+`snapshot.db` file. It must not read from a database file that still has an open
+writer, pending transaction, unfinalized statement, or unresolved SQLite sidecar
+state. Because only `snapshot.db` is uploaded, the local copy must be left in a
+self-contained rollback-journal-mode state before transport upload begins.
+
 Snapshot SWAP recovery:
 
 - `old` exists and `snapshot.db` exists: delete `new` if present, then delete

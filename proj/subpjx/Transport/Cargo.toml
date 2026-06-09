@@ -1,0 +1,12 @@
+[package]
+name = "transport"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"transport_localbackend" = { path = "subpjx/LocalBackend" }
+"transport_sftpbackend" = { path = "subpjx/SftpBackend" }
+"transport_urlnormalize" = { path = "subpjx/UrlNormalize" }

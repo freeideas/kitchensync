@@ -1,0 +1,34 @@
+[package]
+name = "aitc_root"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "aitc_root"
+path = "src/main.rs"
+
+[dependencies]
+"cli" = { path = "subpjx/Cli" }
+"copyqueue" = { path = "subpjx/CopyQueue" }
+"copyqueue_copyscheduler" = { path = "subpjx/CopyQueue/subpjx/CopyScheduler" }
+"copyqueue_stagingcleanup" = { path = "subpjx/CopyQueue/subpjx/StagingCleanup" }
+"copyqueue_swaptransfer" = { path = "subpjx/CopyQueue/subpjx/SwapTransfer" }
+"output" = { path = "subpjx/Output" }
+"runcontroller" = { path = "subpjx/RunController" }
+"snapshot" = { path = "subpjx/Snapshot" }
+"snapshot_clock" = { path = "subpjx/Snapshot/subpjx/Clock" }
+"snapshot_identity" = { path = "subpjx/Snapshot/subpjx/Identity" }
+"snapshot_store" = { path = "subpjx/Snapshot/subpjx/Store" }
+"snapshot_transfer" = { path = "subpjx/Snapshot/subpjx/Transfer" }
+"syncengine" = { path = "subpjx/SyncEngine" }
+"syncengine_decisionrules" = { path = "subpjx/SyncEngine/subpjx/DecisionRules" }
+"syncengine_displacement" = { path = "subpjx/SyncEngine/subpjx/Displacement" }
+"transport" = { path = "subpjx/Transport" }
+"transport_localbackend" = { path = "subpjx/Transport/subpjx/LocalBackend" }
+"transport_sftpbackend" = { path = "subpjx/Transport/subpjx/SftpBackend" }
+"transport_urlnormalize" = { path = "subpjx/Transport/subpjx/UrlNormalize" }
+
+[workspace]
+resolver = "2"
+exclude = ["subpjx"]
+

@@ -1,0 +1,14 @@
+[package]
+name = "copyqueue"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"transport" = { path = "../Transport" }
+"output" = { path = "../Output" }
+"copyqueue_copyscheduler" = { path = "subpjx/CopyScheduler" }
+"copyqueue_stagingcleanup" = { path = "subpjx/StagingCleanup" }
+"copyqueue_swaptransfer" = { path = "subpjx/SwapTransfer" }

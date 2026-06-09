@@ -1,0 +1,15 @@
+[package]
+name = "runcontroller"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"cli" = { path = "../Cli" }
+"transport" = { path = "../Transport" }
+"snapshot" = { path = "../Snapshot" }
+"syncengine" = { path = "../SyncEngine" }
+"copyqueue" = { path = "../CopyQueue" }
+"output" = { path = "../Output" }

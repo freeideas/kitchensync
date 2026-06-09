@@ -1,0 +1,27 @@
+{
+  "shared": false,
+  "entry": false,
+  "interface": "src/api.rs",
+  "wiring": "per-dependent",
+  "deps": [
+    ":cli",
+    ":transport",
+    ":snapshot",
+    ":syncengine",
+    ":copyqueue",
+    ":output"
+  ],
+  "reqs": [
+    "006.1",
+    "006.2",
+    "006.3",
+    "006.4",
+    "006.5",
+    "006.6",
+    "006.7",
+    "006.10",
+    "006.11",
+    "007.10",
+    "007.11"
+  ]
+}

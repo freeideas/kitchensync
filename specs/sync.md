@@ -170,8 +170,8 @@ Each queued copy carries its own try count. `--retries-copy` is the maximum numb
 `--dry-run` makes the run as realistic as possible without changing any peer.
 KitchenSync still connects to peers, downloads snapshots to local temp files,
 lists directories, reads source files for queued copies, updates the local temp
-snapshot databases, exercises the copy queue, applies try-limit behavior, and uses
-the same live progress screen.
+snapshot databases, exercises the copy queue, applies try-limit behavior, and
+emits the same `C`/`X` progress lines.
 
 Dry-run copy work acquires copy slots and reads source files, but destination
 write, swap, archive, delete, and mod_time operations are planned only and are
@@ -254,13 +254,11 @@ Each displacement is a `(peer, path)` pair executed inline during the combined-t
 
 All output produced by KitchenSync goes to stdout. stderr must remain empty across argument parsing, sync execution, and shutdown. A user running `2>/dev/null` must never miss diagnostic information; a user running `2>&1` must never see duplicate lines.
 
-During an interactive run, progress is displayed through the live terminal
-status screen described in `concurrency.md`. During a non-interactive run,
-progress is line-oriented and emitted at no more than once per second. In both
-modes, the currently scanned directory is visible; on the live screen it is
-always the bottom line.
+Progress is the per-action `C`/`X` line output described in `concurrency.md`,
+emitted to stdout in the order the actions happen. The same lines are produced
+whether or not stdout is a terminal.
 
-Verbosity levels (`--verbosity`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative - each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in section Errors below, nonfatal diagnostics for skipped peers and recoverable operation failures, and listing errors described in multi-tree-sync.md section Algorithm), `info` (progress screen or line-oriented progress), and `trace` (copy-slot acquire/release events, see concurrency.md section Trace Logging). No debug-specific messages are defined; `--verbosity debug` is observationally identical to `--verbosity info` until debug-only messages are specified.
+Verbosity levels (`--verbosity`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative - each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in section Errors below, nonfatal diagnostics for skipped peers and recoverable operation failures, and listing errors described in multi-tree-sync.md section Algorithm), `info` (the `C`/`X` progress lines, see concurrency.md section Progress Output), and `trace` (copy-slot acquire/release events, see concurrency.md section Trace Logging). No debug-specific messages are defined; `--verbosity debug` is observationally identical to `--verbosity info` until debug-only messages are specified.
 
 Failed file-transfer diagnostics must identify the relative path, the
 destination peer URL, the failed phase, and the transport error category when
