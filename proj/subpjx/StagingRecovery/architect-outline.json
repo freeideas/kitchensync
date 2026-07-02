@@ -6,8 +6,9 @@
   "children": [
     {
       "name": "SwapRecovery",
-      "responsibility": "Recover user-data SWAP directories for one peer and parent directory before live entries are listed.",
+      "responsibility": "Recover user-data SWAP directories before live entries are listed or before a target path is replaced.",
       "reqs": [
+        "017.5",
         "017.6",
         "017.7",
         "017.8",
@@ -25,7 +26,8 @@
         "017.20",
         "017.21",
         "017.22",
-        "017.51"
+        "017.51",
+        "017.52"
       ]
     },
     {
