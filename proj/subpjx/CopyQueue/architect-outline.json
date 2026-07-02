@@ -28,14 +28,14 @@
         "016.18",
         "016.19",
         "016.20",
-        "016.21"
+        "016.21",
+        "016.22"
       ]
     },
     {
       "name": "StagedTransfer",
       "responsibility": "Owns one copy try from SWAP path derivation through streaming, replacement, metadata, archive, cleanup, and phase-specific failure results.",
       "reqs": [
-        "016.22",
         "016.23",
         "016.24",
         "016.25",
@@ -49,11 +49,12 @@
         "016.33",
         "016.34",
         "016.35",
+        "016.36",
+        "016.37",
         "017.1",
         "017.2",
         "017.3",
-        "017.4",
-        "017.5"
+        "017.4"
       ]
     }
   ]
