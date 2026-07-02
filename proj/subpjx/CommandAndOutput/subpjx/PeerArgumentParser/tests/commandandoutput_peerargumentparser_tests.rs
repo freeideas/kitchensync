@@ -192,6 +192,7 @@ fn parses_url_timeout_query_parameters_as_per_url_overrides() {
         "sftp://host/a?timeout-conn=30&timeout-idle=40",
         "sftp://host/b?timeout-conn=50",
         "sftp://host/c?timeout-idle=60",
+        "file:///tmp/kitchensync?timeout-conn=70&timeout-idle=80",
     ]);
 
     assert_eq!(
@@ -215,6 +216,22 @@ fn parses_url_timeout_query_parameters_as_per_url_overrides() {
             timeout_idle_seconds: 60,
         }
     );
+    match &only_target(&peers[3]).location {
+        PeerArgumentLocation::Local(local) => {
+            assert_eq!(
+                local.path_or_url,
+                "file:///tmp/kitchensync?timeout-conn=70&timeout-idle=80"
+            );
+        }
+        other => panic!("expected local target, got {other:?}"),
+    }
+    assert_eq!(
+        only_target(&peers[3]).connection,
+        PeerArgumentUrlConnectionSettings {
+            timeout_conn_seconds: 70,
+            timeout_idle_seconds: 80,
+        }
+    );
 }
 
 #[test]
@@ -225,6 +242,10 @@ fn rejects_unsupported_url_query_parameters() {
     );
     assert_validation_failure(
         &["sftp://host/a?other=2", "local"],
+        PeerArgumentValidationReason::UnsupportedQueryParameter,
+    );
+    assert_validation_failure(
+        &["file:///tmp/kitchensync?max-copies=2", "local"],
         PeerArgumentValidationReason::UnsupportedQueryParameter,
     );
 }
