@@ -14,6 +14,8 @@ use copyqueue::{
 use transportoperations_localtransportoperations::LocalTransportRoot;
 
 fn subject() -> Arc<dyn CopyQueue> {
+    let _dry_run_policy = dryrunpolicy::new();
+
     let transport = transportoperations::new(
         transportoperations_localtransportoperations::new(),
         transportoperations_sftptransportoperations::new(),
@@ -113,6 +115,26 @@ fn open_run(
     destination_root: &Path,
     sink: copyqueue::CopyQueueEventSink,
 ) -> copyqueue::CopyQueueRunId {
+    open_run_with_policy(
+        copy_queue,
+        max_active_copies,
+        max_total_tries,
+        source_root,
+        destination_root,
+        CopyMutationPolicy::Normal,
+        sink,
+    )
+}
+
+fn open_run_with_policy(
+    copy_queue: &dyn CopyQueue,
+    max_active_copies: Option<u32>,
+    max_total_tries: u32,
+    source_root: &Path,
+    destination_root: &Path,
+    mutation_policy: CopyMutationPolicy,
+    sink: copyqueue::CopyQueueEventSink,
+) -> copyqueue::CopyQueueRunId {
     copy_queue
         .open_run(CopyQueueRunRequest {
             max_active_copies: max_active_copies.map(|value| {
@@ -124,7 +146,7 @@ fn open_run(
                 local_peer("source", source_root),
                 local_peer("destination", destination_root),
             ],
-            mutation_policy: CopyMutationPolicy::Normal,
+            mutation_policy,
             event_sink: sink,
         })
         .expect("open copy queue run")
@@ -335,4 +357,72 @@ fn successful_replacement_uses_encoded_swap_paths_archives_old_and_removes_swap(
         fs::read_to_string(&archived[0]).expect("read archived old file"),
         "old content"
     );
+}
+
+#[test]
+fn first_time_destination_uses_swap_new_without_creating_bak() {
+    let source_root = temp_root("new-source");
+    let destination_root = temp_root("new-destination");
+    write_file(&source_root, "nested/new file.txt", "hello world");
+
+    let copy_queue = subject();
+    let (_events, sink) = event_log();
+    let run_id = open_run(&*copy_queue, Some(1), 1, &source_root, &destination_root, sink);
+
+    copy_queue
+        .enqueue(
+            run_id,
+            queued_copy(
+                "nested/new file.txt",
+                "target/new file.txt",
+                "target/new file.txt",
+            ),
+        )
+        .expect("enqueue first-time copy");
+
+    let result = copy_queue.close_and_drain(run_id).expect("drain run");
+
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].outcome, QueuedCopyOutcome::Succeeded);
+    assert_eq!(
+        read_file(&destination_root, "target/new file.txt"),
+        "hello world"
+    );
+    assert!(!destination_root
+        .join("target/.kitchensync/SWAP/new%20file.txt")
+        .exists());
+    assert!(!destination_root.join("target/.kitchensync/BAK").exists());
+}
+
+#[test]
+fn dry_run_reads_source_and_acquires_slots_without_destination_mutation() {
+    let source_root = temp_root("dry-run-source");
+    let destination_root = temp_root("dry-run-destination");
+    write_file(&source_root, "ready.txt", "hello world");
+    write_file(&destination_root, "ready.txt", "old content");
+
+    let copy_queue = subject();
+    let (events, sink) = event_log();
+    let run_id = open_run_with_policy(
+        &*copy_queue,
+        Some(1),
+        1,
+        &source_root,
+        &destination_root,
+        CopyMutationPolicy::DryRun,
+        sink,
+    );
+
+    copy_queue
+        .enqueue(run_id, queued_copy("ready.txt", "ready.txt", "ready.txt"))
+        .expect("enqueue dry-run copy");
+
+    let result = copy_queue.close_and_drain(run_id).expect("drain run");
+
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].outcome, QueuedCopyOutcome::Succeeded);
+    assert_eq!(read_file(&destination_root, "ready.txt"), "old content");
+    assert!(events.lock().expect("event log lock").iter().any(|event| {
+        matches!(event, CopyQueueEvent::CopySlotAcquire { active: 1, max: 1 })
+    }));
 }
