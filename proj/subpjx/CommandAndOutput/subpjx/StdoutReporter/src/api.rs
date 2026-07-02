@@ -155,11 +155,11 @@ pub trait StdoutReporter: Send + Sync {
 
     /// Writes the final successful sync completion message to stdout.
     ///
-    /// The message text is supplied by the caller and is emitted after the sync
-    /// operation has successfully completed. It is emitted as a complete plain
-    /// line and is visible at every verbosity. The method does not decide
-    /// whether the sync succeeded, does not select an exit code, never writes
-    /// to stderr, and never emits terminal-dependent formatting. Calls are
-    /// emitted in caller order and are not idempotent.
-    fn report_completion(&self, verbosity: StdoutVerbosity, message: String);
+    /// The emitted line is exactly `sync complete`, and it is emitted after
+    /// the sync operation has successfully completed. It is visible at every
+    /// verbosity, including `Error`. The method does not decide whether the
+    /// sync succeeded, does not select an exit code, never writes to stderr,
+    /// and never emits terminal-dependent formatting. A successful sync should
+    /// call this method exactly once. Extra calls emit extra completion lines.
+    fn report_completion(&self, verbosity: StdoutVerbosity);
 }
