@@ -178,8 +178,9 @@ pub trait DryRunPolicy: Send + Sync {
     /// Decides what completion may do with updated local temporary snapshots.
     ///
     /// Dry-run may leave local temporary snapshot databases updated, but must
-    /// not upload them to peers at the end of the run. Snapshot upload is also
-    /// denied by the peer-mutation guard.
+    /// not upload them to any peer at the end of the run, including
+    /// subordinate peers. Snapshot upload is also denied by the peer-mutation
+    /// guard.
     fn decide_local_snapshot_completion(&self) -> DryRunLocalSnapshotCompletionDecision;
 
     /// Returns the dry-run stdout marker event.
