@@ -21,17 +21,17 @@ after per-directory listing errors.
 - `010.8` -- KitchenSync does not recurse into a directory on a peer after displacing that directory on that peer.
 - `010.9` -- KitchenSync recurses into a child directory only with peers that keep or create that child directory.
 - `010.10` -- When a directory listing fails on a reachable peer, KitchenSync tries that same listing up to `--retries-list` total times.
-- `010.11` -- KitchenSync does not place directory listing failures in the file-copy queue.
-- `010.12` -- When a peer's directory listing still fails after all allowed tries, KitchenSync logs the failed peer and path at error level.
-- `010.13` -- When a non-canon peer's directory listing still fails after all allowed tries and at least one contributing peer remains active, KitchenSync continues processing that directory with the remaining active peers.
-- `010.14` -- When a peer's directory listing still fails after all allowed tries, KitchenSync excludes that peer from decisions for that directory and every descendant path during that run.
-- `010.15` -- When a peer's directory listing still fails after all allowed tries, KitchenSync does not modify files or directories under the failed subtree on that peer during that run.
-- `010.16` -- When a peer's directory listing still fails after all allowed tries, KitchenSync does not modify that peer's snapshot rows for the failed subtree during that run.
-- `010.17` -- When the canon peer's directory listing still fails after all allowed tries, KitchenSync skips decisions for that directory and every descendant path for all peers.
-- `010.18` -- When the canon peer's directory listing still fails after all allowed tries, KitchenSync does not modify files, directories, or snapshot rows under that subtree on any peer during that run.
-- `010.19` -- When every contributing peer still fails listing a directory after all allowed tries, KitchenSync skips decisions for that directory and every descendant path.
-- `010.20` -- When every contributing peer still fails listing a directory after all allowed tries, KitchenSync does not displace subordinate peer files under that subtree during that run.
-- `010.21` -- A peer excluded because of a directory listing failure in one run participates normally on a later run when listing that path succeeds.
+- `010.11` -- When a peer's directory listing still fails after all allowed tries, KitchenSync logs the failed peer and path at error level.
+- `010.12` -- When a non-canon peer's directory listing still fails after all allowed tries and at least one contributing peer remains active, KitchenSync continues processing that directory with the remaining active peers.
+- `010.13` -- When a peer's directory listing still fails after all allowed tries, KitchenSync excludes that peer from decisions for that directory and every descendant path during that run.
+- `010.14` -- When a peer's directory listing still fails after all allowed tries, KitchenSync does not modify files or directories under the failed subtree on that peer during that run.
+- `010.15` -- When a peer's directory listing still fails after all allowed tries, KitchenSync does not modify that peer's snapshot rows for the failed subtree during that run.
+- `010.16` -- When the canon peer's directory listing still fails after all allowed tries, KitchenSync skips decisions for that directory and every descendant path for all peers.
+- `010.17` -- When the canon peer's directory listing still fails after all allowed tries, KitchenSync does not modify files, directories, or snapshot rows under that subtree on any peer during that run.
+- `010.18` -- When every contributing peer still fails listing a directory after all allowed tries, KitchenSync skips decisions for that directory and every descendant path.
+- `010.19` -- When every contributing peer still fails listing a directory after all allowed tries, KitchenSync does not displace subordinate peer files under that subtree during that run.
+- `010.20` -- A peer excluded because of a directory listing failure in one run participates normally on a later run when listing that path succeeds.
+- `010.21` -- When survival-evidence listing for a directory fails on a peer after all allowed tries, KitchenSync skips decisions for that directory and every descendant path for all peers during that run.
 
 ## Notes
 This file covers traversal control and visibility after listing succeeds or
