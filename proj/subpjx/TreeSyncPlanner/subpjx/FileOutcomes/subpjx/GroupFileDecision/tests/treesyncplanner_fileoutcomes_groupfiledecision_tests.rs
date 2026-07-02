@@ -1,6 +1,7 @@
 use treesyncplanner_fileoutcomes_groupfiledecision::{
     new as create_group_file_decision, ClassifiedLiveFile, FileAbsenceIntent,
-    FileGroupOutcome, GroupFileDecisionOutput, GroupFileDecisionPeer,
+    FileGroupOutcome, GroupFileDecisionError, GroupFileDecisionOutput,
+    GroupFileDecisionPeer,
     GroupFileDecisionPeerRole, GroupFileDecisionRequest, PeerFileDecisionStatus,
     PeerFileState, SyncTimestamp,
 };
@@ -580,4 +581,29 @@ fn all_contributors_absent_with_no_row_produces_no_file_and_displaces_subordinat
         "subordinate-live",
         PeerFileDecisionStatus::NeedsDisplacement,
     );
+}
+
+#[test]
+fn contradictory_canon_role_facts_return_invalid_input() {
+    let subject = create_group_file_decision();
+    let result = subject.decide_group_file(GroupFileDecisionRequest {
+        relative_path: PATH.to_string(),
+        peers: vec![
+            peer(
+                "first-canon",
+                GroupFileDecisionPeerRole::Canon,
+                PeerFileState::AbsentNoRowNoVote,
+            ),
+            peer(
+                "second-canon",
+                GroupFileDecisionPeerRole::Canon,
+                PeerFileState::UnchangedLiveFile(live_file(10, 100)),
+            ),
+        ],
+    });
+
+    assert!(matches!(
+        result,
+        Err(GroupFileDecisionError::InvalidInput(_))
+    ));
 }
