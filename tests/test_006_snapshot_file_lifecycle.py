@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -19,201 +20,312 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-RELEASED_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
+KITCHENSYNC_EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
 
 
-class CheckSet:
-    def __init__(self) -> None:
-        self.failures: list[str] = []
-
-    def check(self, condition: bool, message: str) -> None:
-        if not condition:
-            self.failures.append(message)
-
-    def equal(self, actual: object, expected: object, message: str) -> None:
-        if actual != expected:
-            self.failures.append(f"{message}: expected {expected!r}, got {actual!r}")
-
-
-def run_kitchensync(args: list[str], cwd: Path, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(RELEASED_EXE), *args],
-        cwd=str(cwd),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        shell=False,
-        check=False,
-    )
+# not reasonably testable: 006.16 local temporary {tmp}/{uuid}/snapshot.db path is not observable.
+# not reasonably testable: 006.18 download errors other than not found require sabotaging transport state.
+# not reasonably testable: 006.19 local temporary database reads are internal implementation detail.
+# not reasonably testable: 006.20 local temporary database writes are internal implementation detail.
+# not reasonably testable: 006.24 close-before-replace is not directly observable from the CLI.
+# not reasonably testable: 006.29 upload failure before SWAP old requires sabotaging transport state.
+# not reasonably testable: 006.30 retained SWAP new after upload failure requires sabotaging transport state.
+# not reasonably testable: 006.31 upload failure after SWAP old requires sabotaging transport state.
+# not reasonably testable: 006.32 transaction completion is internal except through uploaded DB usability.
+# not reasonably testable: 006.33 statement finalization is internal except through uploaded DB usability.
+# not reasonably testable: 006.34 cursor finalization is internal except through uploaded DB usability.
+# not reasonably testable: 006.35 reader finalization is internal except through uploaded DB usability.
+# not reasonably testable: 006.36 connection closing is internal except through uploaded DB usability.
+# not reasonably testable: 006.37 transport upload source is internal except through uploaded DB usability.
+# not reasonably testable: 006.39 true overlapping completion order is not deterministic from this script.
 
 
-def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+@dataclass
+class CheckResult:
+    name: str
+    failures: list[str]
 
 
-def make_empty_snapshot(path: Path) -> None:
+def record(condition: bool, failures: list[str], message: str) -> None:
+    if not condition:
+        failures.append(message)
+
+
+def run_kitchensync(args: list[str], failures: list[str], name: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [str(KITCHENSYNC_EXE), *args],
+            cwd=str(WORKSPACE_ROOT),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        failures.append(f"{name}: KitchenSync timed out")
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return subprocess.CompletedProcess([str(KITCHENSYNC_EXE), *args], 124, stdout, stderr)
+
+
+def require_success(result: subprocess.CompletedProcess[str], failures: list[str], name: str) -> None:
+    record(result.returncode == 0, failures, f"{name}: expected exit 0, got {result.returncode}; stdout={result.stdout!r}")
+    record(result.stderr == "", failures, f"{name}: expected empty stderr, got {result.stderr!r}")
+    record("sync complete" in result.stdout.splitlines(), failures, f"{name}: stdout did not contain sync complete: {result.stdout!r}")
+
+
+def metadata_dir(peer: Path) -> Path:
+    return peer / ".kitchensync"
+
+
+def snapshot_path(peer: Path) -> Path:
+    return metadata_dir(peer) / "snapshot.db"
+
+
+def snapshot_swap_dir(peer: Path) -> Path:
+    return metadata_dir(peer) / "SWAP" / "snapshot.db"
+
+
+def create_snapshot_db(path: Path, marker: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
-    with sqlite3.connect(str(path)) as db:
-        mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-        if str(mode).lower() == "wal":
-            raise RuntimeError(f"could not create rollback-journal snapshot at {path}")
-        db.executescript(
+    con = sqlite3.connect(str(path))
+    try:
+        mode = con.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        if str(mode).lower() != "delete":
+            raise AssertionError(f"sqlite refused rollback journal mode for {path}: {mode}")
+        con.execute(
             """
-            CREATE TABLE snapshot (
+            CREATE TABLE IF NOT EXISTS snapshot (
                 id TEXT PRIMARY KEY,
-                parent_id TEXT,
+                parent_id TEXT NOT NULL,
                 basename TEXT NOT NULL,
                 mod_time TEXT NOT NULL,
                 byte_size INTEGER NOT NULL,
                 last_seen TEXT,
                 deleted_time TEXT
-            );
-            CREATE INDEX idx_snapshot_parent_id ON snapshot(parent_id);
-            CREATE INDEX idx_snapshot_last_seen ON snapshot(last_seen);
-            CREATE INDEX idx_snapshot_deleted_time ON snapshot(deleted_time);
+            )
             """
         )
+        con.execute("CREATE INDEX IF NOT EXISTS snapshot_parent_id ON snapshot(parent_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS snapshot_last_seen ON snapshot(last_seen)")
+        con.execute("CREATE INDEX IF NOT EXISTS snapshot_deleted_time ON snapshot(deleted_time)")
+        if marker:
+            con.execute("PRAGMA user_version = 1")
+            con.execute(
+                "INSERT OR REPLACE INTO snapshot VALUES (?, '/', ?, '2000-01-01_00-00-00_000000Z', 0, NULL, NULL)",
+                (marker, marker),
+            )
+        con.commit()
+    finally:
+        con.close()
 
 
-def assert_snapshot_database(checks: CheckSet, path: Path, label: str) -> None:
-    checks.check(path.is_file(), f"{label}: .kitchensync/snapshot.db should exist")
-    if not path.is_file():
+def assert_sqlite_snapshot_usable(path: Path, failures: list[str], label: str) -> None:
+    record(path.exists(), failures, f"{label}: expected {path} to exist")
+    if not path.exists():
         return
     try:
-        with sqlite3.connect(str(path)) as db:
-            integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
-            mode = str(db.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        checks.equal(integrity, "ok", f"{label}: snapshot.db should be a usable SQLite database")
-        checks.check(mode != "wal", f"{label}: snapshot.db should not use WAL journal mode")
+        con = sqlite3.connect(str(path))
+        try:
+            integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+            journal_mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = {
+                row[0]
+                for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            con.close()
     except sqlite3.Error as exc:
-        checks.failures.append(f"{label}: snapshot.db should open with sqlite3: {exc}")
+        failures.append(f"{label}: snapshot is not a usable SQLite database: {exc}")
+        return
+    record(integrity == "ok", failures, f"{label}: expected SQLite integrity_check ok, got {integrity!r}")
+    record(str(journal_mode).lower() == "delete", failures, f"{label}: expected rollback journal mode, got {journal_mode!r}")
+    record("snapshot" in tables, failures, f"{label}: expected snapshot table in uploaded database, got {sorted(tables)!r}")
 
 
-def assert_no_peer_sidecars(checks: CheckSet, snapshot: Path, label: str) -> None:
-    for suffix in ("-wal", "-shm", "-journal"):
-        checks.check(
-            not snapshot.with_name(snapshot.name + suffix).exists(),
-            f"{label}: peer snapshot sidecar {snapshot.name + suffix} should not exist",
-        )
+def assert_no_snapshot_sidecars(peer: Path, failures: list[str], label: str) -> None:
+    meta = metadata_dir(peer)
+    if not meta.exists():
+        failures.append(f"{label}: expected metadata directory {meta} to exist")
+        return
+    sidecars = sorted(
+        p.relative_to(peer).as_posix()
+        for p in meta.rglob("*")
+        if p.is_file() and p.name.startswith("snapshot.db") and p.name != "snapshot.db"
+    )
+    record(not sidecars, failures, f"{label}: SQLite sidecar files were uploaded: {sidecars!r}")
 
 
-def assert_no_snapshot_swap(checks: CheckSet, peer: Path, label: str) -> None:
-    swap = peer / ".kitchensync" / "SWAP" / "snapshot.db"
-    checks.check(not (swap / "old").exists(), f"{label}: SWAP snapshot old should be removed")
-    checks.check(not (swap / "new").exists(), f"{label}: SWAP snapshot new should be removed")
+def snapshot_basenames(path: Path) -> set[str]:
+    con = sqlite3.connect(str(path))
+    try:
+        return {row[0] for row in con.execute("SELECT basename FROM snapshot")}
+    finally:
+        con.close()
 
 
-def local_first_sync_checks(checks: CheckSet, root: Path) -> None:
-    peer_a = root / "local-first" / "peer-a"
-    peer_b = root / "local-first" / "peer-b"
-    write_text(peer_a / "alpha.txt", "alpha\n")
+def test_first_run_creates_and_uploads_snapshots(root: Path) -> CheckResult:
+    failures: list[str] = []
+    peer_a = root / "first-a"
+    peer_b = root / "first-b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    (peer_a / "payload.txt").write_text("from canon\n", encoding="utf-8", newline="\n")
 
-    result = run_kitchensync([f"+{peer_a}", str(peer_b)], root)
-    checks.equal(result.returncode, 0, "006 local first sync should exit 0")
-    checks.equal(result.stderr, "", "006 local first sync should keep stderr empty")
-    checks.check((peer_b / "alpha.txt").read_text(encoding="utf-8") == "alpha\n", "006 setup copy should complete")
+    result = run_kitchensync([f"+{peer_a}", str(peer_b), "--verbosity", "error"], failures, "first run")
+    require_success(result, failures, "first run")
 
-    for label, peer in (("peer-a", peer_a), ("peer-b", peer_b)):
-        snapshot = peer / ".kitchensync" / "snapshot.db"
-        assert_snapshot_database(checks, snapshot, label)
-        assert_no_peer_sidecars(checks, snapshot, label)
-        assert_no_snapshot_swap(checks, peer, label)
-
-
-def snapshot_replacement_checks(checks: CheckSet, root: Path) -> None:
-    peer_a = root / "replace" / "peer-a"
-    peer_b = root / "replace" / "peer-b"
-    write_text(peer_a / "before.txt", "before\n")
-
-    first = run_kitchensync([f"+{peer_a}", str(peer_b)], root)
-    checks.equal(first.returncode, 0, "006 replacement setup should exit 0")
-
-    write_text(peer_a / "after.txt", "after\n")
-    second = run_kitchensync([str(peer_a), str(peer_b)], root)
-    checks.equal(second.returncode, 0, "006 replacement run should exit 0")
-    checks.equal(second.stderr, "", "006 replacement run should keep stderr empty")
-    checks.check((peer_b / "after.txt").is_file(), "006 replacement run should copy new user data before finishing")
-
-    for label, peer in (("replace peer-a", peer_a), ("replace peer-b", peer_b)):
-        snapshot = peer / ".kitchensync" / "snapshot.db"
-        assert_snapshot_database(checks, snapshot, label)
-        assert_no_peer_sidecars(checks, snapshot, label)
-        assert_no_snapshot_swap(checks, peer, label)
+    record((peer_b / "payload.txt").read_text(encoding="utf-8") == "from canon\n", failures, "006.21/006.22: copied file was not present before successful completion")
+    for label, peer in (("canon peer", peer_a), ("second peer", peer_b)):
+        snap = snapshot_path(peer)
+        assert_sqlite_snapshot_usable(snap, failures, f"006.1/006.2/006.17/006.22/006.38 {label}")
+        assert_no_snapshot_sidecars(peer, failures, f"006.3/006.4/006.38 {label}")
+        names = snapshot_basenames(snap) if snap.exists() else set()
+        record("payload.txt" in names, failures, f"006.21/006.22 {label}: uploaded snapshot does not record completed file copy")
+    return CheckResult("first_run_creates_and_uploads_snapshots", failures)
 
 
-def snapshot_swap_recovery_checks(checks: CheckSet, root: Path) -> None:
+def test_snapshot_replacement_cleans_swap(root: Path) -> CheckResult:
+    failures: list[str] = []
+    peer_a = root / "replace-a"
+    peer_b = root / "replace-b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    create_snapshot_db(snapshot_path(peer_a), "old-canon")
+    create_snapshot_db(snapshot_path(peer_b), "old-target")
+    (peer_a / "fresh.txt").write_text("fresh\n", encoding="utf-8", newline="\n")
+
+    result = run_kitchensync([f"+{peer_a}", str(peer_b), "--verbosity", "error"], failures, "replacement")
+    require_success(result, failures, "replacement")
+
+    for label, peer in (("canon peer", peer_a), ("target peer", peer_b)):
+        swap = snapshot_swap_dir(peer)
+        record(not (swap / "new").exists(), failures, f"006.23/006.26 {label}: SWAP new remained after normal upload")
+        record(not (swap / "old").exists(), failures, f"006.25/006.27/006.28 {label}: SWAP old remained after normal upload")
+        assert_sqlite_snapshot_usable(snapshot_path(peer), failures, f"006.25/006.26/006.27/006.28 {label}")
+        names = snapshot_basenames(snapshot_path(peer)) if snapshot_path(peer).exists() else set()
+        record("fresh.txt" in names, failures, f"006.22 {label}: replacement upload did not include updated snapshot data")
+    return CheckResult("snapshot_replacement_cleans_swap", failures)
+
+
+def seed_swap_case(peer: Path, live: bool, old: bool, new: bool) -> None:
+    peer.mkdir(parents=True, exist_ok=True)
+    if live:
+        create_snapshot_db(snapshot_path(peer), "live-marker")
+    swap = snapshot_swap_dir(peer)
+    if old:
+        create_snapshot_db(swap / "old", "old-marker")
+    if new:
+        create_snapshot_db(swap / "new", "new-marker")
+
+
+def run_recovery_case(root: Path, case_name: str, live: bool, old: bool, new: bool) -> list[str]:
+    failures: list[str] = []
+    control = root / f"{case_name}-control"
+    peer = root / f"{case_name}-peer"
+    control.mkdir(parents=True)
+    seed_swap_case(control, live=True, old=False, new=False)
+    seed_swap_case(peer, live=live, old=old, new=new)
+
+    result = run_kitchensync([f"+{control}", str(peer), "--verbosity", "error"], failures, case_name)
+    require_success(result, failures, case_name)
+
+    swap = snapshot_swap_dir(peer)
+    record(snapshot_path(peer).exists(), failures, f"{case_name}: 006.5 expected recovery/upload to leave a live snapshot.db")
+    record(not (swap / "old").exists(), failures, f"{case_name}: expected SWAP old to be removed or consumed")
+    record(not (swap / "new").exists(), failures, f"{case_name}: expected SWAP new to be removed or consumed")
+    assert_sqlite_snapshot_usable(snapshot_path(peer), failures, f"{case_name}: recovered snapshot")
+    return failures
+
+
+def test_startup_snapshot_swap_recovery(root: Path) -> CheckResult:
+    failures: list[str] = []
     cases = [
-        ("old-live-new", True, True, True),
-        ("old-new-no-live", False, True, True),
-        ("old-only", False, True, False),
-        ("new-live", True, False, True),
-        ("new-only", False, False, True),
+        ("old-live", True, True, False),  # 006.6, 006.7
+        ("old-new-live", True, True, True),  # 006.8
+        ("old-new-no-live", False, True, True),  # 006.9, 006.10
+        ("old-only-no-live", False, True, False),  # 006.11
+        ("new-live", True, False, True),  # 006.12, 006.13
+        ("new-only-no-live", False, False, True),  # 006.14
     ]
-    for name, live_exists, old_exists, new_exists in cases:
-        case_root = root / "recovery" / name
-        peer_a = case_root / "peer-a"
-        peer_b = case_root / "peer-b"
-        peer_a.mkdir(parents=True, exist_ok=True)
-        peer_b.mkdir(parents=True, exist_ok=True)
-        write_text(peer_a / "source.txt", f"{name}\n")
+    for case_name, live, old, new in cases:
+        failures.extend(run_recovery_case(root, case_name, live, old, new))
+    return CheckResult("startup_snapshot_swap_recovery", failures)
 
-        live = peer_a / ".kitchensync" / "snapshot.db"
-        swap = peer_a / ".kitchensync" / "SWAP" / "snapshot.db"
-        if live_exists:
-            make_empty_snapshot(live)
-        if old_exists:
-            make_empty_snapshot(swap / "old")
-        if new_exists:
-            make_empty_snapshot(swap / "new")
 
-        result = run_kitchensync([f"+{peer_a}", str(peer_b)], root)
-        checks.equal(result.returncode, 0, f"006 recovery {name} should exit 0")
-        checks.equal(result.stderr, "", f"006 recovery {name} should keep stderr empty")
-        assert_snapshot_database(checks, live, f"recovery {name}")
-        assert_no_snapshot_swap(checks, peer_a, f"recovery {name}")
+def test_failed_snapshot_recovery_excludes_peer(root: Path) -> CheckResult:
+    failures: list[str] = []
+    canon = root / "failed-recovery-canon"
+    healthy = root / "failed-recovery-healthy"
+    broken = root / "failed-recovery-broken"
+    canon.mkdir(parents=True)
+    healthy.mkdir(parents=True)
+    broken.mkdir(parents=True)
+    create_snapshot_db(snapshot_path(canon), "canon")
+    create_snapshot_db(snapshot_path(healthy), "healthy")
+    (snapshot_swap_dir(broken)).parent.mkdir(parents=True, exist_ok=True)
+    (snapshot_swap_dir(broken)).write_text("not a directory\n", encoding="utf-8", newline="\n")
+    (canon / "survives.txt").write_text("survives\n", encoding="utf-8", newline="\n")
+
+    result = run_kitchensync([f"+{canon}", str(healthy), str(broken), "--verbosity", "error"], failures, "failed recovery")
+
+    require_success(result, failures, "failed recovery")
+    record((healthy / "survives.txt").exists(), failures, "006.15: healthy reachable peer did not sync after broken peer recovery failed")
+    record(not (broken / "survives.txt").exists(), failures, "006.15: peer with failed snapshot recovery was not excluded")
+    record((snapshot_swap_dir(broken)).is_file(), failures, "006.15: broken SWAP state should remain for the excluded peer")
+    return CheckResult("failed_snapshot_recovery_excludes_peer", failures)
+
+
+def test_later_run_replaces_uploaded_snapshot_state(root: Path) -> CheckResult:
+    failures: list[str] = []
+    peer_a = root / "last-a"
+    peer_b = root / "last-b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    (peer_a / "first.txt").write_text("first\n", encoding="utf-8", newline="\n")
+
+    first = run_kitchensync([f"+{peer_a}", str(peer_b), "--verbosity", "error"], failures, "last first")
+    require_success(first, failures, "last first")
+    (peer_a / "second.txt").write_text("second\n", encoding="utf-8", newline="\n")
+    second = run_kitchensync([f"+{peer_a}", str(peer_b), "--verbosity", "error"], failures, "last second")
+    require_success(second, failures, "last second")
+
+    names = snapshot_basenames(snapshot_path(peer_b)) if snapshot_path(peer_b).exists() else set()
+    record({"first.txt", "second.txt"}.issubset(names), failures, f"006.39: final peer snapshot did not reflect latest completed upload, names={sorted(names)!r}")
+    return CheckResult("later_run_replaces_uploaded_snapshot_state", failures)
 
 
 def main() -> int:
-    checks = CheckSet()
-    checks.check(RELEASED_EXE.is_file(), "released executable should exist")
-
+    all_failures: list[str] = []
+    if not KITCHENSYNC_EXE.exists():
+        all_failures.append(f"released executable does not exist: {KITCHENSYNC_EXE}")
     with tempfile.TemporaryDirectory(prefix="kitchensync-006-") as tmp:
         root = Path(tmp)
-        try:
-            local_first_sync_checks(checks, root)
-            snapshot_replacement_checks(checks, root)
-            snapshot_swap_recovery_checks(checks, root)
-        except subprocess.TimeoutExpired as exc:
-            checks.failures.append(f"KitchenSync subprocess timed out: {exc}")
-        except OSError as exc:
-            checks.failures.append(f"filesystem or process error: {exc}")
+        for test in (
+            test_first_run_creates_and_uploads_snapshots,
+            test_snapshot_replacement_cleans_swap,
+            test_startup_snapshot_swap_recovery,
+            test_failed_snapshot_recovery_excludes_peer,
+            test_later_run_replaces_uploaded_snapshot_state,
+        ):
+            case_root = root / test.__name__
+            if case_root.exists():
+                shutil.rmtree(case_root)
+            case_root.mkdir(parents=True)
+            result = test(case_root)
+            for failure in result.failures:
+                all_failures.append(f"{result.name}: {failure}")
 
-    # not reasonably testable: 006.10 local temporary {tmp}/{uuid}/snapshot.db path is internal and removed or unreported.
-    # not reasonably testable: 006.12 requires forcing peer snapshot SWAP recovery failure through a transport fault.
-    # not reasonably testable: 006.13 requires forcing snapshot download failure other than not found through a transport fault.
-    # not reasonably testable: 006.14 local temporary snapshot reads/writes are internal and not exposed after process exit.
-    # not reasonably testable: 006.15 requires observing transient ordering between copy queue completion and snapshot upload.
-    # not reasonably testable: 006.18 requires observing the transient close point of SWAP snapshot new before rename.
-    # not reasonably testable: 006.22 requires a named end-to-end transport fixture that rejects rename over existing destination.
-    # not reasonably testable: 006.23 requires forcing upload failure after SWAP old exists.
-    # not reasonably testable: 006.24 requires observing internal SQLite transaction state immediately before upload.
-    # not reasonably testable: 006.25 requires observing internal SQLite statement, cursor, or reader lifetime.
-    # not reasonably testable: 006.26 requires observing internal SQLite connection lifetime immediately before upload.
-    # not reasonably testable: 006.27 requires observing the upload source as a closed file rather than a live SQLite connection.
-    # not reasonably testable: 006.29 requires controlled overlapping normal runs and deterministic upload completion ordering.
-
-    if checks.failures:
+    if all_failures:
         print("FAIL")
-        for failure in checks.failures:
+        for failure in all_failures:
             print(f"- {failure}")
         return 1
-
     print("PASS")
     return 0
 
