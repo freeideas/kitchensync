@@ -2,7 +2,6 @@ use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use snapshotstore::{
@@ -230,17 +229,6 @@ fn path_ids_and_timestamps_match_the_snapshot_format_rules() {
             Err(SnapshotStoreError::InvalidRelativePath(_))
         ));
     }
-
-    assert_eq!(
-        store
-            .format_utc_timestamp(UNIX_EPOCH + Duration::from_micros(1))
-            .unwrap(),
-        "1970-01-01_00-00-00_000001Z"
-    );
-    assert!(
-        store.format_utc_timestamp(UNIX_EPOCH + Duration::from_secs(1)).unwrap()
-            < store.format_utc_timestamp(UNIX_EPOCH + Duration::from_secs(2)).unwrap()
-    );
 
     let generated_a = store.generate_timestamp().unwrap();
     let generated_b = store.generate_timestamp().unwrap();
@@ -599,9 +587,7 @@ fn normal_upload_replaces_live_snapshot_with_a_closed_self_contained_database() 
         .expect("count live rows before upload");
     assert_eq!(peer_side_before_upload, 0);
 
-    let upload = store
-        .upload_snapshots(run_id, vec!["peer".to_owned()])
-        .expect("upload snapshots");
+    let upload = store.upload_snapshots(run_id).expect("upload snapshots");
     assert_eq!(upload.uploaded_peers, vec!["peer".to_owned()]);
     assert_eq!(upload.failed_peers, Vec::new());
 
@@ -647,7 +633,7 @@ fn dry_run_upload_is_rejected_without_peer_mutation() {
     assert_eq!(result.available_peers.len(), 1);
 
     assert!(matches!(
-        store.upload_snapshots(result.run_id, vec!["peer".to_owned()]),
+        store.upload_snapshots(result.run_id),
         Err(SnapshotStoreError::DryRunUploadForbidden)
     ));
     assert_eq!(marker_mod_time(&live), LIVE_MARKER);

@@ -201,6 +201,12 @@ impl SnapshotStoreImpl {
             }
         }
     }
+
+    fn format_utc_timestamp(&self, time: SystemTime) -> Result<String, SnapshotStoreError> {
+        self.snapshotidentity
+            .format_utc_timestamp(time)
+            .map_err(identity_error)
+    }
 }
 
 impl SnapshotStore for SnapshotStoreImpl {
@@ -269,12 +275,6 @@ impl SnapshotStore for SnapshotStoreImpl {
     fn parent_path_id(&self, relative_path: &str) -> Result<String, SnapshotStoreError> {
         self.snapshotidentity
             .parent_path_id(relative_path)
-            .map_err(identity_error)
-    }
-
-    fn format_utc_timestamp(&self, time: SystemTime) -> Result<String, SnapshotStoreError> {
-        self.snapshotidentity
-            .format_utc_timestamp(time)
             .map_err(identity_error)
     }
 
@@ -429,12 +429,8 @@ impl SnapshotStore for SnapshotStoreImpl {
         })
     }
 
-    fn upload_snapshots(
-        &self,
-        run_id: SnapshotRunId,
-        peer_identities: Vec<String>,
-    ) -> Result<SnapshotUploadResult, SnapshotStoreError> {
-        {
+    fn upload_snapshots(&self, run_id: SnapshotRunId) -> Result<SnapshotUploadResult, SnapshotStoreError> {
+        let peer_identities = {
             let runs = self
                 .runs
                 .lock()
@@ -446,7 +442,9 @@ impl SnapshotStore for SnapshotStoreImpl {
             if run.mode == SnapshotRunMode::DryRun {
                 return Err(SnapshotStoreError::DryRunUploadForbidden);
             }
-        }
+
+            run.peers.keys().cloned().collect::<Vec<_>>()
+        };
 
         let mut uploaded_peers = Vec::new();
         let mut failed_peers = Vec::new();
