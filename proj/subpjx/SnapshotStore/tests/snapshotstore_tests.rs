@@ -2,6 +2,7 @@ use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use snapshotstore::{
@@ -29,9 +30,14 @@ fn subject() -> Arc<dyn SnapshotStore> {
 }
 
 fn temp_root(name: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "kitchensync-snapshotstore-tests-{}-{}",
+        "kitchensync-snapshotstore-tests-{}-{}-{}",
         std::process::id(),
+        stamp,
         name
     ));
     let _ = fs::remove_dir_all(&root);
@@ -39,14 +45,22 @@ fn temp_root(name: &str) -> PathBuf {
     root
 }
 
-fn local_peer(identity: &str, root: &Path) -> SnapshotPeerHandle {
+fn local_peer_with_role(
+    identity: &str,
+    role: SnapshotPeerRole,
+    root: &Path,
+) -> SnapshotPeerHandle {
     SnapshotPeerHandle {
         identity: identity.to_owned(),
-        role: SnapshotPeerRole::Normal,
+        role,
         winning_url: format!("file://{}", root.to_string_lossy()),
         scheme: SnapshotPeerScheme::File,
         handle: Arc::new(root.to_path_buf()) as Arc<dyn Any + Send + Sync>,
     }
+}
+
+fn local_peer(identity: &str, root: &Path) -> SnapshotPeerHandle {
+    local_peer_with_role(identity, SnapshotPeerRole::Normal, root)
 }
 
 fn start_one_peer(
@@ -611,6 +625,98 @@ fn normal_upload_replaces_live_snapshot_with_a_closed_self_contained_database() 
     assert_eq!(uploaded.1, 99);
     assert!(uploaded.2.as_deref().is_some_and(is_timestamp));
     assert_eq!(uploaded.3, None);
+}
+
+#[test]
+fn startup_uses_separate_local_temp_snapshots_and_uploads_subordinate_updates() {
+    let store = subject();
+    let root = temp_root("multi-peer");
+    let peer_a = root.join("peer-a");
+    let peer_b = root.join("peer-b");
+    create_snapshot_db(&peer_a.join(".kitchensync/snapshot.db"), LIVE_MARKER);
+    create_snapshot_db(&peer_b.join(".kitchensync/snapshot.db"), OLD_MARKER);
+
+    let temporary_root = root.join("tmp");
+    let result = store.start_run(SnapshotStartupRequest {
+        run_mode: SnapshotRunMode::Normal,
+        temporary_root: temporary_root.clone(),
+        peers: vec![
+            local_peer_with_role("canon-peer", SnapshotPeerRole::Canon, &peer_a),
+            local_peer_with_role(
+                "subordinate-peer",
+                SnapshotPeerRole::Subordinate,
+                &peer_b,
+            ),
+        ],
+    });
+
+    assert_eq!(result.unavailable_peers, Vec::new());
+    assert_eq!(result.available_peers.len(), 2);
+    assert_eq!(result.available_peers[0].peer_identity, "canon-peer");
+    assert_eq!(result.available_peers[0].role, SnapshotPeerRole::Canon);
+    assert_eq!(result.available_peers[1].peer_identity, "subordinate-peer");
+    assert_eq!(result.available_peers[1].role, SnapshotPeerRole::Subordinate);
+    assert_eq!(
+        result.available_peers[0].local_snapshot_path,
+        temporary_root
+            .join(result.run_id.0.to_string())
+            .join("0")
+            .join("snapshot.db")
+    );
+    assert_eq!(
+        result.available_peers[1].local_snapshot_path,
+        temporary_root
+            .join(result.run_id.0.to_string())
+            .join("1")
+            .join("snapshot.db")
+    );
+    assert_eq!(
+        marker_mod_time(&result.available_peers[0].local_snapshot_path),
+        LIVE_MARKER
+    );
+    assert_eq!(
+        marker_mod_time(&result.available_peers[1].local_snapshot_path),
+        OLD_MARKER
+    );
+
+    store
+        .confirm_present(
+            result.run_id,
+            SnapshotObservedEntry {
+                peer_identity: "subordinate-peer".to_owned(),
+                relative_path: "docs/readme.txt".to_owned(),
+                mod_time: "2025-02-03_04-05-06_000007Z".to_owned(),
+                entry_kind: SnapshotEntryKind::File { byte_size: 123 },
+            },
+        )
+        .unwrap();
+
+    let upload = store
+        .upload_snapshots(result.run_id)
+        .expect("upload all peer snapshots");
+    assert!(upload.uploaded_peers.contains(&"canon-peer".to_owned()));
+    assert!(upload
+        .uploaded_peers
+        .contains(&"subordinate-peer".to_owned()));
+    assert_eq!(upload.failed_peers, Vec::new());
+
+    let subordinate_live = peer_b.join(".kitchensync/snapshot.db");
+    let uploaded_row: (String, i64, Option<String>, Option<String>) =
+        Connection::open(&subordinate_live)
+            .expect("open subordinate live snapshot")
+            .query_row(
+                "SELECT mod_time, byte_size, last_seen, deleted_time
+                 FROM snapshot WHERE id = 'K5EzsWuLZ04'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read subordinate uploaded row");
+    assert_eq!(uploaded_row.0, "2025-02-03_04-05-06_000007Z");
+    assert_eq!(uploaded_row.1, 123);
+    assert!(uploaded_row.2.as_deref().is_some_and(is_timestamp));
+    assert_eq!(uploaded_row.3, None);
+    assert!(!subordinate_live.with_extension("db-wal").exists());
+    assert!(!subordinate_live.with_extension("db-shm").exists());
 }
 
 #[test]
