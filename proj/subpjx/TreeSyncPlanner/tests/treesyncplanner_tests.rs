@@ -1,0 +1,335 @@
+use treesyncplanner::{
+    AcceptedExclude, AcceptedExcludeKind, DirectoryListingFact, DirectoryListingOutcome,
+    DisplacementKind, LiveDirectoryEntry, LiveEntryKind, PeerRunRole, PlanningPeer, SnapshotEntryKind,
+    SnapshotFact, SnapshotRow, SnapshotUpdateIntent, StartupFatalOutcome, StartupPeer,
+    StartupPeerCommandRole, StartupRoleRequest, SyncTimestamp, TreeSyncAction, TreeSyncDiagnosticKind,
+    TreeSyncDiagnosticLevel, TreeSyncPlanRequest, TreeSyncPlanner,
+};
+
+fn subject() -> std::sync::Arc<dyn TreeSyncPlanner> {
+    let directoryoutcomes = treesyncplanner_directoryoutcomes::new();
+    let groupfiledecision = treesyncplanner_fileoutcomes_groupfiledecision::new();
+    let peerfileclassification = treesyncplanner_fileoutcomes_peerfileclassification::new();
+    let fileoutcomes = treesyncplanner_fileoutcomes::new(groupfiledecision, peerfileclassification);
+    let peerrunroles = treesyncplanner_peerrunroles::new();
+    let excludedpathfilter = treesyncplanner_treetraversal_excludedpathfilter::new();
+    let livedirectorywalk = treesyncplanner_treetraversal_livedirectorywalk::new();
+    let treetraversal = treesyncplanner_treetraversal::new(excludedpathfilter, livedirectorywalk);
+    let typeconflictoutcomes = treesyncplanner_typeconflictoutcomes::new();
+
+    treesyncplanner::new(
+        directoryoutcomes,
+        fileoutcomes,
+        peerrunroles,
+        treetraversal,
+        typeconflictoutcomes,
+    )
+}
+
+fn ts(unix_seconds: i64) -> SyncTimestamp {
+    SyncTimestamp {
+        unix_seconds,
+        nanoseconds: 0,
+    }
+}
+
+fn file(name: &str, byte_size: u64, modified_time: i64) -> LiveDirectoryEntry {
+    LiveDirectoryEntry {
+        name: name.to_string(),
+        kind: LiveEntryKind::File {
+            byte_size,
+            modified_time: ts(modified_time),
+        },
+    }
+}
+
+fn listing(
+    peer_id: &str,
+    relative_directory_path: &str,
+    entries: Vec<LiveDirectoryEntry>,
+) -> DirectoryListingFact {
+    DirectoryListingFact {
+        peer_id: peer_id.to_string(),
+        relative_directory_path: relative_directory_path.to_string(),
+        tries_used: 1,
+        outcome: DirectoryListingOutcome::Entries(entries),
+    }
+}
+
+fn peer(peer_id: &str, role: PeerRunRole, is_canon: bool) -> PlanningPeer {
+    PlanningPeer {
+        peer_id: peer_id.to_string(),
+        role,
+        is_canon,
+    }
+}
+
+#[test]
+fn startup_roles_apply_canon_subordinate_and_snapshot_rules() {
+    let planner = subject();
+
+    let decision = planner.decide_startup_roles(StartupRoleRequest {
+        reachable_peers: vec![
+            StartupPeer {
+                peer_id: "canon".to_string(),
+                command_line_role: StartupPeerCommandRole::Canon,
+                had_snapshot_at_startup: false,
+            },
+            StartupPeer {
+                peer_id: "fresh".to_string(),
+                command_line_role: StartupPeerCommandRole::Normal,
+                had_snapshot_at_startup: false,
+            },
+            StartupPeer {
+                peer_id: "forced-subordinate".to_string(),
+                command_line_role: StartupPeerCommandRole::Subordinate,
+                had_snapshot_at_startup: true,
+            },
+            StartupPeer {
+                peer_id: "history".to_string(),
+                command_line_role: StartupPeerCommandRole::Normal,
+                had_snapshot_at_startup: true,
+            },
+        ],
+        designated_canon_peer_id: Some("canon".to_string()),
+    });
+
+    assert_eq!(None, decision.fatal_outcome);
+    assert_eq!(
+        vec![
+            ("canon", PeerRunRole::Contributing),
+            ("fresh", PeerRunRole::Subordinate),
+            ("forced-subordinate", PeerRunRole::Subordinate),
+            ("history", PeerRunRole::Contributing),
+        ],
+        decision
+            .peer_roles
+            .iter()
+            .map(|role| (role.peer_id.as_str(), role.role))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn startup_roles_report_first_sync_without_canon() {
+    let planner = subject();
+
+    let decision = planner.decide_startup_roles(StartupRoleRequest {
+        reachable_peers: vec![StartupPeer {
+            peer_id: "fresh".to_string(),
+            command_line_role: StartupPeerCommandRole::Normal,
+            had_snapshot_at_startup: false,
+        }],
+        designated_canon_peer_id: None,
+    });
+
+    assert_eq!(
+        Some(StartupFatalOutcome::FirstSyncRequiresCanon {
+            exit_code: 1,
+            stdout_line: "First sync? Mark the authoritative peer with a leading +".to_string(),
+        }),
+        decision.fatal_outcome
+    );
+    assert!(decision.peer_roles.is_empty());
+}
+
+#[test]
+fn plan_uses_live_names_excludes_hidden_paths_and_targets_subordinates() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("canon", PeerRunRole::Contributing, true),
+            peer("target", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: vec![AcceptedExclude {
+            relative_path: "skip.txt".to_string(),
+            kind: AcceptedExcludeKind::File,
+        }],
+        directory_listing_facts: vec![
+            listing(
+                "canon",
+                "",
+                vec![
+                    file("beta.txt", 20, 200),
+                    file("Alpha.txt", 10, 100),
+                    file("skip.txt", 30, 300),
+                    LiveDirectoryEntry {
+                        name: ".git".to_string(),
+                        kind: LiveEntryKind::Directory,
+                    },
+                    LiveDirectoryEntry {
+                        name: "link.txt".to_string(),
+                        kind: LiveEntryKind::SymbolicLinkFile,
+                    },
+                ],
+            ),
+            listing("target", "", Vec::new()),
+            listing("subordinate", "", Vec::new()),
+        ],
+        snapshot_facts: vec![SnapshotFact {
+            peer_id: "target".to_string(),
+            relative_path: "snapshot-only.txt".to_string(),
+            row: SnapshotRow {
+                kind: SnapshotEntryKind::File,
+                byte_size: Some(99),
+                modified_time: Some(ts(99)),
+                deleted_time: None,
+                last_seen: Some(ts(99)),
+            },
+        }],
+        list_total_tries: 2,
+    });
+
+    let copy_paths = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            TreeSyncAction::CopyFile(copy) => Some((
+                copy.source_peer_id.as_str(),
+                copy.source_relative_path.as_str(),
+                copy.destination_peer_id.as_str(),
+                copy.destination_relative_path.as_str(),
+                copy.winning_byte_size,
+                copy.winning_modified_time,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        vec![
+            ("canon", "Alpha.txt", "target", "Alpha.txt", 10, ts(100)),
+            (
+                "canon",
+                "Alpha.txt",
+                "subordinate",
+                "Alpha.txt",
+                10,
+                ts(100),
+            ),
+            ("canon", "beta.txt", "target", "beta.txt", 20, ts(200)),
+            (
+                "canon",
+                "beta.txt",
+                "subordinate",
+                "beta.txt",
+                20,
+                ts(200),
+            ),
+        ],
+        copy_paths
+    );
+    assert!(!plan.actions.iter().any(|action| match action {
+        TreeSyncAction::CopyFile(copy) => copy.source_relative_path == "skip.txt"
+            || copy.source_relative_path == ".git"
+            || copy.source_relative_path == "link.txt"
+            || copy.source_relative_path == "snapshot-only.txt",
+        TreeSyncAction::CreateDirectory(create) => create.relative_path == ".git",
+        TreeSyncAction::DisplacePath(displace) => {
+            displace.relative_path == ".git"
+                || displace.relative_path == "link.txt"
+                || displace.relative_path == "snapshot-only.txt"
+        }
+    }));
+    assert!(!plan
+        .snapshot_update_intents
+        .iter()
+        .any(|intent| match intent {
+            SnapshotUpdateIntent::UpsertFile { relative_path, .. }
+            | SnapshotUpdateIntent::UpsertDirectory { relative_path, .. }
+            | SnapshotUpdateIntent::Tombstone { relative_path, .. } => {
+                relative_path == "snapshot-only.txt"
+            }
+        }));
+}
+
+#[test]
+fn canon_listing_failure_blocks_the_subtree_for_every_peer() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("canon", PeerRunRole::Contributing, true),
+            peer("target", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            DirectoryListingFact {
+                peer_id: "canon".to_string(),
+                relative_directory_path: "".to_string(),
+                tries_used: 3,
+                outcome: DirectoryListingOutcome::Failed {
+                    diagnostic: "permission denied".to_string(),
+                },
+            },
+            listing("target", "", vec![file("target-only.txt", 10, 100)]),
+            listing("subordinate", "", vec![file("subordinate-only.txt", 20, 200)]),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 3,
+    });
+
+    assert_eq!(
+        vec![(
+            TreeSyncDiagnosticLevel::Error,
+            TreeSyncDiagnosticKind::DirectoryListingFailed,
+            Some("canon"),
+            "",
+        )],
+        plan.diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.level,
+                diagnostic.kind,
+                diagnostic.peer_id.as_deref(),
+                diagnostic.relative_path.as_str(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(plan.actions.is_empty());
+    assert!(plan.snapshot_update_intents.is_empty());
+    assert!(plan.directory_visit_intents.is_empty());
+}
+
+#[test]
+fn subordinate_only_file_is_displaced_when_contributors_have_no_vote() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("left", PeerRunRole::Contributing, false),
+            peer("right", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            listing("left", "", Vec::new()),
+            listing("right", "", Vec::new()),
+            listing("subordinate", "", vec![file("extra.txt", 10, 100)]),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 1,
+    });
+
+    assert_eq!(
+        vec![("subordinate", "extra.txt", DisplacementKind::File)],
+        plan.actions
+            .iter()
+            .filter_map(|action| match action {
+                TreeSyncAction::DisplacePath(displace) => Some((
+                    displace.peer_id.as_str(),
+                    displace.relative_path.as_str(),
+                    displace.kind,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(!plan.actions.iter().any(|action| matches!(
+        action,
+        TreeSyncAction::CopyFile(copy) if copy.source_relative_path == "extra.txt"
+    )));
+}
