@@ -165,7 +165,21 @@ fn debug_verbosity_has_same_observable_output_as_info() {
     let debug_output = run_helper("observable_debug");
 
     assert_eq!(info_output, debug_output);
-    assert_eq!("C same/file.txt\nX same/displaced\nfinished\n", info_output);
+    assert_eq!(
+        "C same/file.txt\nX same/displaced\nsync complete\n",
+        info_output
+    );
+}
+
+#[test]
+fn sync_complete_is_emitted_once_at_every_verbosity() {
+    let output = run_helper("completion_all_verbosities");
+
+    assert_eq!(
+        "sync complete\nsync complete\nsync complete\nsync complete\n",
+        output
+    );
+    assert_plain_lines(&output);
 }
 
 #[test]
@@ -217,6 +231,7 @@ fn stdoutreporter_child_helper() {
         "progress_order_and_filtering" => emit_progress_order_and_filtering(),
         "observable_info" => emit_observable(StdoutVerbosity::Info),
         "observable_debug" => emit_observable(StdoutVerbosity::Debug),
+        "completion_all_verbosities" => emit_completion_all_verbosities(),
         "failed_file_transfers" => emit_failed_file_transfers(),
         _ => panic!("unknown stdout reporter helper mode {mode}"),
     }
@@ -323,7 +338,19 @@ fn emit_observable(verbosity: StdoutVerbosity) {
     reporter.report_copy_progress(verbosity, "same/file.txt".to_string());
     reporter.report_displacement_progress(verbosity, "same/displaced".to_string());
     reporter.report_copy_slots(verbosity, 3, 8);
-    reporter.report_completion(verbosity, "finished".to_string());
+    reporter.report_completion(verbosity, "sync complete".to_string());
+}
+
+fn emit_completion_all_verbosities() {
+    let reporter = new();
+    for verbosity in [
+        StdoutVerbosity::Error,
+        StdoutVerbosity::Info,
+        StdoutVerbosity::Debug,
+        StdoutVerbosity::Trace,
+    ] {
+        reporter.report_completion(verbosity, "sync complete".to_string());
+    }
 }
 
 fn emit_failed_file_transfers() {
