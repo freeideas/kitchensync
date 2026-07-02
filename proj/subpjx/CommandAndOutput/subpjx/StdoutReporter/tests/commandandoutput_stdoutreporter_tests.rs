@@ -312,7 +312,7 @@ fn emit_error_diagnostics_and_completion() {
         );
     }
 
-    reporter.report_completion(StdoutVerbosity::Error, "sync complete".to_string());
+    reporter.report_completion(StdoutVerbosity::Error);
 }
 
 fn emit_progress_order_and_filtering() {
@@ -338,7 +338,7 @@ fn emit_observable(verbosity: StdoutVerbosity) {
     reporter.report_copy_progress(verbosity, "same/file.txt".to_string());
     reporter.report_displacement_progress(verbosity, "same/displaced".to_string());
     reporter.report_copy_slots(verbosity, 3, 8);
-    reporter.report_completion(verbosity, "sync complete".to_string());
+    reporter.report_completion(verbosity);
 }
 
 fn emit_completion_all_verbosities() {
@@ -349,7 +349,7 @@ fn emit_completion_all_verbosities() {
         StdoutVerbosity::Debug,
         StdoutVerbosity::Trace,
     ] {
-        reporter.report_completion(verbosity, "sync complete".to_string());
+        reporter.report_completion(verbosity);
     }
 }
 
