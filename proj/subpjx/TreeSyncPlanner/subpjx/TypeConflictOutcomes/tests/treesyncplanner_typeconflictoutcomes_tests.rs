@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use treesyncplanner_typeconflictoutcomes::{
-    new, TypeConflictDecision, TypeConflictDirectoryRecursion, TypeConflictDisplacementIntent,
+    new, TypeConflictDecision, TypeConflictDisplacementIntent,
     TypeConflictDisplacementKind, TypeConflictGroupOutcome, TypeConflictLiveEntry,
-    TypeConflictOutcomes, TypeConflictPeerDecision, TypeConflictPeerDisposition,
-    TypeConflictPeerInput, TypeConflictPeerRole, TypeConflictReplacementIntent,
-    TypeConflictRequest, TypeConflictResult, TypeConflictSyncSource,
+    TypeConflictInvalidReason, TypeConflictOutcomes, TypeConflictPeerDecision,
+    TypeConflictPeerDisposition, TypeConflictPeerInput, TypeConflictPeerRole,
+    TypeConflictReplacementIntent, TypeConflictRequest, TypeConflictResult,
+    TypeConflictSyncSource,
 };
 
 fn subject() -> Arc<dyn TypeConflictOutcomes> {
@@ -74,6 +75,23 @@ fn decision(result: TypeConflictResult) -> TypeConflictDecision {
     }
 }
 
+fn assert_invalid_reason(result: TypeConflictResult, expected_reason: TypeConflictInvalidReason) {
+    match result {
+        TypeConflictResult::InvalidInput(invalid) => {
+            assert_eq!(invalid.relative_path, "Recipes/Menu");
+            assert!(
+                std::mem::discriminant(&invalid.reason)
+                    == std::mem::discriminant(&expected_reason),
+                "expected invalid reason {expected_reason:?}, got {:?}",
+                invalid.reason
+            );
+        }
+        TypeConflictResult::Decision(decision) => {
+            panic!("expected invalid input {expected_reason:?}, got {decision:?}")
+        }
+    }
+}
+
 fn peer_decision<'a>(
     decision: &'a TypeConflictDecision,
     peer_identity: &str,
@@ -130,6 +148,27 @@ fn assert_replacement_intents(
 
     actual.sort_by_key(replacement_key);
     expected.sort_by_key(replacement_key);
+    assert_eq!(actual, expected);
+}
+
+fn assert_directory_recursion(
+    decision: &TypeConflictDecision,
+    expected_peer_identities: &[&str],
+) {
+    let recursion = decision
+        .directory_recursion
+        .as_ref()
+        .expect("expected directory recursion");
+    assert_eq!(recursion.relative_path, "Recipes/Menu");
+
+    let mut actual = recursion.peer_identities.clone();
+    let mut expected = expected_peer_identities
+        .iter()
+        .map(|peer_identity| peer_identity.to_string())
+        .collect::<Vec<_>>();
+
+    actual.sort();
+    expected.sort();
     assert_eq!(actual, expected);
 }
 
@@ -280,16 +319,9 @@ fn canon_directory_displaces_files_and_syncs_exact_case_directory_to_targets() {
             sync_directory("canon", "Recipes/MENU.Directory", "missing_subordinate"),
         ],
     );
-    assert_eq!(
-        decision.directory_recursion,
-        Some(TypeConflictDirectoryRecursion {
-            relative_path: "Recipes/Menu".to_string(),
-            peer_identities: vec![
-                "canon".to_string(),
-                "file_peer".to_string(),
-                "missing_subordinate".to_string(),
-            ],
-        })
+    assert_directory_recursion(
+        &decision,
+        &["canon", "file_peer", "missing_subordinate"],
     );
 }
 
@@ -424,14 +456,79 @@ fn subordinate_file_does_not_beat_contributing_directory_without_canon_peer() {
             "subordinate_file",
         )],
     );
-    assert_eq!(
-        decision.directory_recursion,
-        Some(TypeConflictDirectoryRecursion {
-            relative_path: "Recipes/Menu".to_string(),
-            peer_identities: vec![
-                "subordinate_file".to_string(),
-                "contributing_directory".to_string(),
-            ],
-        })
+    assert_directory_recursion(
+        &decision,
+        &["subordinate_file", "contributing_directory"],
     );
+}
+
+#[test]
+fn invalid_inputs_return_structured_invalid_reasons_without_deciding() {
+    let cases = vec![
+        (request(vec![], None), TypeConflictInvalidReason::EmptyPeerSet),
+        (
+            request(
+                vec![
+                    contributing("same", file("Recipes/Menu")),
+                    contributing("same", directory("Recipes/Menu")),
+                ],
+                None,
+            ),
+            TypeConflictInvalidReason::DuplicatePeerIdentity(String::new()),
+        ),
+        (
+            request(
+                vec![
+                    contributing("file_peer", file("Recipes/Menu")),
+                    contributing("directory_peer", directory("Recipes/Menu")),
+                ],
+                Some("not_active"),
+            ),
+            TypeConflictInvalidReason::CanonPeerNotActive(String::new()),
+        ),
+        (
+            request(
+                vec![
+                    contributing("file_peer", file("Recipes/Menu")),
+                    contributing("missing_peer", TypeConflictLiveEntry::Missing),
+                ],
+                None,
+            ),
+            TypeConflictInvalidReason::NotOneMixedFileDirectoryPath,
+        ),
+        (
+            request(
+                vec![
+                    contributing("canon", file("")),
+                    contributing("directory_peer", directory("Recipes/Menu")),
+                ],
+                Some("canon"),
+            ),
+            TypeConflictInvalidReason::MissingCanonSource(String::new()),
+        ),
+        (
+            request(
+                vec![
+                    contributing("file_peer", file("")),
+                    contributing("directory_peer", directory("Recipes/Menu")),
+                ],
+                None,
+            ),
+            TypeConflictInvalidReason::MissingEligibleContributingSource,
+        ),
+        (
+            request(
+                vec![
+                    subordinate("subordinate_file", file("Recipes/Menu")),
+                    subordinate("subordinate_directory", directory("Recipes/Menu")),
+                ],
+                None,
+            ),
+            TypeConflictInvalidReason::NoContributingWinningType,
+        ),
+    ];
+
+    for (request, expected_reason) in cases {
+        assert_invalid_reason(subject().decide_type_conflict(request), expected_reason);
+    }
 }
