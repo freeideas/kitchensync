@@ -150,9 +150,7 @@ impl CommandAndOutput for CommandAndOutputImpl {
                         relpath: diagnostic.relpath,
                         destination_peer_url: diagnostic.destination_peer_url,
                         phase: stdout_transfer_phase(diagnostic.phase),
-                        transport_error_category: diagnostic
-                            .transport_error
-                            .map(transport_error_category),
+                        transport_error_category: diagnostic.transport_error_category,
                     },
                 ),
             OutputEvent::CopyProgress { relpath } => {
@@ -165,8 +163,9 @@ impl CommandAndOutput for CommandAndOutputImpl {
                 self.stdoutreporter
                     .report_copy_slots(verbosity, active, max)
             }
-            OutputEvent::Completion { message } => {
-                self.stdoutreporter.report_completion(verbosity, message)
+            OutputEvent::Completion => {
+                self.stdoutreporter
+                    .report_completion(verbosity, "sync complete".to_owned())
             }
         }
     }
@@ -366,7 +365,6 @@ fn stdout_verbosity(verbosity: Verbosity) -> commandandoutput_stdoutreporter::St
 
 fn stdout_error_kind(kind: SyncErrorKind) -> commandandoutput_stdoutreporter::StdoutErrorKind {
     match kind {
-        SyncErrorKind::ArgumentError => commandandoutput_stdoutreporter::StdoutErrorKind::ArgumentError,
         SyncErrorKind::NoSnapshotsAndNoCanon => commandandoutput_stdoutreporter::StdoutErrorKind::NoSnapshotsAndNoCanon,
         SyncErrorKind::UnreachablePeer => commandandoutput_stdoutreporter::StdoutErrorKind::UnreachablePeer,
         SyncErrorKind::DirectoryListingFailure => commandandoutput_stdoutreporter::StdoutErrorKind::DirectoryListingFailure,
@@ -396,13 +394,4 @@ fn stdout_transfer_phase(
         FileTransferPhase::ArchiveOld => commandandoutput_stdoutreporter::StdoutFileTransferPhase::ArchiveOld,
         FileTransferPhase::Cleanup => commandandoutput_stdoutreporter::StdoutFileTransferPhase::Cleanup,
     }
-}
-
-fn transport_error_category(category: TransportErrorCategory) -> String {
-    match category {
-        TransportErrorCategory::NotFound => "not_found",
-        TransportErrorCategory::PermissionDenied => "permission_denied",
-        TransportErrorCategory::IoError => "io_error",
-    }
-    .to_owned()
 }

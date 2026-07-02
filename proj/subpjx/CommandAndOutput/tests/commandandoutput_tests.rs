@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use commandandoutput::{
     CommandAndOutput, CommandParseResult, FileTransferPhase, LocalPeerTarget, OutputEvent,
     PeerLocation, PeerRole, SftpPeerTarget, SyncErrorDiagnostic, SyncErrorKind,
-    TransportErrorCategory, UrlConnectionSettings, Verbosity,
+    UrlConnectionSettings, Verbosity,
 };
 
 fn subject() -> Arc<dyn CommandAndOutput> {
@@ -132,12 +132,7 @@ fn write_output_subprocess_helper() {
                 },
             );
             command.write_output(Verbosity::Error, OutputEvent::CopySlots { active: 1, max: 3 });
-            command.write_output(
-                Verbosity::Error,
-                OutputEvent::Completion {
-                    message: arg("sync complete"),
-                },
-            );
+            command.write_output(Verbosity::Error, OutputEvent::Completion);
         }
         "info_output" => {
             command.write_output(
@@ -153,12 +148,7 @@ fn write_output_subprocess_helper() {
                 },
             );
             command.write_output(Verbosity::Info, OutputEvent::CopySlots { active: 1, max: 3 });
-            command.write_output(
-                Verbosity::Info,
-                OutputEvent::Completion {
-                    message: arg("sync complete"),
-                },
-            );
+            command.write_output(Verbosity::Info, OutputEvent::Completion);
         }
         "debug_output" => {
             command.write_output(
@@ -174,12 +164,7 @@ fn write_output_subprocess_helper() {
                 },
             );
             command.write_output(Verbosity::Debug, OutputEvent::CopySlots { active: 1, max: 3 });
-            command.write_output(
-                Verbosity::Debug,
-                OutputEvent::Completion {
-                    message: arg("sync complete"),
-                },
-            );
+            command.write_output(Verbosity::Debug, OutputEvent::Completion);
         }
         "trace_output" => {
             command.write_output(
@@ -195,12 +180,7 @@ fn write_output_subprocess_helper() {
                 },
             );
             command.write_output(Verbosity::Trace, OutputEvent::CopySlots { active: 1, max: 3 });
-            command.write_output(
-                Verbosity::Trace,
-                OutputEvent::Completion {
-                    message: arg("sync complete"),
-                },
-            );
+            command.write_output(Verbosity::Trace, OutputEvent::Completion);
         }
         "diagnostics" => {
             command.write_output(Verbosity::Error, OutputEvent::FirstSyncNeedsCanon);
@@ -218,7 +198,7 @@ fn write_output_subprocess_helper() {
                     relpath: arg("dir/file.txt"),
                     destination_peer_url: arg("sftp://host.example/root"),
                     phase: FileTransferPhase::WriteSwapNew,
-                    transport_error: Some(TransportErrorCategory::PermissionDenied),
+                    transport_error_category: Some(arg("permission_denied")),
                 }),
             );
         }
