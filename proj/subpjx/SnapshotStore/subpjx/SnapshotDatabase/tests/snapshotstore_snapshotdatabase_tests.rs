@@ -211,6 +211,115 @@ fn create_empty_prepares_a_self_contained_rollback_journal_database_with_require
 }
 
 #[test]
+fn open_existing_opens_a_valid_prepared_snapshot_database_and_preserves_rows() {
+    let database = subject();
+    let path = temp_snapshot_path("open-existing-valid");
+    let handle = database.create_empty(&path).expect("create snapshot database");
+
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "file-a",
+                ROOT_PARENT_ID,
+                "file.txt",
+                "2026-01-02T03:04:05Z",
+                17,
+            ),
+            "2026-01-02T03:10:00Z",
+        )
+        .expect("confirm file present");
+
+    let prepared_path = database
+        .prepare_for_upload(handle)
+        .expect("prepare snapshot database");
+    let reopened = database
+        .open_existing(&prepared_path)
+        .expect("open existing snapshot database");
+
+    assert_row(
+        database
+            .lookup_row(&reopened, "file-a")
+            .expect("lookup reopened row")
+            .expect("reopened row exists"),
+        "file-a",
+        ROOT_PARENT_ID,
+        "file.txt",
+        "2026-01-02T03:04:05Z",
+        17,
+        Some("2026-01-02T03:10:00Z"),
+        None,
+    );
+}
+
+#[test]
+fn list_child_rows_returns_rows_for_the_requested_parent_including_tombstones() {
+    let database = subject();
+    let path = temp_snapshot_path("list-child-rows");
+    let handle = database.create_empty(&path).expect("create snapshot database");
+
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "visible-file",
+                ROOT_PARENT_ID,
+                "file.txt",
+                "2026-01-01T00:00:00Z",
+                10,
+            ),
+            "2026-01-01T00:01:00Z",
+        )
+        .expect("confirm visible file");
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "tombstone-file",
+                ROOT_PARENT_ID,
+                "old.txt",
+                "2026-01-01T00:02:00Z",
+                11,
+            ),
+            "2026-01-01T00:03:00Z",
+        )
+        .expect("confirm file before tombstone");
+    database
+        .confirm_absent(
+            &handle,
+            &identity("tombstone-file", ROOT_PARENT_ID, "old.txt"),
+        )
+        .expect("confirm tombstone file absent");
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "nested-file",
+                "visible-file",
+                "nested.txt",
+                "2026-01-01T00:04:00Z",
+                12,
+            ),
+            "2026-01-01T00:05:00Z",
+        )
+        .expect("confirm nested file");
+
+    let listed_ids: BTreeSet<String> = database
+        .list_child_rows(&handle, ROOT_PARENT_ID)
+        .expect("list root children")
+        .into_iter()
+        .map(|row| row.identity.id)
+        .collect();
+    assert_eq!(
+        listed_ids,
+        BTreeSet::from([
+            "tombstone-file".to_string(),
+            "visible-file".to_string(),
+        ])
+    );
+}
+
+#[test]
 fn row_operations_record_presence_pending_copies_completion_and_tombstones() {
     let database = subject();
     let path = temp_snapshot_path("row-operations");
@@ -359,6 +468,45 @@ fn row_operations_record_presence_pending_copies_completion_and_tombstones() {
 }
 
 #[test]
+fn complete_displacement_marks_one_entry_deleted_using_its_previous_last_seen() {
+    let database = subject();
+    let path = temp_snapshot_path("complete-displacement");
+    let handle = database.create_empty(&path).expect("create snapshot database");
+
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "file-a",
+                ROOT_PARENT_ID,
+                "file.txt",
+                "2026-01-02T03:04:05Z",
+                17,
+            ),
+            "2026-01-02T03:10:00Z",
+        )
+        .expect("confirm file present");
+
+    database
+        .complete_displacement(&handle, &identity("file-a", ROOT_PARENT_ID, "file.txt"))
+        .expect("complete displacement");
+
+    assert_row(
+        database
+            .lookup_row(&handle, "file-a")
+            .expect("lookup displaced file")
+            .expect("displaced file remains"),
+        "file-a",
+        ROOT_PARENT_ID,
+        "file.txt",
+        "2026-01-02T03:04:05Z",
+        17,
+        Some("2026-01-02T03:10:00Z"),
+        Some("2026-01-02T03:10:00Z"),
+    );
+}
+
+#[test]
 fn directory_displacement_cascade_and_cleanup_are_scoped_to_one_local_database() {
     let database = subject();
     let first_path = temp_snapshot_path("cascade-first");
@@ -500,6 +648,76 @@ fn directory_displacement_cascade_and_cleanup_are_scoped_to_one_local_database()
         database
             .lookup_row(&first, "already-tombstoned")
             .expect("lookup retained tombstone")
+            .is_some()
+    );
+}
+
+#[test]
+fn cleanup_old_rows_removes_old_non_tombstone_orphans_only() {
+    let database = subject();
+    let path = temp_snapshot_path("cleanup-orphans");
+    let handle = database.create_empty(&path).expect("create snapshot database");
+
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "old-orphan",
+                "missing-parent",
+                "old.txt",
+                "2026-01-01T00:00:00Z",
+                10,
+            ),
+            "2026-01-01T00:01:00Z",
+        )
+        .expect("confirm old orphan");
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "fresh-orphan",
+                "missing-parent",
+                "fresh.txt",
+                "2026-01-01T00:02:00Z",
+                11,
+            ),
+            "2026-01-03T00:01:00Z",
+        )
+        .expect("confirm fresh orphan");
+    database
+        .confirm_present(
+            &handle,
+            &file_facts(
+                "root-file",
+                ROOT_PARENT_ID,
+                "root.txt",
+                "2026-01-01T00:04:00Z",
+                12,
+            ),
+            "2026-01-01T00:05:00Z",
+        )
+        .expect("confirm old root child");
+
+    database
+        .cleanup_old_rows(&handle, "2026-01-02T00:00:00Z")
+        .expect("cleanup old rows");
+
+    assert!(
+        database
+            .lookup_row(&handle, "old-orphan")
+            .expect("lookup old orphan")
+            .is_none()
+    );
+    assert!(
+        database
+            .lookup_row(&handle, "fresh-orphan")
+            .expect("lookup fresh orphan")
+            .is_some()
+    );
+    assert!(
+        database
+            .lookup_row(&handle, "root-file")
+            .expect("lookup old root child")
             .is_some()
     );
 }
