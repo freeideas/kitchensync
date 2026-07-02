@@ -258,7 +258,11 @@ fn live_directory_conflict_uses_deleted_time_before_last_seen() {
     );
     assert_eq!(
         recursion_peers(&decision),
-        Some(vec!["live".to_string(), "target_missing".to_string()])
+        Some(vec![
+            "live".to_string(),
+            "absent".to_string(),
+            "target_missing".to_string()
+        ])
     );
     assert!(decision.displacement_intents.is_empty());
 }
@@ -342,7 +346,11 @@ fn survival_within_five_second_tolerance_keeps_recursion_and_child_file_eligibil
     );
     assert_eq!(
         recursion_peers(&decision),
-        Some(vec!["live".to_string(), "missing_target".to_string()])
+        Some(vec![
+            "live".to_string(),
+            "absent".to_string(),
+            "missing_target".to_string()
+        ])
     );
     assert!(decision.displacement_intents.is_empty());
 }
