@@ -40,9 +40,12 @@ URL and the returned connection handle or connection settings as the peer's
 winning URL. It then stops that peer's URL attempt loop and does not try any
 later fallback URL during this run.
 
-If a URL establishment child reports failure, StartupCoordinator tries the next
-URL for the same peer when one remains. A single URL failure does not stop
-startup for other peers and does not stop fallback attempts for that peer.
+If a URL establishment child reports failure, StartupCoordinator treats only
+that URL as failed and tries the next URL for the same peer when one remains. A
+single URL failure does not stop startup for other peers and does not stop
+fallback attempts for that peer. When a child reports that peer root directory
+creation failed during a normal run, StartupCoordinator treats that report as a
+failed URL attempt.
 
 If every URL for a peer fails, StartupCoordinator marks that peer unreachable
 for the run and creates one error-level diagnostic for that peer. The
@@ -59,6 +62,10 @@ The startup result contains:
 - one error-level diagnostic for each unreachable peer;
 - a fatal startup status when fewer than two peers are reachable;
 - a fatal startup status when the canon peer is unreachable.
+
+The reachable peer set returned by StartupCoordinator excludes every peer whose
+URLs all failed. Later startup and run work must use only that reachable peer
+set.
 
 The result must make the winning URL invariant clear to later operations:
 reachable peer handles returned by this child represent exactly one selected
@@ -95,5 +102,6 @@ do not cause this child to try remaining fallback URLs.
 - A peer's later fallback URLs are not tried after that peer has a winner.
 - A peer is unreachable only when every URL for that peer fails at startup.
 - Each unreachable peer produces one error-level diagnostic.
+- Unreachable peers are excluded from the returned reachable peer set.
 - Startup is fatal when fewer than two peers are reachable.
 - Startup is fatal when the canon peer is unreachable.
