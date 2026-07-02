@@ -17,16 +17,18 @@
         "005.13",
         "005.14",
         "005.15",
-        "005.16"
+        "005.16",
+        "005.17",
+        "005.18"
       ]
     },
     {
       "name": "FileUrlConnection",
       "responsibility": "Establishes file URLs by preparing or rejecting the local peer root according to run mode while ignoring SFTP connection settings.",
       "reqs": [
-        "005.9",
         "005.10",
-        "005.12"
+        "005.11",
+        "005.13"
       ]
     },
     {
@@ -35,11 +37,12 @@
       "reqs": [
         "005.7",
         "005.8",
-        "005.11",
+        "005.9",
         "005.12",
-        "005.17",
-        "005.18",
-        "005.19"
+        "005.13",
+        "005.19",
+        "005.20",
+        "005.21"
       ]
     }
   ]
