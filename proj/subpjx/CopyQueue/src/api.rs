@@ -20,7 +20,7 @@ pub enum PeerScheme {
 
 pub struct CopyQueueRunRequest {
     pub max_active_copies: Option<NonZeroU32>,
-    pub max_total_tries_per_copy: NonZeroU32,
+    pub max_total_tries_per_copy: Option<NonZeroU32>,
     pub peers: Vec<ConnectedPeerHandle>,
     pub mutation_policy: CopyMutationPolicy,
     pub event_sink: CopyQueueEventSink,
@@ -146,15 +146,16 @@ pub trait CopyQueue: Send + Sync {
     /// enqueue and drain calls.
     ///
     /// When `max_active_copies` is `None`, the queue uses a global maximum of
-    /// `10`; otherwise it uses the supplied positive value. The total try
-    /// limit is per queued copy and includes the first try. The connected peer
-    /// handles are already established for their winning URLs and later copy
-    /// work must use only those handles, without reconnecting or selecting
-    /// fallback URLs. In dry-run mode the queue still starts work, acquires
-    /// active-copy slots, reads source files, applies retry limits, and emits
-    /// the same copy and failed-copy events as a normal run, but performs no
-    /// destination-side peer mutation. The event sink receives structured
-    /// events in queue order for starts, slot changes, successes, skips, and
+    /// `10`; otherwise it uses the supplied positive value. When
+    /// `max_total_tries_per_copy` is `None`, the queue uses `3`; otherwise it
+    /// uses the supplied positive value. The total try limit is per queued copy
+    /// and includes the first try. The connected peer handles are already
+    /// established for their winning URLs and later copy work must use only
+    /// those handles, without reconnecting or selecting fallback URLs. The dry
+    /// run mutation policy is applied before any operation that might acquire a
+    /// copy slot, read source content, or mutate the destination side; this
+    /// trait does not decide dry-run semantics itself. The event sink receives
+    /// structured events for starts, slot changes, successes, skips, and
     /// failures; stdout formatting is outside this trait. Duplicate peer
     /// identities are rejected before the run is opened.
     fn open_run(&self, request: CopyQueueRunRequest) -> Result<CopyQueueRunId, CopyQueueError>;
@@ -187,18 +188,19 @@ pub trait CopyQueue: Send + Sync {
     ///
     /// For each normal transfer, the destination basename is percent-encoded
     /// when needed so the encoded value is one path segment on every supported
-    /// transport. Before writing replacement content, the queue recovers any
-    /// existing SWAP directory for that encoded basename or treats recovery
-    /// failure as a failed try before SWAP `old` exists. Replacement content
-    /// must be written only to SWAP `new`; any existing destination file must
-    /// move to SWAP `old` before SWAP `new` moves to the final path; the final
-    /// destination modification time must be set to the winning modification
-    /// time; any SWAP `old` must be archived below the nearby BAK timestamp
-    /// directory using a fresh process-local timestamp string for that archive
-    /// path; and successful transfers must remove their empty SWAP
-    /// directories. A destination that had no existing file creates no BAK
-    /// entry. Active transfer I/O must stream with bounded buffering whose
-    /// memory use is independent of source file size.
+    /// transport. Pre-transfer recovery of an existing destination SWAP
+    /// directory is outside this trait and must already have been handled
+    /// before CopyQueue writes a replacement for that encoded basename.
+    /// Replacement content must be written only to SWAP `new`; any existing
+    /// destination file must move to SWAP `old` before SWAP `new` moves to the
+    /// final path; the final destination modification time must be set to the
+    /// winning modification time; any SWAP `old` must be archived below the
+    /// nearby BAK timestamp directory using a fresh process-local timestamp
+    /// string requested from the snapshot child for that archive path; and
+    /// successful transfers must remove their empty SWAP directories. A
+    /// destination that had no existing file creates no BAK entry. Active
+    /// transfer I/O must stream with bounded buffering whose memory use is
+    /// independent of source file size.
     ///
     /// Failed copies keep independent try counts. A retryable failure before
     /// the try limit moves only that copy behind other queued work and lets
