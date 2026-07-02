@@ -23,8 +23,8 @@ output as `info`. Trace-only output is visible only at `trace`.
 
 StdoutReporter exposes an argument-validation report operation. For a non-help
 argument validation failure, it writes the validation error message followed by
-the help text to stdout. The caller supplies the already-selected error message
-and the exact help text.
+the help text from the fenced block in `specs/help.md` to stdout. The caller
+supplies the already-selected error message and the exact help text.
 
 StdoutReporter exposes startup and decision failure operations for these exact
 lines:
@@ -92,8 +92,14 @@ slots, not network connection counts.
 
 StdoutReporter exposes a completion operation for successful sync execution.
 It writes one final completion message to stdout after the sync operation has
-successfully completed. The caller supplies the product's completion message
-text.
+successfully completed. The line is exactly:
+
+```text
+sync complete
+```
+
+The completion line is emitted exactly once for a successful sync and is visible
+at every verbosity level, including `error`.
 
 ## Boundaries
 

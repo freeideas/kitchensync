@@ -1,8 +1,12 @@
 {
-  "deps": [],
+  "shared": false,
   "entry": false,
   "interface": "src/api.rs",
+  "wiring": "per-dependent",
+  "deps": [],
   "reqs": [
+    "002.43",
+    "002.45",
     "019.1",
     "019.2",
     "019.3",
@@ -32,8 +36,7 @@
     "019.27",
     "019.28",
     "019.29",
-    "019.30"
-  ],
-  "shared": false,
-  "wiring": "per-dependent"
+    "019.30",
+    "019.31"
+  ]
 }
