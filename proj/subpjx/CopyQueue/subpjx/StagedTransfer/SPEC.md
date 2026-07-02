@@ -3,11 +3,10 @@
 ## Purpose
 
 StagedTransfer owns one attempted file copy after QueueRunner has granted a
-copy slot. It derives the destination SWAP paths, recovers any existing SWAP
-state for the destination basename, streams the source file into SWAP `new`,
-replaces the final destination through SWAP `old`, applies the winning
-modification time, archives the displaced file when one exists, cleans the
-empty SWAP directories after success, and returns a phase-specific result.
+copy slot. It derives the destination SWAP paths, streams the source file into
+SWAP `new`, replaces the final destination through SWAP `old`, applies the
+winning modification time, archives the displaced file when one exists, cleans
+the empty SWAP directories after success, and returns a phase-specific result.
 
 This child performs the work for one try only. It does not decide when the try
 starts, how many other transfers may run, whether the copy should be retried,
@@ -22,8 +21,7 @@ winning modification time, winning byte size, a timestamp generator for BAK
 paths, and the peer file operations needed for the try. Those file operations
 must cover existence checks, streaming read, streaming write to a new path,
 rename to a missing path, delete, directory creation, empty-directory removal,
-and modification-time updates. The caller also supplies the operation that
-recovers an existing user-data SWAP directory for the encoded target basename.
+and modification-time updates.
 
 For target `<target-parent>/<basename>`, StagedTransfer percent-encodes
 `<basename>` when needed so the encoded value is one path segment on every
@@ -34,22 +32,17 @@ supported transport. It derives exactly these replacement paths:
 - SWAP old:
   `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old`
 
-Before writing replacement content, StagedTransfer recovers any existing SWAP
-directory for that encoded basename. If recovery fails, the try fails before
-SWAP `old` exists and no replacement begins.
-
 For a normal try, StagedTransfer performs these phases in order:
 
-1. Recover existing SWAP state for the target basename.
-2. Stream source file content into SWAP `new`.
-3. If the destination target currently has a file, move that file to SWAP
+1. Stream source file content into SWAP `new`.
+2. If the destination target currently has a file, move that file to SWAP
    `old`.
-4. Move SWAP `new` into the final destination path.
-5. Set the final destination file modification time to the winning
+3. Move SWAP `new` into the final destination path.
+4. Set the final destination file modification time to the winning
    modification time.
-6. If SWAP `old` exists, archive it to
+5. If SWAP `old` exists, archive it to
    `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`.
-7. Remove the empty SWAP directories for this transfer.
+6. Remove the empty SWAP directories for this transfer.
 
 StagedTransfer writes replacement content only to SWAP `new` before the final
 rename. A local-to-local copy may use an efficient local copy primitive to
@@ -129,8 +122,7 @@ and modification-time updates.
 
 StagedTransfer does not own traversal-wide SWAP recovery, snapshot SWAP
 recovery, TMP staging, BAK/TMP age cleanup, or type-conflict displacement. It
-uses only the caller-supplied user-data SWAP recovery operation and the BAK
-archive path it derives for this one replacement try.
+only derives and uses the SWAP and BAK paths for this one replacement try.
 
 StagedTransfer does not update snapshot rows and does not format stdout. It
 returns structured outcomes and phase information so its caller can update
