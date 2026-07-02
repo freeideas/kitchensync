@@ -2,12 +2,14 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
+
 from __future__ import annotations
 
 import os
 import platform
 import queue
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,51 +20,33 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-LITERAL_WORKSPACE = Path("/home/ace/Desktop/prjx/kitchensync")
-WORKSPACE = LITERAL_WORKSPACE if LITERAL_WORKSPACE.exists() else Path(__file__).resolve().parents[1]
-LITERAL_EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
-KITCHENSYNC_EXE = LITERAL_EXE if LITERAL_EXE.exists() else WORKSPACE / "released" / "kitchensync.exe"
-SFTP_SERVER = WORKSPACE / "extart" / "ephemeral-sftp-server.py"
+LITERAL_WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
+WORKSPACE_ROOT = (
+    LITERAL_WORKSPACE_ROOT
+    if LITERAL_WORKSPACE_ROOT.exists()
+    else Path(__file__).resolve().parents[1]
+)
+KITCHENSYNC_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
 
 
-# not reasonably testable: 009.6, 009.10. The testing guidelines forbid creating
-# symbolic links for KitchenSync tests, and the released CLI exposes no direct
-# stat/list_dir primitive for an existing natural symlink.
-# not reasonably testable: 009.7, 009.11. Portable creation of devices, FIFOs,
-# and sockets is not available on every supported platform, and the released CLI
-# exposes no direct primitive-operation API for naturally occurring special files.
-# not reasonably testable: 009.22. The requirement is a negative transport
-# assumption: KitchenSync must not require rename-over-existing. The observable
-# replacement checks below verify successful replacement through the released
-# sync surface, but they cannot prove the internal rename call was never aimed at
-# an existing destination.
-# not reasonably testable: 009.28, 009.29, 009.30. The released CLI reports
-# sync-level outcomes. Triggering every primitive error category, including
-# mid-operation SFTP network failure, would require sabotaging runtime state or
-# using a controllable fault-injection transport that is not a released surface.
-
-
-def uv_executable() -> Path:
+def bundled_uv() -> Path:
     system = platform.system().lower()
     if system == "windows":
-        return WORKSPACE / "aitc" / "bin" / "uv.exe"
+        return WORKSPACE_ROOT / "aitc" / "bin" / "uv.exe"
     if system == "darwin":
-        return WORKSPACE / "aitc" / "bin" / "uv.mac"
-    return WORKSPACE / "aitc" / "bin" / "uv.linux"
+        return WORKSPACE_ROOT / "aitc" / "bin" / "uv.mac"
+    return WORKSPACE_ROOT / "aitc" / "bin" / "uv.linux"
 
 
-def decode_output(data: bytes | str | None) -> str:
-    if data is None:
-        return ""
-    if isinstance(data, str):
-        return data
-    return data.decode("utf-8", errors="replace")
+def record(failures: list[str], condition: bool, message: str) -> None:
+    if not condition:
+        failures.append(message)
 
 
 def run_kitchensync(args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(KITCHENSYNC_EXE), *args],
-        cwd=str(WORKSPACE),
+        cwd=str(WORKSPACE_ROOT),
         env=env,
         text=True,
         encoding="utf-8",
@@ -71,177 +55,199 @@ def run_kitchensync(args: list[str], env: dict[str, str] | None = None) -> subpr
         stderr=subprocess.PIPE,
         timeout=45,
         shell=False,
+        check=False,
     )
 
 
-def check(failures: list[str], condition: bool, message: str) -> None:
-    if not condition:
-        failures.append(message)
+def write_bytes(path: Path, data: bytes, mod_time: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    os.utime(path, (mod_time, mod_time))
 
 
-def read_bytes(path: Path) -> bytes:
-    return path.read_bytes()
+def read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
-def assert_file(
-    failures: list[str],
-    path: Path,
-    expected: bytes,
-    req_ids: str,
-) -> None:
-    if not path.is_file():
-        failures.append(f"{req_ids}: expected file to exist: {path}")
-        return
-    actual = read_bytes(path)
-    if actual != expected:
-        failures.append(
-            f"{req_ids}: wrong content for {path}: expected {expected!r}, got {actual!r}"
-        )
+def close_enough_mtime(actual: float, expected: float) -> bool:
+    return abs(actual - expected) <= 5.0
 
 
-def assert_absent(failures: list[str], path: Path, req_ids: str) -> None:
-    if path.exists():
-        failures.append(f"{req_ids}: expected path to be absent after sync: {path}")
+def find_bak_entry(peer: Path, name: str) -> list[Path]:
+    bak = peer / ".kitchensync" / "BAK"
+    if not bak.exists():
+        return []
+    return [path for path in bak.glob(f"*/{name}") if path.exists()]
 
 
-def assert_mtime_close(
-    failures: list[str],
-    path: Path,
-    expected: float,
-    tolerance: float,
-    req_ids: str,
-) -> None:
-    if not path.exists():
-        failures.append(f"{req_ids}: cannot check modification time for missing path: {path}")
-        return
-    actual = path.stat().st_mtime
-    if abs(actual - expected) > tolerance:
-        failures.append(
-            f"{req_ids}: modification time for {path} was {actual}, expected near {expected}"
-        )
+def snapshot_rows(peer: Path) -> list[dict[str, object]]:
+    db = peer / ".kitchensync" / "snapshot.db"
+    if not db.exists():
+        return []
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT basename, byte_size, mod_time, last_seen, deleted_time FROM snapshot"
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(row) for row in rows]
 
 
-def prepare_source_tree(src: Path) -> dict[str, float]:
-    (src / "nested").mkdir(parents=True)
-    (src / "empty-dir").mkdir()
-    (src / "alpha.txt").write_bytes(b"alpha from canon\n")
-    (src / "nested" / "beta.bin").write_bytes(b"\x00beta bytes\xff")
-    file_time = 1_700_000_111.0
-    nested_time = 1_700_000_222.0
-    empty_time = 1_700_000_333.0
-    os.utime(src / "alpha.txt", (file_time, file_time))
-    os.utime(src / "nested" / "beta.bin", (nested_time, nested_time))
-    os.utime(src / "empty-dir", (empty_time, empty_time))
+def row_for(rows: list[dict[str, object]], basename: str) -> dict[str, object] | None:
+    for row in rows:
+        if row.get("basename") == basename:
+            return row
+    return None
+
+
+def prepare_local_source(peer: Path) -> dict[str, float]:
+    base = time.time() - 7200
+    write_bytes(peer / "root.txt", b"root file\n", base + 10)
+    write_bytes(peer / "nested" / "child.bin", b"0123456789", base + 20)
+    write_bytes(peer / "nested" / "deeper" / "leaf.txt", b"leaf\n", base + 30)
+    write_bytes(peer / "replace.txt", b"new replacement\n", base + 40)
+    write_bytes(peer / "type_conflict", b"file wins\n", base + 50)
+    (peer / "empty_dir").mkdir(parents=True, exist_ok=True)
+    os.utime(peer / "empty_dir", (base + 60, base + 60))
     return {
-        "alpha": file_time,
-        "beta": nested_time,
-        "empty_dir": empty_time,
+        "root.txt": base + 10,
+        "child.bin": base + 20,
+        "leaf.txt": base + 30,
+        "replace.txt": base + 40,
+        "type_conflict": base + 50,
+        "empty_dir": base + 60,
     }
 
 
-def test_local_transport(failures: list[str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-009-local-") as tmp_name:
-        tmp = Path(tmp_name)
-        src = tmp / "canon"
-        dst = tmp / "replica"
-        src.mkdir()
-        times = prepare_source_tree(src)
+def check_local_transport(failures: list[str], tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    peer_a = tmp / "local-a"
+    peer_b = tmp / "local-b"
+    peer_a.mkdir()
+    peer_b.mkdir()
+    mtimes = prepare_local_source(peer_a)
 
-        first = run_kitchensync(["--verbosity", "info", f"+{src}", str(dst)])
-        check(failures, first.returncode == 0, f"009.1: local first sync exited {first.returncode}; stdout={first.stdout!r}")
-        check(failures, first.stderr == "", f"009.1: stderr must be empty, got {first.stderr!r}")
-        assert_file(failures, dst / "alpha.txt", b"alpha from canon\n", "009.1, 009.12-009.20")
-        assert_file(failures, dst / "nested" / "beta.bin", b"\x00beta bytes\xff", "009.3-009.5, 009.12-009.20")
-        check(failures, (dst / "empty-dir").is_dir(), "009.5, 009.24: expected empty directory to be created")
-        assert_mtime_close(failures, dst / "alpha.txt", times["alpha"], 5.0, "009.8, 009.26")
-        assert_mtime_close(failures, dst / "nested" / "beta.bin", times["beta"], 5.0, "009.8, 009.26")
+    write_bytes(tmp / "outside-root.txt", b"outside\n", mtimes["root.txt"] + 100)
+    write_bytes(peer_b / "replace.txt", b"old replacement\n", mtimes["root.txt"])
+    write_bytes(peer_b / "extra.txt", b"remove me\n", mtimes["root.txt"])
+    write_bytes(peer_b / "type_conflict" / "kept_in_bak.txt", b"directory loser\n", mtimes["root.txt"])
 
-        (src / "alpha.txt").write_bytes(b"replacement content\n")
-        replacement_time = 1_700_001_000.0
-        os.utime(src / "alpha.txt", (replacement_time, replacement_time))
-        (src / "nested" / "beta.bin").unlink()
-        (src / "empty-dir").rmdir()
+    result = run_kitchensync([f"+{peer_a}", str(peer_b)])
+    record(failures, result.returncode == 0, "009 local sync should exit 0")
+    record(failures, result.stderr == "", "009 local sync should keep stderr empty")
+    record(failures, "sync complete" in result.stdout.splitlines(), "009 local sync should report completion")
 
-        second = run_kitchensync(["--verbosity", "info", f"+{src}", str(dst)])
-        check(failures, second.returncode == 0, f"009.1: local second sync exited {second.returncode}; stdout={second.stdout!r}")
-        check(failures, second.stderr == "", f"009.1: stderr must remain empty, got {second.stderr!r}")
-        assert_file(failures, dst / "alpha.txt", b"replacement content\n", "009.16-009.21, 009.26")
-        assert_mtime_close(failures, dst / "alpha.txt", replacement_time, 5.0, "009.26")
-        assert_absent(failures, dst / "nested" / "beta.bin", "009.21, 009.23")
-        assert_absent(failures, dst / "empty-dir", "009.21, 009.25")
-        check(failures, "C alpha.txt" in second.stdout, "009.12-009.21: expected copy progress for replaced local file")
-        check(failures, "X nested/beta.bin" in second.stdout, "009.23: expected delete/displace progress for removed local file")
+    record(failures, read_bytes(peer_b / "root.txt") == b"root file\n", "009.1, 009.25-009.34 local file copy should preserve root file bytes")
+    record(failures, read_bytes(peer_b / "nested" / "child.bin") == b"0123456789", "009.5-009.13 local traversal should copy immediate child file with size metadata")
+    record(failures, read_bytes(peer_b / "nested" / "deeper" / "leaf.txt") == b"leaf\n", "009.31 local open_write should create missing parent directories")
+    record(failures, (peer_b / "empty_dir").is_dir(), "009.39-009.40 local create_dir should create missing directories")
+    record(failures, not (peer_b / "outside-root.txt").exists(), "009.3-009.4 operations should stay scoped to relative peer-root paths")
+    record(failures, read_bytes(peer_b / "replace.txt") == b"new replacement\n", "009.35 and 009.37 local replacement should use safe rename-to-missing flow")
+    record(failures, read_bytes(peer_b / "type_conflict") == b"file wins\n", "009.16-009.24 local stat should distinguish file from directory in a type conflict")
+    record(failures, not (peer_b / "extra.txt").exists(), "009.35 and 009.38 local canon deletion should remove the obsolete live file path")
+
+    extra_bak = find_bak_entry(peer_b, "extra.txt")
+    conflict_bak = find_bak_entry(peer_b, "type_conflict")
+    record(failures, bool(extra_bak), "009.35 local same-filesystem rename should displace obsolete file to BAK")
+    record(failures, any((path / "kept_in_bak.txt").exists() for path in conflict_bak), "009.36 local directory displacement should preserve subtree contents")
+
+    for rel, expected in (
+        ("root.txt", mtimes["root.txt"]),
+        ("nested/child.bin", mtimes["child.bin"]),
+        ("nested/deeper/leaf.txt", mtimes["leaf.txt"]),
+        ("replace.txt", mtimes["replace.txt"]),
+    ):
+        dst = peer_b / rel
+        record(failures, dst.exists() and close_enough_mtime(dst.stat().st_mtime, expected), f"009.17, 009.42 local file mod_time should be preserved for {rel}")
+
+    rows = snapshot_rows(peer_b)
+    root_row = row_for(rows, "root.txt")
+    child_row = row_for(rows, "child.bin")
+    nested_row = row_for(rows, "nested")
+    empty_dir_row = row_for(rows, "empty_dir")
+    record(failures, root_row is not None and root_row.get("byte_size") == len(b"root file\n"), "009.8-009.9 local snapshot should record regular file size and mod_time")
+    record(failures, child_row is not None and child_row.get("byte_size") == 10, "009.6-009.9 local listing should report nested regular file name and byte size")
+    record(failures, nested_row is not None and nested_row.get("byte_size") == -1, "009.10-009.13 local listing should report directory name and byte size -1")
+    record(failures, empty_dir_row is not None and empty_dir_row.get("byte_size") == -1, "009.19-009.21 local stat/listing should record existing directory metadata")
+
+    second = run_kitchensync([str(peer_a), str(peer_b)])
+    record(failures, second.returncode == 0, "009.22 and 009.44 missing local snapshot paths should converge through not-found handling")
+    record(failures, second.stderr == "", "009 repeated local sync should keep stderr empty")
 
 
-class SftpFixture:
-    def __init__(self, failures: list[str], home: Path) -> None:
+class SftpServer:
+    def __init__(self, failures: list[str], tmp: Path) -> None:
         self.failures = failures
-        self.home = home
+        self.tmp = tmp
         self.proc: subprocess.Popen[str] | None = None
-        self.stdout_lines: queue.Queue[str] = queue.Queue()
         self.stderr_lines: queue.Queue[str] = queue.Queue()
         self.port: int | None = None
-        self.root: Path | None = None
-        self.host_key_line: str | None = None
+        self.host_key: str | None = None
 
-    def __enter__(self) -> "SftpFixture":
+    def __enter__(self) -> "SftpServer":
         self.proc = subprocess.Popen(
             [
-                str(uv_executable()),
+                str(bundled_uv()),
                 "run",
                 "--script",
-                str(SFTP_SERVER),
+                str(WORKSPACE_ROOT / "extart" / "ephemeral-sftp-server.py"),
                 "--user",
-                "ksuser",
+                "ks",
                 "--password",
-                "kspass",
+                "pw",
             ],
-            cwd=str(WORKSPACE),
+            cwd=str(WORKSPACE_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             shell=False,
         )
         assert self.proc.stdout is not None
         assert self.proc.stderr is not None
-        threading.Thread(target=self._reader, args=(self.proc.stdout, self.stdout_lines), daemon=True).start()
-        threading.Thread(target=self._reader, args=(self.proc.stderr, self.stderr_lines), daemon=True).start()
+        stdout_lines: queue.Queue[str] = queue.Queue()
 
-        port_line = self._get_line(self.stdout_lines, 20.0, "SFTP server did not print a port")
-        if port_line is None:
+        def collect_stdout() -> None:
+            assert self.proc is not None
+            assert self.proc.stdout is not None
+            for line in self.proc.stdout:
+                stdout_lines.put(line.rstrip("\n"))
+
+        def collect_stderr() -> None:
+            assert self.proc is not None
+            assert self.proc.stderr is not None
+            for line in self.proc.stderr:
+                self.stderr_lines.put(line.rstrip("\n"))
+
+        threading.Thread(target=collect_stdout, daemon=True).start()
+        threading.Thread(target=collect_stderr, daemon=True).start()
+        try:
+            line = stdout_lines.get(timeout=20.0).strip()
+        except queue.Empty:
+            self.failures.append("SFTP server should print its port within 20 seconds")
             return self
         try:
-            self.port = int(port_line.strip())
+            self.port = int(line)
         except ValueError:
-            self.failures.append(f"009.2: SFTP server printed a non-port stdout line: {port_line!r}")
+            self.failures.append(f"SFTP server should print a port number, got {line!r}")
             return self
 
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline and (self.root is None or self.host_key_line is None):
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and self.host_key is None:
             try:
-                line = self.stderr_lines.get(timeout=0.2)
+                err_line = self.stderr_lines.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if line.startswith("sftp root: "):
-                self.root = Path(line.removeprefix("sftp root: ").strip())
-            if line.startswith("host key: "):
-                self.host_key_line = line.removeprefix("host key: ").strip()
-
-        if self.root is None:
-            self.failures.append("009.2: SFTP server did not report its temporary root")
-        if self.host_key_line is None:
-            self.failures.append("009.2: SFTP server did not report its host key")
-        if self.port is not None and self.host_key_line is not None:
-            ssh_dir = self.home / ".ssh"
-            ssh_dir.mkdir(parents=True, exist_ok=True)
-            known_hosts = ssh_dir / "known_hosts"
-            known_hosts.write_text(
-                f"[127.0.0.1]:{self.port} {self.host_key_line}\n",
-                encoding="ascii",
-                newline="\n",
-            )
+            if err_line.startswith("host key: "):
+                self.host_key = err_line.removeprefix("host key: ")
+        record(self.failures, self.host_key is not None, "SFTP server should report a host key for known_hosts")
         return self
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
@@ -254,85 +260,95 @@ class SftpFixture:
             self.proc.kill()
             self.proc.wait(timeout=10)
 
-    def _reader(self, stream: object, lines: queue.Queue[str]) -> None:
-        for line in stream:
-            lines.put(str(line))
-
-    def _get_line(self, lines: queue.Queue[str], timeout: float, message: str) -> str | None:
-        try:
-            return lines.get(timeout=timeout)
-        except queue.Empty:
-            self.failures.append(f"009.2: {message}")
-            return None
-
-    def url(self, path: str) -> str:
-        assert self.port is not None
-        return f"sftp://ksuser:kspass@127.0.0.1:{self.port}/{path}"
-
-
-def test_sftp_transport(failures: list[str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-009-sftp-") as tmp_name:
-        tmp = Path(tmp_name)
-        home = tmp / "home"
-        home.mkdir()
+    def env(self) -> dict[str, str]:
+        home = self.tmp / "home"
+        ssh = home / ".ssh"
+        ssh.mkdir(parents=True, exist_ok=True)
+        known_hosts = ssh / "known_hosts"
+        known_hosts.write_text(f"[127.0.0.1]:{self.port} {self.host_key}\n", encoding="ascii", newline="\n")
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
-        env["SSH_AUTH_SOCK"] = ""
+        env["HOMEDRIVE"] = ""
+        env["HOMEPATH"] = str(home)
+        env.pop("SSH_AUTH_SOCK", None)
+        return env
 
-        with SftpFixture(failures, home) as sftp:
-            if sftp.port is None or sftp.root is None:
-                return
+    def url(self, root: str = "/transport-root") -> str:
+        return f"sftp://ks:pw@127.0.0.1:{self.port}{root}"
 
-            src = tmp / "canon"
-            src.mkdir()
-            times = prepare_source_tree(src)
-            remote_url = sftp.url("remote-root")
-            remote_root = sftp.root / "remote-root"
 
-            first = run_kitchensync(["--verbosity", "info", f"+{src}", remote_url], env=env)
-            check(failures, first.returncode == 0, f"009.2: SFTP first sync exited {first.returncode}; stdout={first.stdout!r}")
-            check(failures, first.stderr == "", f"009.2: SFTP sync stderr must be empty, got {first.stderr!r}")
-            assert_file(failures, remote_root / "alpha.txt", b"alpha from canon\n", "009.2, 009.12-009.20")
-            assert_file(failures, remote_root / "nested" / "beta.bin", b"\x00beta bytes\xff", "009.2-009.5, 009.12-009.20")
-            check(failures, (remote_root / "empty-dir").is_dir(), "009.2, 009.24: SFTP directory creation failed")
-            assert_mtime_close(failures, remote_root / "alpha.txt", times["alpha"], 5.0, "009.8, 009.26")
+def check_sftp_transport(failures: list[str], tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    with SftpServer(failures, tmp) as server:
+        if server.port is None or server.host_key is None:
+            return
+        env = server.env()
+        source = tmp / "sftp-source"
+        roundtrip = tmp / "sftp-roundtrip"
+        source.mkdir()
+        roundtrip.mkdir()
+        mtimes = prepare_local_source(source)
 
-            (src / "alpha.txt").write_bytes(b"sftp replacement\n")
-            replacement_time = 1_700_002_000.0
-            os.utime(src / "alpha.txt", (replacement_time, replacement_time))
-            (src / "nested" / "beta.bin").unlink()
-            (src / "empty-dir").rmdir()
+        upload = run_kitchensync([f"+{source}", server.url()], env=env)
+        record(failures, upload.returncode == 0, "009.2 SFTP upload sync should exit 0")
+        record(failures, upload.stderr == "", "009.2 SFTP upload should keep stderr empty")
+        record(failures, "sync complete" in upload.stdout.splitlines(), "009.2 SFTP upload should report completion")
 
-            second = run_kitchensync(["--verbosity", "info", f"+{src}", remote_url], env=env)
-            check(failures, second.returncode == 0, f"009.2: SFTP second sync exited {second.returncode}; stdout={second.stdout!r}")
-            check(failures, second.stderr == "", f"009.2: SFTP sync stderr must remain empty, got {second.stderr!r}")
-            assert_file(failures, remote_root / "alpha.txt", b"sftp replacement\n", "009.2, 009.16-009.21, 009.26")
-            assert_mtime_close(failures, remote_root / "alpha.txt", replacement_time, 5.0, "009.2, 009.26")
-            assert_absent(failures, remote_root / "nested" / "beta.bin", "009.2, 009.21, 009.23")
-            assert_absent(failures, remote_root / "empty-dir", "009.2, 009.21, 009.25")
+        download = run_kitchensync([f"+{server.url()}", str(roundtrip)], env=env)
+        record(failures, download.returncode == 0, "009.2 SFTP download sync should exit 0")
+        record(failures, download.stderr == "", "009.2 SFTP download should keep stderr empty")
+        record(failures, "sync complete" in download.stdout.splitlines(), "009.2 SFTP download should report completion")
+
+        record(failures, read_bytes(roundtrip / "root.txt") == b"root file\n", "009.2, 009.25-009.34 SFTP should stream file bytes back through SSH/SFTP")
+        record(failures, read_bytes(roundtrip / "nested" / "child.bin") == b"0123456789", "009.5-009.13 SFTP list_dir should expose immediate regular-file children")
+        record(failures, read_bytes(roundtrip / "nested" / "deeper" / "leaf.txt") == b"leaf\n", "009.31 SFTP open_write should create missing parent directories")
+        record(failures, (roundtrip / "empty_dir").is_dir(), "009.39-009.40 SFTP create_dir should create missing directories")
+        record(failures, not (roundtrip / "sftp-source").exists(), "009.3-009.4 SFTP operations should stay relative to the remote peer root")
+
+        for rel, expected in (
+            ("root.txt", mtimes["root.txt"]),
+            ("nested/child.bin", mtimes["child.bin"]),
+            ("nested/deeper/leaf.txt", mtimes["leaf.txt"]),
+        ):
+            dst = roundtrip / rel
+            record(failures, dst.exists() and close_enough_mtime(dst.stat().st_mtime, expected), f"009.17, 009.42 SFTP mod_time should round-trip for {rel}")
+
+        rows = snapshot_rows(roundtrip)
+        record(failures, row_for(rows, "root.txt") is not None, "009.48 file and SFTP peers should produce the same snapshot outcome for copied files")
+        record(failures, row_for(rows, "empty_dir") is not None and row_for(rows, "empty_dir").get("byte_size") == -1, "009.10-009.13 SFTP should report directory entries with byte size -1")
 
 
 def main() -> int:
     failures: list[str] = []
-    check(failures, KITCHENSYNC_EXE.is_file(), f"released executable is missing: {KITCHENSYNC_EXE}")
-    check(failures, SFTP_SERVER.is_file(), f"SFTP fixture is missing: {SFTP_SERVER}")
-    if not failures:
-        try:
-            test_local_transport(failures)
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"local transport check crashed: {exc!r}")
-        try:
-            test_sftp_transport(failures)
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"SFTP transport check crashed: {exc!r}")
+    record(failures, KITCHENSYNC_EXE.exists(), "released kitchensync.exe should exist")
+    record(failures, bundled_uv().exists(), "bundled uv executable should exist")
+
+    # not reasonably testable: 009.14, 009.23. The testing guidelines forbid
+    # creating symlinks or relying on symlink-specific behavior.
+    # not reasonably testable: 009.15, 009.24. Portable special-file setup would
+    # require platform-specific device, FIFO, or socket creation outside the
+    # specified happy-path CLI surface.
+    # not reasonably testable: 009.43. The sync specification records directory
+    # mod_time but does not expose a user operation that requires setting a
+    # directory's mod_time through the CLI.
+    # not reasonably testable: 009.45, 009.46, 009.47. Permission-denied,
+    # miscellaneous I/O, and mid-operation network failures require sabotaging
+    # the host filesystem or SFTP connection rather than normal user input.
+
+    with tempfile.TemporaryDirectory(prefix="kitchensync-009-") as temp_name:
+        tmp = Path(temp_name)
+        if KITCHENSYNC_EXE.exists():
+            check_local_transport(failures, tmp / "local")
+            shutil.rmtree(tmp / "local", ignore_errors=True)
+            if bundled_uv().exists():
+                check_sftp_transport(failures, tmp / "sftp")
 
     if failures:
-        print("FAILURES:")
         for failure in failures:
-            print(f"- {failure}")
+            print(f"FAIL: {failure}")
         return 1
-    print("test_009_transport_operations passed")
+    print("PASS: 009 transport operations")
     return 0
 
 
