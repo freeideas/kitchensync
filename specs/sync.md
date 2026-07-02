@@ -136,7 +136,7 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 ## Startup
 
 1. Parse command line. A help invocation is no arguments at all; it prints the help text to stdout and exits 0 (see `help.md`). For non-help invocations, validate: at least two peers, at most one `+` peer, no unrecognized flags, and all option values are valid (e.g., `--max-copies`, `--timeout-conn`, `--timeout-idle`, `--keep-tmp-days`, `--keep-bak-days`, `--keep-del-days`, `--retries-copy`, and `--retries-list` are positive integers; `--verbosity` is one of `error`/`info`/`debug`/`trace`; every `-x` path is a valid relative slash path; URL query parameters are limited to `timeout-conn` and `timeout-idle`). On any validation error, print the error message followed by the help text and exit 1.
-2. Connect to all peers in parallel. In normal runs, auto-create the peer's root directory (and any missing parents) if it does not exist - for both `file://` and `sftp://` URLs. In `--dry-run`, do not create missing peer roots or parents; a URL whose root path does not already exist is treated as unreachable for that run. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. Skip unreachable peers with an error-level diagnostic. If directory creation fails in a normal run, treat the peer as unreachable (try next fallback URL).
+2. Connect to all peers in parallel. In normal runs, auto-create the peer's root directory (and any missing parents) if it does not exist - for both `file://` and `sftp://` URLs. In `--dry-run`, do not create missing peer roots or parents; a URL whose root path does not already exist is treated as unreachable for that run. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. A reachable peer carries the connected peer root handle selected at startup: a local root handle for `file://`, or the established SSH/SFTP session plus remote root path for `sftp://`. Skip unreachable peers with an error-level diagnostic. If directory creation fails in a normal run, treat the peer as unreachable (try next fallback URL).
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
 5. In normal runs, recover any incomplete `.kitchensync/SWAP/snapshot.db/` state, then download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). In `--dry-run`, skip peer-side snapshot SWAP recovery and download the live `.kitchensync/snapshot.db` as-is. If a peer has no `snapshot.db` (transport returns 'not found'), create a new empty one locally. If recovery or download fails with any other error (I/O error, permission denied), treat the peer as unreachable: log an error-level diagnostic and exclude it from the reachable set, then re-evaluate steps 3-4 against the updated set and exit with the corresponding error if either check now fails.
@@ -302,39 +302,39 @@ Displaced entries are recoverable from BAK/ until cleaned. BAK/ is created at th
 
 ## Peer Transports
 
-Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine.
+Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
 
 ### Required Operations
 
 Every transport must support:
 
-- `list_dir(path)`:
+- `list_dir(peer, path)`:
   List immediate children: name, `is_dir`, `mod_time`, and `byte_size`.
   `byte_size` is the file size in bytes for files, or -1 for directories.
-- `stat(path)`:
+- `stat(peer, path)`:
   Return `mod_time`, `byte_size`, and `is_dir`; or "not found".
-- `open_read(path)` -> handle:
+- `open_read(peer, path)` -> handle:
   Open a file for streaming read.
 - `read(handle, max_bytes)`:
   Pull the next chunk; returns bytes or EOF.
 - `close_read(handle)`:
   Close a read handle.
-- `open_write(path)` -> handle:
+- `open_write(peer, path)` -> handle:
   Open a file for streaming write, creating the file and parent directories as
   needed.
 - `write(handle, bytes)`:
   Push the next chunk.
 - `close_write(handle)`:
   Finalize the write: flush and close.
-- `rename(src, dst)`:
+- `rename(peer, src, dst)`:
   Same-filesystem rename. The destination must not already exist.
-- `delete_file(path)`:
+- `delete_file(peer, path)`:
   Remove a file.
-- `create_dir(path)`:
+- `create_dir(peer, path)`:
   Create a directory and any needed parents.
-- `delete_dir(path)`:
+- `delete_dir(peer, path)`:
   Remove an empty directory.
-- `set_mod_time(path, time)`:
+- `set_mod_time(peer, path, time)`:
   Set file/directory modification time.
 
 `list_dir` returns only regular files and directories. Symbolic links, special files (devices, FIFOs, sockets), and any other non-regular entry types are silently omitted by the implementation. The same applies to `stat`: if the path is a symlink or special file, return "not found."

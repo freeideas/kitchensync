@@ -20,8 +20,9 @@ that work may occupy available copy slots while later directories are still
 being scanned.
 
 There is no per-peer, per-host, or per-connection transfer limit in the user
-interface. The implementation may keep SFTP sessions open and reuse them as an
-internal optimization, but this must not change the externally visible rule:
+interface. Startup keeps the selected peer connection state as the reachable
+peer handle, including the established SSH/SFTP session and remote root path for
+an `sftp://` peer, but this must not change the externally visible rule:
 `--max-copies` means max active file copies for the whole run.
 
 | Setting                   | Default | Global flag      |
@@ -71,7 +72,8 @@ At startup, each peer selects one winning URL:
    path does not exist, create it and any missing parents before connecting. In
    `--dry-run`, do not create missing local paths; treat that URL as failed for
    this run.
-4. First successful connection wins. Remaining URLs are not tried.
+4. First successful connection wins. The reachable peer handle records that
+   connection and root. Remaining URLs are not tried.
 5. If all URLs fail, the peer is unreachable for the run.
 
 After startup, all operations for a reachable peer use that peer's winning URL
