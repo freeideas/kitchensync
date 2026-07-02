@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import filecmp
 import os
 import shutil
 import sqlite3
@@ -12,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -21,17 +21,11 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-RELEASED_EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
+KITCHENSYNC_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
+TIMEOUT_SECONDS = 30
 
 
-@dataclass
-class RunResult:
-    code: int
-    stdout: str
-    stderr: str
-
-
-class Checks:
+class CheckRun:
     def __init__(self) -> None:
         self.failures: list[str] = []
 
@@ -39,318 +33,264 @@ class Checks:
         if not condition:
             self.failures.append(message)
 
-    def equal(self, actual: object, expected: object, message: str) -> None:
-        if actual != expected:
-            self.failures.append(f"{message}: expected {expected!r}, got {actual!r}")
 
-
-def product_exe() -> Path:
-    if RELEASED_EXE.exists():
-        return RELEASED_EXE
-    moved = Path(__file__).resolve().parents[1] / "released" / "kitchensync.exe"
-    return moved
-
-
-def run_kitchensync(args: list[str], timeout: float = 25.0) -> RunResult:
-    completed = subprocess.run(
-        [str(product_exe()), *args],
-        cwd=str(WORKSPACE_ROOT if WORKSPACE_ROOT.exists() else Path(__file__).resolve().parents[1]),
+def run_sync(*args: str | Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(KITCHENSYNC_EXE), *[str(arg) for arg in args]],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
-        check=False,
+        timeout=TIMEOUT_SECONDS,
+        shell=False,
     )
-    return RunResult(completed.returncode, completed.stdout, completed.stderr)
 
 
-def peer(root: Path, name: str) -> Path:
-    path = root / name
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def write_file(path: Path, text: str, seconds_ago: int = 0) -> None:
+def write_file(path: Path, text: str, offset_seconds: int = 0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
-    stamp = time.time() - seconds_ago
-    os.utime(path, (stamp, stamp))
+    if offset_seconds:
+        stamp = time.time() + offset_seconds
+        os.utime(path, (stamp, stamp))
 
 
 def read_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def snapshot_path(root: Path) -> Path:
-    return root / ".kitchensync" / "snapshot.db"
+def snapshot_path(peer: Path) -> Path:
+    return peer / ".kitchensync" / "snapshot.db"
 
 
-def snapshot_rows(root: Path) -> list[tuple[str, int, str | None, str | None]]:
-    db = snapshot_path(root)
-    with sqlite3.connect(str(db)) as conn:
-        rows = conn.execute(
-            "SELECT basename, byte_size, last_seen, deleted_time "
-            "FROM snapshot ORDER BY basename, byte_size, last_seen, deleted_time"
-        ).fetchall()
-    return [(str(a), int(b), c, d) for a, b, c, d in rows]
-
-
-def snapshot_has_rows(root: Path) -> bool:
-    db = snapshot_path(root)
+def snapshot_rows(peer: Path) -> list[tuple[str, int, str | None, str | None]]:
+    db = snapshot_path(peer)
     if not db.exists():
+        return []
+    with sqlite3.connect(str(db)) as conn:
+        return list(
+            conn.execute(
+                "SELECT basename, byte_size, last_seen, deleted_time "
+                "FROM snapshot ORDER BY basename, byte_size"
+            )
+        )
+
+
+def snapshot_has_basename(peer: Path, basename: str) -> bool:
+    return any(row[0] == basename for row in snapshot_rows(peer))
+
+
+def snapshot_bytes(peer: Path) -> bytes:
+    return snapshot_path(peer).read_bytes()
+
+
+def has_bak_entry(peer: Path, basename: str) -> bool:
+    bak_root = peer / ".kitchensync"
+    if not bak_root.exists():
         return False
-    return len(snapshot_rows(root)) > 0
+    return any(path.name == basename for path in bak_root.rglob(basename))
 
 
-def assert_clean_process(checks: Checks, result: RunResult, context: str) -> None:
-    checks.equal(result.stderr, "", f"{context} writes diagnostics only to stdout")
+def expect_success(checks: CheckRun, proc: subprocess.CompletedProcess[str], label: str) -> None:
+    checks.check(proc.returncode == 0, f"{label}: expected exit 0, got {proc.returncode}; stdout={proc.stdout!r}")
+    checks.check(proc.stderr == "", f"{label}: expected empty stderr, got {proc.stderr!r}")
+    checks.check("sync complete" in proc.stdout.splitlines(), f"{label}: stdout should include sync complete")
 
 
-def assert_exit_ok(checks: Checks, result: RunResult, context: str) -> None:
-    checks.equal(result.code, 0, f"{context} exits 0")
-    assert_clean_process(checks, result, context)
+def expect_failure(checks: CheckRun, proc: subprocess.CompletedProcess[str], label: str) -> None:
+    checks.check(proc.returncode != 0, f"{label}: expected non-zero exit, got 0")
+    checks.check(proc.stderr == "", f"{label}: expected empty stderr, got {proc.stderr!r}")
 
 
-def bootstrap_history(checks: Checks, root: Path, names: list[str]) -> dict[str, Path]:
-    peers = {name: peer(root, name) for name in names}
-    write_file(peers[names[0]] / "shared.txt", "canon seed\n", seconds_ago=40)
-    args = ["+" + str(peers[names[0]]), *[str(peers[name]) for name in names[1:]]]
-    result = run_kitchensync(args)
-    assert_exit_ok(checks, result, "bootstrap history run")
-    for name in names:
-        checks.check(
-            snapshot_has_rows(peers[name]),
-            f"bootstrap writes snapshot history for {name}",
-        )
-    return peers
+def test_first_sync_requires_canon(checks: CheckRun, root: Path) -> None:
+    peer_a = root / "first-no-canon-a"
+    peer_b = root / "first-no-canon-b"
+    peer_a.mkdir()
+    peer_b.mkdir()
+
+    proc = run_sync(peer_a, peer_b)
+
+    expect_failure(checks, proc, "012.4/012.5 first sync without canon")
+    checks.check(
+        "First sync? Mark the authoritative peer with a leading +" in proc.stdout,
+        "012.4: first sync without canon should print the required guidance",
+    )
 
 
-def scenario_first_sync_requires_canon(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-first-") as tmp:
-        root = Path(tmp)
-        left = peer(root, "left")
-        right = peer(root, "right")
-        write_file(left / "only-left.txt", "left\n")
+def test_no_contributing_peer(checks: CheckRun, root: Path) -> None:
+    canon = root / "no-contrib-canon"
+    historical = root / "no-contrib-historical"
+    new_peer = root / "no-contrib-new"
+    canon.mkdir()
+    historical.mkdir()
+    new_peer.mkdir()
+    write_file(canon / "seed.txt", "seed\n")
 
-        result = run_kitchensync([str(left), str(right)])
+    setup = run_sync(f"+{canon}", historical)
+    expect_success(checks, setup, "setup for 012.3/012.6/012.7")
 
-        checks.equal(result.code, 1, "012.5 first sync without canon exits 1")
-        checks.check(
-            "First sync? Mark the authoritative peer with a leading +" in result.stdout,
-            "012.4 first sync without canon prints the required guidance",
-        )
-        assert_clean_process(checks, result, "012.4/012.5 first sync failure")
+    proc = run_sync(f"-{historical}", new_peer)
 
-
-def scenario_no_contributing_peer(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-nocontrib-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["source", "sub"])
-        shutil.rmtree(peers["sub"] / ".kitchensync")
-
-        result = run_kitchensync(["-" + str(peers["source"]), str(peers["sub"])])
-
-        checks.check(result.code != 0, "012.7 no contributing peer exits with an error")
-        checks.check(
-            "No contributing peer reachable - cannot make sync decisions" in result.stdout,
-            "012.6 no contributing peer prints the required diagnostic",
-        )
-        assert_clean_process(checks, result, "012.6/012.7 no contributing failure")
+    expect_failure(checks, proc, "012.3/012.6/012.7 no contributing peer")
+    checks.check(
+        "No contributing peer reachable - cannot make sync decisions" in proc.stdout,
+        "012.6: all-subordinate run should print the required no-contributor message",
+    )
+    checks.check(
+        not (new_peer / "seed.txt").exists(),
+        "012.3/012.7: marked subordinate peer with history must not contribute a decision",
+    )
 
 
-def scenario_auto_subordinate_and_later_contributor(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-auto-sub-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["a", "b"])
-        new_peer = peer(root, "new_peer")
-        write_file(new_peer / "new-only.txt", "should not vote\n", seconds_ago=5)
+def test_subordinate_and_canon_roles(checks: CheckRun, root: Path) -> tuple[Path, Path, Path]:
+    canon = root / "roles-canon"
+    normal_new = root / "roles-normal-new"
+    explicit_sub = root / "roles-explicit-sub"
+    canon.mkdir()
+    normal_new.mkdir()
+    explicit_sub.mkdir()
+    write_file(canon / "keep.txt", "canon keep\n")
+    write_file(canon / "conflict.txt", "canon old\n", offset_seconds=-100)
+    write_file(explicit_sub / "sub-only.txt", "must not influence decisions\n")
 
-        first = run_kitchensync([str(peers["a"]), str(peers["b"]), str(new_peer)])
+    first = run_sync(f"+{canon}", normal_new, f"-{explicit_sub}")
 
-        assert_exit_ok(checks, first, "012.1 subordinate onboarding run")
-        checks.check(
-            not (new_peer / "new-only.txt").exists(),
-            "012.1 and 012.10 snapshotless non-canon peer does not contribute its new file",
-        )
-        checks.equal(
-            read_file(new_peer / "shared.txt"),
-            "canon seed\n",
-            "012.11 snapshotless subordinate receives the selected group outcome",
-        )
-        checks.check(
-            snapshot_has_rows(new_peer),
-            "012.12 normal run writes updated snapshot data to the subordinate peer",
-        )
+    expect_success(checks, first, "012.1/012.2/012.10/012.11/012.12/012.13 first canon run")
+    checks.check(
+        read_file(normal_new / "keep.txt") == "canon keep\n",
+        "012.1/012.12: snapshotless non-canon peer should receive canon file as subordinate",
+    )
+    checks.check(
+        read_file(explicit_sub / "keep.txt") == "canon keep\n",
+        "012.12: explicit subordinate peer should receive selected outcome",
+    )
+    checks.check(
+        not (canon / "sub-only.txt").exists() and not (normal_new / "sub-only.txt").exists(),
+        "012.11: subordinate-only entry must not contribute to sync decisions",
+    )
+    checks.check(
+        not (explicit_sub / "sub-only.txt").exists() and has_bak_entry(explicit_sub, "sub-only.txt"),
+        "012.10/012.12: subordinate listing should be processed and extra entry displaced",
+    )
+    checks.check(
+        snapshot_has_basename(normal_new, "keep.txt") and snapshot_has_basename(explicit_sub, "keep.txt"),
+        "012.13: normal run should upload updated snapshot data to subordinate peers",
+    )
 
-        write_file(new_peer / "later.txt", "later contributor\n", seconds_ago=0)
-        second = run_kitchensync([str(peers["a"]), str(peers["b"]), str(new_peer)])
+    write_file(normal_new / "conflict.txt", "newer non-canon text\n", offset_seconds=200)
+    canon_wins = run_sync(f"+{canon}", normal_new)
 
-        assert_exit_ok(checks, second, "012.13 later contributor run")
-        checks.equal(
-            read_file(peers["a"] / "later.txt"),
-            "later contributor\n",
-            "012.13 previous subordinate contributes after it has history and no '-' prefix",
-        )
-        checks.equal(
-            read_file(peers["b"] / "later.txt"),
-            "later contributor\n",
-            "012.13 previous subordinate propagates its later new file",
-        )
+    expect_success(checks, canon_wins, "012.9 canon conflict")
+    checks.check(
+        read_file(normal_new / "conflict.txt") == "canon old\n",
+        "012.9: canon peer state should win even against a newer conflicting peer file",
+    )
 
+    no_canon = run_sync(canon, normal_new)
+    expect_success(checks, no_canon, "012.8 no canon with snapshot history")
 
-def scenario_canon_snapshotless_and_conflict_winner(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-canon-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["a", "b"])
-        canon = peer(root, "canon")
-        write_file(canon / "shared.txt", "snapshotless canon wins\n", seconds_ago=60)
-        write_file(peers["a"] / "shared.txt", "normal has different state\n", seconds_ago=0)
+    write_file(canon / "dry-only.txt", "dry run source\n", offset_seconds=300)
+    before_sub_snapshot = snapshot_bytes(explicit_sub)
+    dry = run_sync("--dry-run", canon, normal_new, f"-{explicit_sub}")
 
-        result = run_kitchensync(["+" + str(canon), str(peers["a"]), str(peers["b"])])
+    expect_success(checks, dry, "012.14 dry-run subordinate snapshot")
+    checks.check(
+        "dry run" in dry.stdout.lower(),
+        "012.14: dry run should report dry run mode on stdout",
+    )
+    checks.check(
+        not (explicit_sub / "dry-only.txt").exists(),
+        "012.14: dry run must not copy selected outcomes to subordinate peer",
+    )
+    checks.check(
+        snapshot_bytes(explicit_sub) == before_sub_snapshot,
+        "012.14: dry run must not upload updated temporary snapshot data to subordinate peer",
+    )
 
-        assert_exit_ok(checks, result, "012.2 snapshotless canon run")
-        checks.equal(
-            read_file(peers["a"] / "shared.txt"),
-            "snapshotless canon wins\n",
-            "012.2 snapshotless canon remains contributing",
-        )
-        checks.equal(
-            read_file(peers["b"] / "shared.txt"),
-            "snapshotless canon wins\n",
-            "012.9 canon state wins sync conflicts unconditionally",
-        )
-        checks.check(
-            snapshot_has_rows(canon),
-            "012.2 snapshotless canon receives snapshot history after the run",
-        )
+    write_file(explicit_sub / "later-contributor.txt", "from previous subordinate\n", offset_seconds=400)
+    later = run_sync(canon, normal_new, explicit_sub)
 
+    expect_success(checks, later, "012.15 later contribution")
+    checks.check(
+        read_file(canon / "later-contributor.txt") == "from previous subordinate\n"
+        and read_file(normal_new / "later-contributor.txt") == "from previous subordinate\n",
+        "012.15: a peer that was subordinate in a previous normal run should later contribute when unmarked",
+    )
 
-def scenario_explicit_subordinate_with_history(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-explicit-sub-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["a", "b", "c"])
-        write_file(peers["c"] / "c-only.txt", "history peer should not vote\n")
-        write_file(peers["c"] / "shared.txt", "subordinate changed shared\n")
-
-        result = run_kitchensync([str(peers["a"]), str(peers["b"]), "-" + str(peers["c"])])
-
-        assert_exit_ok(checks, result, "012.3 explicit subordinate run")
-        checks.check(
-            not (peers["a"] / "c-only.txt").exists(),
-            "012.3 and 012.10 '-' peer with history does not contribute unique entries",
-        )
-        checks.check(
-            not (peers["b"] / "c-only.txt").exists(),
-            "012.3 subordinate-only file is not propagated to contributing peers",
-        )
-        checks.equal(
-            read_file(peers["c"] / "shared.txt"),
-            "canon seed\n",
-            "012.11 explicit subordinate receives the contributing peers' outcome",
-        )
-        checks.check(
-            any(row[0] == "c-only.txt" and row[3] is not None for row in snapshot_rows(peers["c"])),
-            "012.12 explicit subordinate snapshot records displaced subordinate-only file",
-        )
+    return canon, normal_new, explicit_sub
 
 
-def scenario_no_canon_after_history(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-no-canon-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["a", "b"])
-        write_file(peers["b"] / "after-history.txt", "no canon needed\n")
+def test_offline_peer_roles(checks: CheckRun, root: Path) -> None:
+    peer_a = root / "offline-a"
+    peer_b = root / "offline-b"
+    peer_o = root / "offline-peer"
+    peer_a.mkdir()
+    peer_b.mkdir()
+    peer_o.mkdir()
+    write_file(peer_a / "baseline.txt", "baseline\n")
 
-        result = run_kitchensync([str(peers["a"]), str(peers["b"])])
+    setup = run_sync(f"+{peer_a}", peer_b, peer_o)
+    expect_success(checks, setup, "setup for 012.16-012.19")
 
-        assert_exit_ok(checks, result, "012.8 no-canon run after history")
-        checks.equal(
-            read_file(peers["a"] / "after-history.txt"),
-            "no canon needed\n",
-            "012.8 reachable snapshot history on a contributing peer removes canon requirement",
-        )
+    saved_offline = root / "offline-peer-saved"
+    shutil.move(str(peer_o), str(saved_offline))
+    write_file(saved_offline / "offline-only.txt", "offline change\n", offset_seconds=500)
+    before_rows = snapshot_rows(saved_offline)
+    before_bytes = snapshot_bytes(saved_offline)
+    write_file(peer_o, "not a directory\n")
+    write_file(peer_a / "online-only.txt", "online change\n", offset_seconds=600)
 
+    offline_run = run_sync(peer_a, peer_b, peer_o)
 
-def scenario_offline_peer_exclusion_and_later_return(checks: Checks) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-012-offline-") as tmp:
-        root = Path(tmp)
-        peers = bootstrap_history(checks, root, ["a", "b", "offline"])
-        offline = peers["offline"]
-        offline_saved = root / "offline_saved"
-        shutil.move(str(offline), str(offline_saved))
-        write_file(offline, "this file blocks auto-created directory\n")
-        before_rows = snapshot_rows(offline_saved)
-        write_file(peers["a"] / "while-offline.txt", "created while offline\n")
+    expect_success(checks, offline_run, "012.16/012.17/012.18 offline peer omitted")
+    checks.check(
+        read_file(peer_b / "online-only.txt") == "online change\n",
+        "012.16/012.17: reachable peers should still sync while an unreachable peer is omitted",
+    )
+    checks.check(
+        not (peer_a / "offline-only.txt").exists() and not (peer_b / "offline-only.txt").exists(),
+        "012.16/012.17: unreachable peer filesystem entries must be omitted from listings and decisions",
+    )
+    checks.check(
+        snapshot_rows(saved_offline) == before_rows and snapshot_bytes(saved_offline) == before_bytes,
+        "012.18: unreachable peer snapshot rows must not be modified during the run",
+    )
 
-        offline_run = run_kitchensync([str(peers["a"]), str(peers["b"]), str(offline)])
+    peer_o.unlink()
+    shutil.move(str(saved_offline), str(peer_o))
+    catch_up = run_sync(peer_a, peer_b, peer_o)
 
-        assert_exit_ok(checks, offline_run, "012.14 offline peer run")
-        checks.check(
-            offline.is_file(),
-            "012.14 unreachable peer is not converted into a reachable sync root",
-        )
-        checks.check(
-            not (offline / "while-offline.txt").exists(),
-            "012.15 unreachable peer receives no sync decision outcome during that run",
-        )
-        checks.equal(
-            snapshot_rows(offline_saved),
-            before_rows,
-            "012.16 unreachable peer snapshot rows are not modified while unreachable",
-        )
-        # not reasonably testable: 012.14 exact internal listing membership is not
-        # directly observable; the checks above verify no peer operations are applied.
-
-        offline.unlink()
-        shutil.move(str(offline_saved), str(offline))
-        write_file(offline / "offline-new.txt", "returned peer drives decision\n")
-
-        return_run = run_kitchensync([str(peers["a"]), str(peers["b"]), str(offline)])
-
-        assert_exit_ok(checks, return_run, "012.17 returned peer run")
-        checks.equal(
-            read_file(peers["a"] / "offline-new.txt"),
-            "returned peer drives decision\n",
-            "012.17 returned peer filesystem discrepancy drives a sync decision",
-        )
-        checks.equal(
-            read_file(peers["b"] / "offline-new.txt"),
-            "returned peer drives decision\n",
-            "012.17 returned peer discrepancy propagates to other contributors",
-        )
+    expect_success(checks, catch_up, "012.19 offline peer later reachable")
+    checks.check(
+        read_file(peer_a / "offline-only.txt") == "offline change\n"
+        and read_file(peer_b / "offline-only.txt") == "offline change\n"
+        and read_file(peer_o / "online-only.txt") == "online change\n",
+        "012.19: when a previously unreachable peer returns, live discrepancies against its snapshot should drive sync decisions",
+    )
 
 
 def main() -> int:
-    checks = Checks()
-    scenarios = [
-        scenario_first_sync_requires_canon,
-        scenario_no_contributing_peer,
-        scenario_auto_subordinate_and_later_contributor,
-        scenario_canon_snapshotless_and_conflict_winner,
-        scenario_explicit_subordinate_with_history,
-        scenario_no_canon_after_history,
-        scenario_offline_peer_exclusion_and_later_return,
-    ]
+    checks = CheckRun()
+    checks.check(KITCHENSYNC_EXE.exists(), f"released executable does not exist: {KITCHENSYNC_EXE}")
 
-    if not product_exe().exists():
-        checks.failures.append(f"released executable does not exist: {product_exe()}")
-    else:
-        for scenario in scenarios:
-            try:
-                scenario(checks)
-            except subprocess.TimeoutExpired as exc:
-                checks.failures.append(f"{scenario.__name__} timed out after {exc.timeout} seconds")
-            except Exception as exc:
-                checks.failures.append(f"{scenario.__name__} raised {type(exc).__name__}: {exc}")
+    with tempfile.TemporaryDirectory(prefix="kitchensync-012-") as tmp:
+        root = Path(tmp)
+        try:
+            test_first_sync_requires_canon(checks, root)
+            test_no_contributing_peer(checks, root)
+            test_subordinate_and_canon_roles(checks, root)
+            test_offline_peer_roles(checks, root)
+        except subprocess.TimeoutExpired as exc:
+            checks.failures.append(f"subprocess timed out after {exc.timeout} seconds: {exc.cmd!r}")
+        except Exception as exc:
+            checks.failures.append(f"unexpected test exception: {type(exc).__name__}: {exc}")
 
     if checks.failures:
-        print("FAILURES:")
-        for index, failure in enumerate(checks.failures, 1):
-            print(f"{index}. {failure}")
+        for failure in checks.failures:
+            print(f"FAIL: {failure}")
         return 1
 
-    print("test_012_peer_roles passed")
+    print("all peer role checks passed")
     return 0
 
 
