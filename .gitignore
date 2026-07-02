@@ -72,11 +72,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Java / JVM
+# Java / JVM (Gradle)
 *.class
 *.jar
 *.war
 *.ear
+build/
+.gradle/
+.kotlin/
 
 # IDE and OS files
 .idea/

@@ -1,0 +1,23 @@
+{
+  "decision": "split",
+  "architecture_notes": [
+    "Use a small facade over backend adapters; keep shared operation semantics and error category parity at this parent."
+  ],
+  "children": [
+    {
+      "name": "LocalTransportOperations",
+      "responsibility": "Perform the connected file:// peer filesystem operations through the local filesystem.",
+      "reqs": [
+        "009.1"
+      ]
+    },
+    {
+      "name": "SftpTransportOperations",
+      "responsibility": "Perform the connected sftp:// peer filesystem operations through the established SSH/SFTP connection.",
+      "reqs": [
+        "009.2",
+        "009.29"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[package]
+name = "treesyncplanner_fileoutcomes_peerfileclassification"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

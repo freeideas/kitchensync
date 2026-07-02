@@ -1,0 +1,18 @@
+[package]
+name = "stagingrecovery"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"transportoperations" = { path = "../TransportOperations" }
+"stagingrecovery_bakdisplacement" = { path = "subpjx/BakDisplacement" }
+"stagingrecovery_stagingcleanup" = { path = "subpjx/StagingCleanup" }
+"stagingrecovery_swaprecovery" = { path = "subpjx/SwapRecovery" }
+"stagingrecovery_tmpstagingpaths" = { path = "subpjx/TmpStagingPaths" }
+
+[dev-dependencies]
+"transportoperations_localtransportoperations" = { path = "../TransportOperations/subpjx/LocalTransportOperations" }
+"transportoperations_sftptransportoperations" = { path = "../TransportOperations/subpjx/SftpTransportOperations" }

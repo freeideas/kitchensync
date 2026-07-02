@@ -1,180 +1,222 @@
-//! Public interface for the CopyQueue subproject.
-//!
-//! CopyQueue executes the file copies the sync engine decides to perform. It
-//! runs those copies concurrently under one global copy-slot limit shared
-//! across the whole run, retries failed copies up to a per-copy try limit, and
-//! makes each replacement recoverable through SWAP staging. It also owns the
-//! TMP/SWAP/BAK staging areas under each directory's `.kitchensync/`.
-//!
-//! CopyQueue never decides which files to copy or which modification time wins;
-//! those decisions arrive from the caller as enqueued copy requests. CopyQueue
-//! only carries them out safely and reports progress through the output service.
+use std::any::Any;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
-use std::time::{Duration, SystemTime};
+pub type CopyQueueEventSink = Arc<dyn Fn(CopyQueueEvent) + Send + Sync + 'static>;
 
-/// A single file copy to perform, as decided by the sync engine.
-///
-/// Peers are identified by their winning (canonical) URL; paths are relative to
-/// the peer root and slash-separated.
-pub struct CopyRequest {
-    /// Source peer, identified by its winning (canonical) URL.
-    pub src_peer: String,
-    /// Source path relative to the source peer's root.
-    pub src_path: String,
-    /// Destination peer, identified by its winning (canonical) URL.
-    pub dst_peer: String,
-    /// Destination path relative to the destination peer's root.
-    pub dst_path: String,
-    /// The winning modification time to stamp on the destination once the
-    /// replacement is in place. It is set verbatim and is never re-read from
-    /// the source file.
-    pub mod_time: SystemTime,
-    /// Called exactly once when the copy succeeds, before the copy slot is
-    /// released. `None` means no action on success.
-    pub on_success: Option<Box<dyn FnOnce() + Send>>,
+#[derive(Clone)]
+pub struct ConnectedPeerHandle {
+    pub identity: String,
+    pub winning_url: String,
+    pub scheme: PeerScheme,
+    pub handle: Arc<dyn Any + Send + Sync>,
 }
 
-/// Run-global settings for the copy queue.
-///
-/// A field left `None` selects the documented default. These settings are
-/// established once per run, before any copy is enqueued or any SWAP recovery
-/// or cleanup is requested.
-pub struct CopyConfig {
-    /// Single global limit on the number of file copies that may hold a slot at
-    /// one instant across the whole run. `None` selects 10. The limit is
-    /// independent of peer scheme, peer count, and connection count, and only
-    /// file copies count against it.
-    pub copy_slot_limit: Option<usize>,
-    /// Maximum total number of tries for one queued copy, counting the first
-    /// try. `None` selects 3. Try budgets are tracked per copy and are
-    /// independent across copies.
-    pub copy_try_limit: Option<u32>,
-    /// Age beyond which a `.kitchensync/BAK/<timestamp>/` entry is purged,
-    /// judged from its `<timestamp>` directory-name component. `None` selects
-    /// 90 days.
-    pub bak_retention: Option<Duration>,
-    /// Age beyond which a `.kitchensync/TMP/<timestamp>/` entry is purged,
-    /// judged from its `<timestamp>` directory-name component. `None` selects
-    /// 2 days.
-    pub tmp_retention: Option<Duration>,
-    /// When true, every peer-mutating operation is suppressed: no copy is
-    /// performed, SWAP recovery during traversal is skipped, and BAK/TMP
-    /// cleanup is skipped.
-    pub dry_run: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerScheme {
+    File,
+    Sftp,
 }
 
-/// The copy-execution service. A single shared instance is used for the whole
-/// run, so `Arc<dyn CopyQueue>` is the handle other components hold.
+pub struct CopyQueueRunRequest {
+    pub max_active_copies: Option<NonZeroU32>,
+    pub max_total_tries_per_copy: NonZeroU32,
+    pub peers: Vec<ConnectedPeerHandle>,
+    pub mutation_policy: CopyMutationPolicy,
+    pub event_sink: CopyQueueEventSink,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyMutationPolicy {
+    Normal,
+    DryRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CopyQueueRunId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedCopy {
+    pub source_peer_identity: String,
+    pub source_relative_file_path: String,
+    pub destination_peer_identity: String,
+    pub destination_relative_file_path: String,
+    pub report_relative_path: String,
+    pub winning_mod_time: String,
+    pub winning_byte_size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyQueueEvent {
+    CopyStart {
+        relpath: String,
+        source_peer_identity: String,
+        destination_peer_identity: String,
+        try_number: u32,
+    },
+    CopySlotAcquire {
+        active: u32,
+        max: u32,
+    },
+    CopySlotRelease {
+        active: u32,
+        max: u32,
+    },
+    TransferSuccess {
+        relpath: String,
+        destination_peer_identity: String,
+    },
+    TransferSkip {
+        relpath: String,
+        destination_peer_identity: String,
+        phase: CopyFailurePhase,
+        transport_error: Option<TransportErrorCategory>,
+    },
+    TransferFailure {
+        relpath: String,
+        destination_peer_identity: String,
+        phase: CopyFailurePhase,
+        transport_error: Option<TransportErrorCategory>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyQueueDrainResult {
+    pub results: Vec<QueuedCopyResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedCopyResult {
+    pub copy: QueuedCopy,
+    pub total_tries: u32,
+    pub outcome: QueuedCopyOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueuedCopyOutcome {
+    Succeeded,
+    SkippedForRun {
+        phase: CopyFailurePhase,
+        transport_error: Option<TransportErrorCategory>,
+    },
+    FailedTryLimit {
+        phase: CopyFailurePhase,
+        transport_error: Option<TransportErrorCategory>,
+        installation_state: CopyInstallationState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyInstallationState {
+    NotInstalled,
+    OriginalDestinationStillInPlace,
+    SwapOldLeftForRecovery,
+    FinalDestinationInstalled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFailurePhase {
+    ReadSource,
+    WriteSwapNew,
+    MoveExistingToSwapOld,
+    RenameFinal,
+    SetModTime,
+    ArchiveOld,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportErrorCategory {
+    NotFound,
+    PermissionDenied,
+    IoError,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyQueueError {
+    UnknownRun,
+    QueueClosed,
+    DuplicatePeerIdentity(String),
+    UnknownSourcePeer(String),
+    UnknownDestinationPeer(String),
+}
+
 pub trait CopyQueue: Send + Sync {
-    /// Establish the run-global settings (copy-slot limit, per-copy try limit,
-    /// BAK/TMP retention, and dry-run mode) for the run.
+    /// Opens one run-scoped copy queue and returns the token used by later
+    /// enqueue and drain calls.
     ///
-    /// Call this once before any other operation. A `None` field takes its
-    /// documented default.
-    fn configure(&self, config: CopyConfig);
+    /// When `max_active_copies` is `None`, the queue uses a global maximum of
+    /// `10`; otherwise it uses the supplied positive value. The total try
+    /// limit is per queued copy and includes the first try. The connected peer
+    /// handles are already established for their winning URLs and later copy
+    /// work must use only those handles, without reconnecting or selecting
+    /// fallback URLs. In dry-run mode the queue still starts work, acquires
+    /// active-copy slots, reads source files, applies retry limits, and emits
+    /// the same copy and failed-copy events as a normal run, but performs no
+    /// destination-side peer mutation. The event sink receives structured
+    /// events in queue order for starts, slot changes, successes, skips, and
+    /// failures; stdout formatting is outside this trait. Duplicate peer
+    /// identities are rejected before the run is opened.
+    fn open_run(&self, request: CopyQueueRunRequest) -> Result<CopyQueueRunId, CopyQueueError>;
 
-    /// Enqueue a file copy and return immediately, without waiting for it to
-    /// run.
+    /// Adds one already-eligible file copy to an open run queue.
     ///
-    /// A newly enqueued copy is accepted while earlier copies are still
-    /// running, so copy work for an already-scanned directory begins while
-    /// later directories are still being scanned; the queue never waits for a
-    /// whole-tree scan before starting. The copy is scheduled under the global
-    /// copy-slot limit, and only file copies count against that limit.
-    ///
-    /// Each copy that would replace an existing destination follows this
-    /// ordered, recoverable SWAP sequence, never writing the destination in
-    /// place:
-    ///
-    /// 1. Recover or fail any existing SWAP directory for the target basename.
-    /// 2. Write the new content to
-    ///    `<target-parent>/.kitchensync/SWAP/<encoded-basename>/new`.
-    /// 3. If a file exists at the target, move it to that SWAP `old`.
-    /// 4. Rename the SWAP `new` file onto the final target path.
-    /// 5. Set the destination's modification time to `request.mod_time`.
-    /// 6. If SWAP `old` exists, archive it to BAK.
-    /// 7. Remove the empty SWAP directories.
-    ///
-    /// The `<encoded-basename>` segment is the target basename percent-encoded
-    /// to a single path segment.
-    ///
-    /// Retry: when a try fails before the copy reaches its try limit, the copy
-    /// is moved to the back of the queue and other work continues; when its try
-    /// count reaches the limit it is marked failed for the run and is not
-    /// requeued. The copy is tried at most its try-limit times in total.
-    ///
-    /// Error obligations during a copy:
-    /// - Transfer failure before SWAP `old` exists deletes the staged SWAP
-    ///   `new`, then requeues or fails the copy by its try count.
-    /// - Failure to move the existing destination to SWAP `old` leaves the
-    ///   original destination in place and skips this copy for the run.
-    /// - Transfer failure after SWAP `old` exists leaves the SWAP state in
-    ///   place for later recovery.
-    /// - Failure to archive SWAP `old` to BAK after the replacement is in place
-    ///   leaves SWAP `old` in place for later recovery.
-    ///
-    /// The per-copy outcome (succeeded, or failed-for-the-run after exhausting
-    /// tries) is reported through the output service, not returned here. In a
-    /// dry-run the copy is not performed.
-    fn enqueue(&self, request: CopyRequest);
+    /// Enqueued work becomes eligible immediately and may start before
+    /// traversal has finished scanning the whole tree, subject only to the
+    /// run's global active-copy limit and available queued work. The queue
+    /// must not impose any lower per-peer, per-host, or per-connection copy
+    /// limit. The source and destination peer identities must name peers from
+    /// the run request. The relative source and destination paths are already
+    /// selected by the caller; this trait does not decide winners, canon
+    /// status, excludes, displacements, or traversal. Enqueue after the run has
+    /// been closed for draining is rejected and does not add work.
+    fn enqueue(&self, run_id: CopyQueueRunId, copy: QueuedCopy) -> Result<(), CopyQueueError>;
 
-    /// Block until every copy enqueued so far has reached a terminal outcome
-    /// (succeeded, or failed-for-the-run after exhausting tries).
+    /// Closes one run queue and waits until all accepted work has reached a
+    /// terminal run outcome.
     ///
-    /// Called once after the traversal has enqueued all copies, so the run does
-    /// not exit while copies are still running.
-    fn wait(&self);
-
-    /// Run the given jobs concurrently on the shared executor and block until
-    /// all of them have finished.
+    /// Closing means traversal will enqueue no more copies. Draining returns
+    /// only after every queued copy has succeeded, has been skipped for this
+    /// run, or has reached its per-copy total try limit. Every active try holds
+    /// exactly one global copy slot from just before the transfer try begins
+    /// until after all cleanup required for that try and the matching slot
+    /// release event have completed. The limit is shared across file-to-file,
+    /// file-to-sftp, sftp-to-file, and sftp-to-sftp copies; directory listing,
+    /// snapshot transfer, directory creation, and BAK, TMP, or SWAP cleanup
+    /// outside a copy try do not count as active file copies.
     ///
-    /// This is the shared concurrent executor the caller uses to issue the
-    /// directory listings for all reachable peers at a given directory level at
-    /// the same time rather than one after another. Each job performs one peer's
-    /// work (typically a transport listing) and stores its own result in state
-    /// the closure captured; the method returns only once every job has
-    /// completed.
+    /// For each normal transfer, the destination basename is percent-encoded
+    /// when needed so the encoded value is one path segment on every supported
+    /// transport. Before writing replacement content, the queue recovers any
+    /// existing SWAP directory for that encoded basename or treats recovery
+    /// failure as a failed try before SWAP `old` exists. Replacement content
+    /// must be written only to SWAP `new`; any existing destination file must
+    /// move to SWAP `old` before SWAP `new` moves to the final path; the final
+    /// destination modification time must be set to the winning modification
+    /// time; any SWAP `old` must be archived below the nearby BAK timestamp
+    /// directory using a fresh process-local timestamp string for that archive
+    /// path; and successful transfers must remove their empty SWAP
+    /// directories. A destination that had no existing file creates no BAK
+    /// entry. Active transfer I/O must stream with bounded buffering whose
+    /// memory use is independent of source file size.
     ///
-    /// The jobs run on the same executor as file copies but never consume a copy
-    /// slot, so they proceed at full concurrency even while the copy-slot limit
-    /// is full. This operation only schedules the work; it reads and mutates no
-    /// peer state of its own and so behaves identically in a normal run and a
-    /// dry-run.
-    fn run_in_parallel<'scope>(&self, jobs: Vec<Box<dyn FnOnce() + Send + 'scope>>);
-
-    /// Recover the SWAP state for a directory on a peer, before that directory's
-    /// live entries are listed for sync decisions.
-    ///
-    /// Each `.kitchensync/SWAP/<encoded-basename>` directory is recovered
-    /// according to the presence of `old`, `new`, and the target:
-    /// - `old` present, target present: move `old` to BAK, remove the SWAP dir.
-    /// - `old` present, `new` present, target missing: rename `new` to the
-    ///   target, move `old` to BAK, remove the SWAP dir.
-    /// - `old` present, `new` missing, target missing: rename `old` back to the
-    ///   target, remove the SWAP dir.
-    /// - `old` missing, `new` present, target present: delete `new`, remove the
-    ///   SWAP dir.
-    /// - `old` missing, `new` present, target missing: rename `new` to the
-    ///   target, remove the SWAP dir.
-    ///
-    /// Returns `true` when recovery succeeded. On `false`, the caller treats
-    /// this peer's listing for the directory as failed and excludes the peer
-    /// from that directory subtree. In a dry-run this peer-mutating recovery is
-    /// skipped and success is reported.
-    fn recover_swap(&self, peer: &str, dir_path: &str) -> bool;
-
-    /// Run aged BAK/TMP cleanup for a directory on a peer, after the union of
-    /// entry names at that directory level has been processed.
-    ///
-    /// Inspects the peer's `.kitchensync/` directly even though the built-in
-    /// exclude removes it from synced listings. Removes each
-    /// `.kitchensync/BAK/<timestamp>/` entry older than the BAK retention limit
-    /// and each `.kitchensync/TMP/<timestamp>/` entry older than the TMP
-    /// retention limit, judging age from the `<timestamp>` name. Entries not
-    /// older than their limit are left in place, and SWAP is never purged by
-    /// age.
-    ///
-    /// Cleanup is best-effort; any failure is reported through the output
-    /// service rather than returned. In a dry-run cleanup is skipped.
-    fn cleanup(&self, peer: &str, dir_path: &str);
+    /// Failed copies keep independent try counts. A retryable failure before
+    /// the try limit moves only that copy behind other queued work and lets
+    /// other work continue. A copy that reaches its try limit is not requeued
+    /// in the same run. If failure occurs before SWAP `old` exists, SWAP `new`
+    /// is deleted when possible before the slot is released. If moving the
+    /// existing destination to SWAP `old` fails, the original destination stays
+    /// in place, SWAP `new` is deleted when possible, the phase is reported as
+    /// `MoveExistingToSwapOld`, and that copy is skipped for the rest of the
+    /// run instead of retried. A failure after SWAP `old` exists leaves
+    /// peer-visible SWAP state for later recovery. If setting modification time
+    /// or archiving SWAP `old` fails after the replacement is installed, the
+    /// replacement is not undone and the result reports that final destination
+    /// state to the caller. Failure events include the relative path,
+    /// destination peer identity, transport error category when available, and
+    /// exactly one failed phase.
+    fn close_and_drain(
+        &self,
+        run_id: CopyQueueRunId,
+    ) -> Result<CopyQueueDrainResult, CopyQueueError>;
 }

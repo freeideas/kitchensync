@@ -1,0 +1,34 @@
+{
+  "docs": [
+    {
+      "file": "sftp-client.md",
+      "packages": [{ "name": "ssh2", "version": "0.9.5" }],
+      "experiments": ["experiments/sftp-client"]
+    },
+    {
+      "file": "sqlite-snapshot.md",
+      "packages": [{ "name": "rusqlite", "version": "0.32.1" }],
+      "experiments": ["experiments/sqlite-snapshot"]
+    },
+    {
+      "file": "path-ids.md",
+      "packages": [{ "name": "xxhash-rust", "version": "0.8.12" }],
+      "experiments": ["experiments/path-ids"]
+    },
+    {
+      "file": "url-normalization.md",
+      "packages": [
+        { "name": "url", "version": "2.5.4" },
+        { "name": "percent-encoding", "version": "2.3.1" },
+        { "name": "whoami", "version": "1.5.2" }
+      ],
+      "experiments": ["experiments/url-normalization"]
+    },
+    {
+      "file": "local-file-metadata.md",
+      "packages": [{ "name": "filetime", "version": "0.2.25" }],
+      "experiments": ["experiments/local-file-metadata"]
+    }
+  ]
+}
+

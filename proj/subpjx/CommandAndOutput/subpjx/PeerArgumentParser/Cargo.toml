@@ -1,0 +1,11 @@
+[package]
+name = "commandandoutput_peerargumentparser"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"url" = "2.5.4"
+"percent-encoding" = "2.3.1"

@@ -1,0 +1,10 @@
+[package]
+name = "copyqueue_stagedtransfer"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"percent-encoding" = "2.3.1"

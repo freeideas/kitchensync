@@ -1,0 +1,10 @@
+[package]
+name = "snapshotstore_snapshotdatabase_snapshotrows"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"rusqlite" = "0.32.1"

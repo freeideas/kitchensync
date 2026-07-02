@@ -1,0 +1,16 @@
+{
+  "deps": [],
+  "entry": false,
+  "interface": "src/api.rs",
+  "packages": [
+    {
+      "name": "filetime",
+      "version": "0.2.25"
+    }
+  ],
+  "reqs": [
+    "009.1"
+  ],
+  "shared": false,
+  "wiring": "per-dependent"
+}

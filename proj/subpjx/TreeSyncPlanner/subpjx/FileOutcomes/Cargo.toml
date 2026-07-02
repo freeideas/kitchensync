@@ -1,0 +1,11 @@
+[package]
+name = "treesyncplanner_fileoutcomes"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"treesyncplanner_fileoutcomes_groupfiledecision" = { path = "subpjx/GroupFileDecision" }
+"treesyncplanner_fileoutcomes_peerfileclassification" = { path = "subpjx/PeerFileClassification" }

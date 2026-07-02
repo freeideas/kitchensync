@@ -7,8 +7,23 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
-"transport" = { path = "../Transport" }
-"output" = { path = "../Output" }
-"copyqueue_copyscheduler" = { path = "subpjx/CopyScheduler" }
-"copyqueue_stagingcleanup" = { path = "subpjx/StagingCleanup" }
-"copyqueue_swaptransfer" = { path = "subpjx/SwapTransfer" }
+"transportoperations" = { path = "../TransportOperations" }
+"snapshotstore" = { path = "../SnapshotStore" }
+"stagingrecovery" = { path = "../StagingRecovery" }
+"copyqueue_queuerunner" = { path = "subpjx/QueueRunner" }
+"copyqueue_stagedtransfer" = { path = "subpjx/StagedTransfer" }
+"percent-encoding" = "2.3.1"
+
+[dev-dependencies]
+"transportoperations_localtransportoperations" = { path = "../TransportOperations/subpjx/LocalTransportOperations" }
+"transportoperations_sftptransportoperations" = { path = "../TransportOperations/subpjx/SftpTransportOperations" }
+"snapshotstore_snapshotdatabase" = { path = "../SnapshotStore/subpjx/SnapshotDatabase" }
+"snapshotstore_snapshotidentity" = { path = "../SnapshotStore/subpjx/SnapshotIdentity" }
+"snapshotstore_snapshotpeerfiles" = { path = "../SnapshotStore/subpjx/SnapshotPeerFiles" }
+"stagingrecovery_bakdisplacement" = { path = "../StagingRecovery/subpjx/BakDisplacement" }
+"stagingrecovery_stagingcleanup" = { path = "../StagingRecovery/subpjx/StagingCleanup" }
+"stagingrecovery_swaprecovery" = { path = "../StagingRecovery/subpjx/SwapRecovery" }
+"stagingrecovery_tmpstagingpaths" = { path = "../StagingRecovery/subpjx/TmpStagingPaths" }
+"snapshotstore_snapshotdatabase_snapshotcleanup" = { path = "../SnapshotStore/subpjx/SnapshotDatabase/subpjx/SnapshotCleanup" }
+"snapshotstore_snapshotdatabase_snapshotfile" = { path = "../SnapshotStore/subpjx/SnapshotDatabase/subpjx/SnapshotFile" }
+"snapshotstore_snapshotdatabase_snapshotrows" = { path = "../SnapshotStore/subpjx/SnapshotDatabase/subpjx/SnapshotRows" }

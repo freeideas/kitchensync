@@ -1,0 +1,13 @@
+[package]
+name = "transportoperations"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"transportoperations_localtransportoperations" = { path = "subpjx/LocalTransportOperations" }
+"transportoperations_sftptransportoperations" = { path = "subpjx/SftpTransportOperations" }
+"ssh2" = "0.9.5"
+"filetime" = "0.2.25"

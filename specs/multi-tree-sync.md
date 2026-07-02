@@ -176,7 +176,7 @@ In `--dry-run`, BAK/TMP cleanup on peers is skipped.
 
 ## Entry Classification
 
-For each **file** entry, compare each contributing peer's state to that peer's snapshot row. A live file is unchanged only when both its mod_time and byte_size match the snapshot row. (Directories use existence-based decisions only - see "Directory Decisions" below.)
+For each **file** entry, compare each contributing peer's state to that peer's snapshot row. A live file is unchanged only when both its mod_time and byte_size match the snapshot row. (Directories are decided by existence and tombstone evidence, never their own mod_time - see "Directory Decisions" below.)
 
 | Peer State               | Snapshot row for **this peer** | `deleted_time` | Classification                                 |
 | ------------------------ | ------------------------------ | -------------- | ---------------------------------------------- |
@@ -211,6 +211,13 @@ Only contributing (non-subordinate) peers participate in decisions:
 4b. **Absent-unconfirmed** (absent, snapshot row exists, `deleted_time` NULL) -> compare `last_seen` against the max mod_time of peers that have the entry. If `last_seen` > max mod_time, this is a deletion - the entry was confirmed present on this peer after the latest modification anywhere, and has since been removed. Apply rule 4 using `last_seen` as the deletion estimate. If `last_seen` <= max mod_time (or `last_seen` is NULL), this is a failed copy or the peer has never successfully received the file - re-enqueue the copy, no deletion vote
 5. **Same mod_time, different size** -> larger file wins
 6. **Ties** -> keep data (existence over deletion, larger over smaller)
+7. **Exact tie** (mod_time within tolerance and equal byte_size) -> the entries
+   are treated as identical, even if their bytes differ. No copy is enqueued
+   between the tied peers; each keeps its current content, and only snapshot
+   rows are updated. Content is never read or hashed to break a tie -
+   decisions use only mod_time and byte_size. When another peer needs the
+   entry, any one tied peer may be chosen as the copy source; the recorded
+   winning mod_time and byte_size are the tied values either way.
 
 Peers with no snapshot row for the entry ("never had it") do not vote - they are simply targets for propagation once a winner is decided.
 
@@ -230,11 +237,45 @@ Cleanup removes tombstone rows (where `deleted_time IS NOT NULL`) with `deleted_
 
 Directories do not use mod_time for decision-making. Directory mod_times are filesystem bookkeeping (they change when children are added or removed) and vary in precision across filesystem types - they do not represent meaningful user intent.
 
-Directory decisions are existence-based only:
-- If any contributing peer has the directory, it should exist on all peers. Create it on peers that lack it.
-- If no contributing peer has the directory live in its listing, at least one contributing peer has a snapshot row for the directory, and every contributing peer with a snapshot row for the directory is absent in the current listing, delete it on all remaining peers (displace to BAK/). A row with `deleted_time IS NOT NULL` is already a recorded deletion. A row with `deleted_time = NULL` becomes a confirmed absence for this run and is tombstoned using the normal snapshot update rule. A contributing peer with no snapshot row for the directory has no opinion and does not block deletion - consistent with the file decision rules where no-row peers do not vote.
+Directory decisions use existence, snapshot tombstone evidence, and the
+mod_times of live **files** inside the directory's subtree (never the
+directory's own mod_time):
+
+- Canon peer (`+`) overrides as usual: canon has it -> create everywhere;
+  canon lacks it -> delete everywhere.
+- If every contributing peer that votes has the directory live, it should
+  exist on all peers. Create it on active peers that lack it, and recurse.
+- If at least one contributing peer has the directory live and at least one
+  contributing peer votes deletion - absent in the current listing with a
+  snapshot row for the directory - the conflict is decided like file rule 4,
+  with the live subtree's file evidence standing in for the file's mod_time:
+  - The deletion estimate is the absent peer's row's `deleted_time` if set,
+    else its `last_seen` (rule 4b's estimate). If several peers vote
+    deletion, use the most recent estimate among them.
+  - The survival evidence is the newest mod_time among all live files
+    anywhere in the directory's subtree, across the peers that have the
+    directory live (gathered by recursively listing that subtree).
+    Directories inside contribute no evidence of their own; a subtree
+    containing no files provides no evidence.
+  - If the deletion estimate exceeds the survival evidence by more than the
+    5-second tolerance - or there is no survival evidence at all - the
+    deletion is the latest user event and wins: displace the directory to
+    BAK/ on every active peer that has it, do not recreate it anywhere,
+    cascade tombstones per Snapshot Updates, and do not recurse.
+  - Otherwise the directory survives: create it on peers that lack it and
+    recurse. Content newer than the deletion estimate is preserved and
+    propagates by the file rules; content older is still removed entry by
+    entry via file rules 4/4b during recursion. A directory that survives
+    only because of newer content therefore converges to holding just that
+    newer content.
+  - If the survival-evidence listing fails on a peer after the normal
+    `--retries-list` tries, skip decisions for this directory and its subtree
+    for all peers this run (the same conservative outcome as a canon listing
+    failure): with incomplete evidence, neither deletion nor recreation is
+    safe.
+- If no contributing peer has the directory live in its listing, at least one contributing peer has a snapshot row for the directory, and every contributing peer with a snapshot row for the directory is absent in the current listing, delete it on all remaining peers (displace to BAK/). A row with `deleted_time IS NOT NULL` is already a recorded deletion. A row with `deleted_time = NULL` becomes a confirmed absence for this run and is tombstoned using the normal snapshot update rule.
+- A contributing peer with no snapshot row for the directory has no opinion: it neither votes deletion nor blocks one - consistent with the file decision rules where no-row peers do not vote. A peer with the directory live votes for existence regardless of rows.
 - If no contributing peer has the directory - neither live in its listing nor as a snapshot row (with or without tombstone) - the directory does not exist in the group's view. Subordinate peers that have it are displaced to BAK/.
-- Canon peer (`+`) overrides as usual: canon has it -> create everywhere; canon lacks it -> delete everywhere.
 
 Directories are displaced to BAK/ just like files. The snapshot still tracks directories (with `byte_size = -1`) for deletion detection via tombstones, but `mod_time` for directory rows is informational only - it is recorded but not used in decisions.
 

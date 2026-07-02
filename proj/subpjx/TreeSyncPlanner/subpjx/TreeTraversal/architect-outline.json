@@ -1,0 +1,58 @@
+{
+  "decision": "split",
+  "architecture_notes": [
+    "TreeTraversal stays a facade that applies exclusion policy to live walk facts before returning entries, skips, and recursion intents."
+  ],
+  "children": [
+    {
+      "name": "LiveDirectoryWalk",
+      "responsibility": "Own the combined live directory walk, listing retries, failure scoping, sorted entry facts, and parent-directed child recursion intents.",
+      "reqs": [
+        "010.1",
+        "010.2",
+        "010.3",
+        "010.4",
+        "010.5",
+        "010.6",
+        "010.7",
+        "010.8",
+        "010.9",
+        "010.10",
+        "010.11",
+        "010.12",
+        "010.13",
+        "010.14",
+        "010.15",
+        "010.16",
+        "010.17",
+        "010.18",
+        "010.19",
+        "010.20",
+        "010.21"
+      ]
+    },
+    {
+      "name": "ExcludedPathFilter",
+      "responsibility": "Own accepted command-line excludes and built-in excluded entries so hidden paths produce no scan, decision, mutation, or snapshot eligibility.",
+      "reqs": [
+        "011.1",
+        "011.2",
+        "011.3",
+        "011.4",
+        "011.5",
+        "011.6",
+        "011.7",
+        "011.8",
+        "011.9",
+        "011.10",
+        "011.11",
+        "011.12",
+        "011.13",
+        "011.14",
+        "011.15",
+        "011.16",
+        "011.17"
+      ]
+    }
+  ]
+}

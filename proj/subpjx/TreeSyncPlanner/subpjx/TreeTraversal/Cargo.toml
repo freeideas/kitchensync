@@ -1,0 +1,11 @@
+[package]
+name = "treesyncplanner_treetraversal"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"treesyncplanner_treetraversal_excludedpathfilter" = { path = "subpjx/ExcludedPathFilter" }
+"treesyncplanner_treetraversal_livedirectorywalk" = { path = "subpjx/LiveDirectoryWalk" }

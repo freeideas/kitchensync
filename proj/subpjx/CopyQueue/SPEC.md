@@ -2,187 +2,173 @@
 
 ## Purpose
 
-CopyQueue executes the file copies that the sync engine decides to perform. It
-runs those copies concurrently under one global copy-slot limit shared across
-the whole run, retries failed copies up to a per-copy try limit, and makes each
-replacement recoverable through SWAP staging. It also owns the TMP/SWAP/BAK
-staging areas under each directory's `.kitchensync/`: recovering interrupted
-SWAP state during traversal, archiving replaced files to BAK, and purging aged
-BAK and TMP entries.
+CopyQueue owns queued user-file transfers for one KitchenSync run. It accepts
+file-copy work as soon as traversal discovers it, starts eligible transfers
+while later directories are still being scanned, enforces the one global active
+copy limit, retries failed copies according to each copy's own try count, and
+replaces destination user files through recoverable SWAP staging.
 
-CopyQueue does not decide which files to copy or which modification time wins;
-those decisions arrive from the caller as enqueued copy requests. CopyQueue only
-carries them out safely and reports progress.
+The child operates on already connected peers. A queued transfer is one source
+peer and relative source file path, one destination peer and relative
+destination file path, the slash-separated user relative path for reporting,
+the winning modification time selected by the sync decision, and the winning
+byte size selected by the sync decision.
 
 ## Responsibilities
 
-### Bounded concurrent execution
+CopyQueue exposes a run-scoped queue operation. The caller supplies the maximum
+active copy count, the maximum total tries per queued copy, connected peer
+handles, a dry-run mutation policy, and an event sink for structured copy
+events. If the caller does not supply a maximum active copy count, the queue
+uses `10`. If the caller supplies `--max-copies N`, the queue uses `N`.
 
-- Enforce a single global limit on the number of file copies that hold a slot at
-  one time across the whole run, defaulting to 10 when the caller supplies no
-  limit. The limit is independent of peer scheme, peer count, and connection
-  count.
-- Count only file copies against the limit. Directory listing, snapshot
-  download/upload, directory creation, and BAK/TMP/SWAP cleanup never consume a
-  copy slot and may proceed while the limit is full.
-- Accept newly enqueued copies while earlier copies are still running, so copy
-  work for an already scanned directory begins while later directories are still
-  being scanned. CopyQueue never waits for a whole-tree scan before starting.
-- Provide the shared concurrent executor that issues the directory listings for
-  all reachable peers at a given directory level at the same time rather than one
-  after another. Listings run on this executor without consuming a copy slot, so
-  they proceed even while the copy-slot limit is full.
+CopyQueue exposes an enqueue operation that can be called while traversal is
+still running. Enqueueing a copy makes it eligible for workers immediately when
+a global copy slot is available; the queue must not wait for the whole tree to
+be scanned before starting copy work. The queue also exposes a drain operation
+that waits until traversal has closed the queue and every queued copy has
+either succeeded, been skipped for this run, or reached its copy-try limit.
 
-### Per-copy retry tracking
+CopyQueue enforces one active file-copy limit across the whole run. A transfer
+holds one global copy slot from the moment its try starts until the try has
+finished all required cleanup for that try. These transfers all count against
+the same limit:
 
-- Treat the copy try limit as the maximum total number of tries for one queued
-  copy, counting the first try, defaulting to 3 when the caller supplies no
-  limit.
-- When a copy try fails before the copy reaches its try limit, move that copy to
-  the back of the queue and continue other queued work.
-- When a copy's try count reaches the limit, mark it failed for the run and do
-  not requeue it.
-- Track tries per copy. One copy's failed tries never reduce the tries available
-  to another copy. The try limit applies identically to local, SFTP, and
-  mixed-scheme copies.
+- `file://` source to `file://` destination.
+- `file://` source to `sftp://` destination.
+- `sftp://` source to `file://` destination.
+- `sftp://` source to `sftp://` destination.
 
-### Transfer mechanics
+The queue does not count directory listing, snapshot download, snapshot upload,
+directory creation, BAK cleanup, TMP cleanup, or SWAP cleanup as active file
+copies, even when those operations run during the same overall sync run.
+CopyQueue does not impose any per-peer, per-host, or per-connection active-copy
+limit below the global active copy limit.
 
-- Stream each copy using a buffer whose total size is independent of the size of
-  the file being copied, and begin writing to the destination before the entire
-  source has been read.
-- When both ends of a copy are local, the host filesystem's native copy
-  primitive may be used, but the copy still goes through the SWAP staging path
-  rather than writing the destination in place.
+Each queued copy owns its own failed-copy try count. The first try counts
+toward `--retries-copy`. When a try fails before the copy has reached its total
+try limit, CopyQueue increments only that queued copy's count, moves that copy
+behind other queued copy work, releases its slot after required cleanup, and
+continues other queued work in the same run. When a copy reaches its total try
+limit, CopyQueue marks that copy failed for this run and does not requeue it.
+The same try rules apply to local, SFTP, and mixed-scheme copies.
 
-### SWAP-staged replacement
+Before starting replacement for a destination user path, CopyQueue derives the
+destination basename and percent-encodes it when needed so the encoded value is
+one path segment on every supported transport. For target
+`<target-parent>/<basename>`, it uses these paths:
 
-For every copy that would replace an existing destination, follow this ordered
-sequence so the replacement is recoverable without renaming over an existing
-file:
+- SWAP new:
+  `<target-parent>/.kitchensync/SWAP/<encoded-basename>/new`
+- SWAP old:
+  `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old`
 
-1. Before starting, recover or fail any existing SWAP directory for the target
-   basename.
-2. Write the new content to `<target-parent>/.kitchensync/SWAP/<encoded-basename>/new`.
-3. If a file already exists at the target path, move it to
-   `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old`.
-4. Rename the SWAP `new` file to the final target path.
-5. Set the destination file's modification time to the winning mod_time supplied
-   with the copy request, not a time re-read from the source.
-6. If SWAP `old` exists, archive it to BAK.
-7. Remove the empty SWAP directories.
+Before writing replacement content for that target, CopyQueue recovers any
+existing SWAP directory for the encoded basename, or treats recovery failure as
+a failed copy try before SWAP old exists.
 
-The `<encoded-basename>` segment is the target basename percent-encoded so it
-forms a single path segment on the transport.
+Each normal transfer follows this order:
 
-### SWAP recovery during traversal
+1. Acquire one global copy slot.
+2. Recover or fail the destination SWAP directory for the encoded basename.
+3. Stream source file content into SWAP `new`.
+4. If the destination has an existing file at the final target path, rename
+   that file to SWAP `old`.
+5. Rename SWAP `new` into the final target path.
+6. Set the final destination file modification time to the winning
+   modification time from the sync decision.
+7. If SWAP `old` exists, archive it to
+   `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`.
+8. Remove the empty SWAP directories for that transfer.
+9. Release the global copy slot.
 
-Before a directory's live entries are listed for sync decisions in a normal run,
-recover each `.kitchensync/SWAP/<encoded-basename>` directory according to the
-five states of (`old` present, `new` present, target present):
+A destination that had no existing file creates no BAK entry for that
+destination path. A local-to-local copy may use a native filesystem copy
+primitive to populate SWAP `new`, but it must not write replacement content
+directly to the final destination path.
 
-- `old` present, target present: move `old` to BAK, remove the empty SWAP
-  directory.
-- `old` present, `new` present, target missing: rename `new` to the target, move
-  `old` to BAK, remove the empty SWAP directory.
-- `old` present, `new` missing, target missing: rename `old` back to the target,
-  remove the empty SWAP directory.
-- `old` missing, `new` present, target present: delete `new`, remove the empty
-  SWAP directory.
-- `old` missing, `new` present, target missing: rename `new` to the target,
-  remove the empty SWAP directory.
+Active transfers stream content with bounded buffering. CopyQueue starts
+writing to the destination SWAP `new` file while it reads from the source and
+must not buffer the entire source file in memory before destination writing
+begins. The total buffer memory used by one active transfer is fixed by the
+implementation's chosen buffer sizes and is independent of the copied file
+size.
 
-### TMP staging and aged cleanup
+CopyQueue reports structured events for copy start, copy-slot acquire,
+copy-slot release, transfer success, transfer skip, and transfer failure. Slot
+events include the current active count and the global maximum. Transfer
+failure events include the relative path, destination peer identity, transport
+error category when available, and one failed phase:
+`read_source`, `write_swap_new`, `move_existing_to_swap_old`, `rename_final`,
+`set_mod_time`, `archive_old`, or `cleanup`.
 
-- Create TMP staging directories under `.kitchensync/`, one distinct directory
-  per transfer so concurrent transfers do not collide.
-- During a normal run, after the union of entry names at a directory level is
-  processed, inspect each peer's `.kitchensync/` directory directly even though
-  the built-in exclude removes `.kitchensync/` from synced listings.
-- Remove each `.kitchensync/BAK/<timestamp>/` entry older than the BAK retention
-  limit (default 90 days) and each `.kitchensync/TMP/<timestamp>/` entry older
-  than the TMP retention limit (default 2 days), judging age from the
-  `<timestamp>` component of the directory name. Leave entries not older than
-  their limit in place, and never purge SWAP by age.
+When a transfer fails before the existing destination has been moved to SWAP
+`old`, CopyQueue deletes that transfer's SWAP `new` file when possible before
+releasing the copy slot. It then applies the normal retry rule: requeue behind
+other work if tries remain, otherwise mark the copy failed for this run.
+
+When moving an existing destination file to SWAP `old` fails, the original
+destination must remain in place. CopyQueue deletes SWAP `new` when possible,
+releases the copy slot, reports the `move_existing_to_swap_old` failure, and
+skips that copy for the rest of the run instead of requeueing it.
+
+When a transfer fails after the existing destination has been moved to SWAP
+`old` and before replacement fully completes, CopyQueue leaves the peer-visible
+SWAP state in place. In particular, SWAP `old` remains durable evidence of an
+incomplete KitchenSync replacement rather than a user deletion. The next
+recovery pass is responsible for repairing that state before the directory is
+used for sync decisions.
+
+If archiving SWAP `old` fails after SWAP `new` has already become the final
+destination, CopyQueue reports the `archive_old` failure and leaves SWAP `old`
+for later recovery. If setting the final modification time fails after the file
+is in place, CopyQueue reports the `set_mod_time` failure and does not undo the
+replacement.
+
+For every BAK archive path it creates during queued replacement, CopyQueue asks
+the snapshot child for a fresh process-local timestamp string and uses that
+string as the `<timestamp>` directory component.
 
 ## Boundaries
 
-### Operations exposed across the boundary
+CopyQueue does not decide which files should be copied, which peer is canon or
+subordinate, which paths are excluded, which directories are traversed, or
+which entries should be displaced. Tree planning supplies copy work that is
+already eligible to run.
 
-- Enqueue a file copy request. A request carries the source peer and path, the
-  destination peer and path, and the winning modification time to set on the
-  destination. CopyQueue schedules it under the slot limit and reports the
-  per-copy outcome (succeeded or failed-for-the-run after exhausting tries).
-- Recover the SWAP state for a directory on a peer before that directory is
-  listed. CopyQueue reports whether recovery succeeded; on failure the caller
-  treats that peer's listing for the directory as failed and excludes the peer
-  from that directory subtree.
-- Run BAK/TMP aged cleanup for a directory on a peer.
+CopyQueue does not connect peers, choose fallback URLs, authenticate SFTP,
+normalize command-line URLs, or implement scheme-specific filesystem calls. It
+uses the transport child for stat, streaming read, streaming write, rename,
+delete, directory creation, empty-directory deletion, and modification-time
+operations.
 
-### Construction and the hidden helpers
+CopyQueue does not own traversal-wide SWAP recovery, snapshot SWAP recovery,
+BAK/TMP cleanup, or inline displacement of entries selected for deletion or
+type-conflict removal. It uses the staging recovery child for destination
+SWAP recovery and nearby BAK archive mechanics needed by a queued replacement.
 
-- CopyQueue is split internally into private helpers it owns and builds itself:
-  the run-global copy scheduler, the SWAP-staged single-file transfer helper, and
-  the staging cleanup helper. These helpers are an implementation detail of
-  CopyQueue, not part of its public surface.
-- The function that creates a CopyQueue instance takes exactly two parameters, the
-  shared Transport service and the shared Output service it depends on. It
-  constructs its own scheduler, transfer, and staging-cleanup helpers internally;
-  a caller hands it only the Transport and Output services and never names,
-  imports, or constructs any of those helpers. No parameter or return type of any
-  public CopyQueue operation, and no parameter of its constructor other than the
-  Transport and Output services, is a type that belongs to the scheduler,
-  transfer, or staging-cleanup helper. Those helper types stay entirely behind the
-  CopyQueue boundary.
+CopyQueue does not update snapshot rows. On transfer success or installed-file
+failure states, it returns structured results so the caller can apply the
+snapshot rules owned by the snapshot child.
 
-### Error obligations
+CopyQueue does not format stdout and does not decide verbosity. It emits
+structured copy and slot events; the output child decides which events become
+stdout lines.
 
-- On transfer failure before SWAP `old` exists, delete the staged SWAP `new`,
-  then requeue or fail the copy by its try count.
-- When moving the existing destination to SWAP `old` fails, leave the original
-  destination in place and skip the copy for this run.
-- On transfer failure after SWAP `old` exists, leave the SWAP state in place for
-  later recovery.
-- When archiving SWAP `old` to BAK fails after the replacement is in place, leave
-  SWAP `old` in place for later recovery.
-- When SWAP recovery for a directory fails, report that failure so the caller
-  excludes the peer from the directory subtree.
-- All progress and diagnostics (the `C`/`X` lines and copy-slot trace events) are
-  emitted through the output component, not written directly; CopyQueue keeps
-  stderr empty.
+CopyQueue must preserve these invariants:
 
-### Dry-run
-
-In a dry-run, CopyQueue still exercises the copy machinery so the run is as
-realistic as possible, while making no change to any peer:
-
-- Queued copies still read their source files, still acquire copy slots subject
-  to the global active-copy limit, and the per-copy try limit still applies the
-  same way it does in a normal run.
-- No peer state is mutated: no TMP, SWAP, or BAK directories are created on
-  peers, no destination file is written, and no modification time is set on a
-  peer.
-- Peer-side SWAP recovery during traversal and peer-side BAK/TMP cleanup during
-  traversal are both skipped.
-
-### Not in scope
-
-- Deciding which files to copy, which mod_time wins, and inline displacement of
-  conflicting entries to BAK belong to the sync engine.
-- The uniform per-peer filesystem operations (streaming read/write, rename,
-  delete, stat, set mod_time, native local copy) belong to the transport
-  component; CopyQueue calls them and never branches on scheme itself.
-- Snapshot row updates that correspond to a completed copy belong to the snapshot
-  component.
-- The exact `C`/`X` progress-line and copy-slot trace text, and the embedded
-  timestamp string format, are owned by the logging and timestamp concerns.
-
-## Invariants
-
-- At most the configured number of file copies hold a slot at any instant across
-  the whole run.
-- A destination file is never written in place; every replacement passes through
-  the SWAP `new`/`old` sequence so an interruption is always recoverable.
-- A copy is tried at most its try-limit times in total, and try budgets are
-  independent across copies.
-- In a dry-run, no peer state is mutated.
+- active file copies across the whole run never exceed the configured global
+  maximum;
+- no extra per-peer, per-host, or per-connection copy limit is imposed below
+  that global maximum;
+- every queued copy tracks tries independently;
+- retryable failed copies move behind other queued copy work;
+- copies that reach their total try limit are not requeued in the same run;
+- replacement content reaches the final destination only through SWAP `new`;
+- an existing destination is moved to SWAP `old` before SWAP `new` is moved
+  into the final path;
+- a failed move to SWAP `old` leaves the original destination in place and
+  skips that copy for the rest of the run;
+- a failure after SWAP `old` exists leaves SWAP state visible for recovery;
+- a successful transfer removes its empty SWAP directories;
+- active transfer buffer memory is independent of source file size.

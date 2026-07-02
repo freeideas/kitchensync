@@ -1,0 +1,16 @@
+[package]
+name = "commandandoutput"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"commandandoutput_globalargumentparser" = { path = "subpjx/GlobalArgumentParser" }
+"commandandoutput_peerargumentparser" = { path = "subpjx/PeerArgumentParser" }
+"commandandoutput_peeridentitynormalizer" = { path = "subpjx/PeerIdentityNormalizer" }
+"commandandoutput_stdoutreporter" = { path = "subpjx/StdoutReporter" }
+"url" = "2.5.4"
+"percent-encoding" = "2.3.1"
+"whoami" = "1.5.2"

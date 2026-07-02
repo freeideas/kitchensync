@@ -1,0 +1,37 @@
+{
+  "deps": [],
+  "entry": false,
+  "interface": "src/api.rs",
+  "packages": [
+    {
+      "name": "url",
+      "version": "2.5.4"
+    },
+    {
+      "name": "percent-encoding",
+      "version": "2.3.1"
+    },
+    {
+      "name": "whoami",
+      "version": "1.5.2"
+    }
+  ],
+  "reqs": [
+    "004.1",
+    "004.2",
+    "004.3",
+    "004.4",
+    "004.5",
+    "004.6",
+    "004.7",
+    "004.8",
+    "004.9",
+    "004.10",
+    "004.11",
+    "004.12",
+    "004.13",
+    "004.14"
+  ],
+  "shared": false,
+  "wiring": "per-dependent"
+}
