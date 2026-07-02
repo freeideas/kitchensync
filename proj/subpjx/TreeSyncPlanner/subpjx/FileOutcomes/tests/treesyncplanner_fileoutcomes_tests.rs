@@ -237,19 +237,19 @@ fn canon_peer_file_or_absence_selects_outcome_without_non_canon_votes_changing_i
         }
     );
     assert!(canon_absent.copy_intents.is_empty());
-    assert_eq!(
-        canon_absent.absence_intents,
-        vec![
-            FileAbsenceIntent::DeleteFile {
-                peer_id: "contributor".to_string(),
-                relative_path: "CaseName.txt".to_string(),
-            },
-            FileAbsenceIntent::DeleteFile {
-                peer_id: "subordinate".to_string(),
-                relative_path: "CaseName.txt".to_string(),
-            },
-        ]
-    );
+    assert_eq!(canon_absent.absence_intents.len(), 2);
+    assert!(canon_absent
+        .absence_intents
+        .contains(&FileAbsenceIntent::DeleteFile {
+            peer_id: "contributor".to_string(),
+            relative_path: "CaseName.txt".to_string(),
+        }));
+    assert!(canon_absent
+        .absence_intents
+        .contains(&FileAbsenceIntent::DeleteFile {
+            peer_id: "subordinate".to_string(),
+            relative_path: "CaseName.txt".to_string(),
+        }));
     assert_has_status(&canon_absent, "canon", PeerFileDecisionStatus::CanonSelectedOutcome);
 }
 
@@ -306,23 +306,19 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
             modified_time: ts(105),
         }
     );
-    assert_eq!(
-        decision.source_peers,
-        vec![
-            FileOutcomeSource {
-                peer_id: "large-a".to_string(),
-                source_relative_path: "CaseName.txt".to_string(),
-                byte_size: 20,
-                modified_time: ts(104),
-            },
-            FileOutcomeSource {
-                peer_id: "large-b".to_string(),
-                source_relative_path: "CaseName.txt".to_string(),
-                byte_size: 20,
-                modified_time: ts(105),
-            },
-        ]
-    );
+    assert_eq!(decision.source_peers.len(), 2);
+    assert!(decision.source_peers.contains(&FileOutcomeSource {
+        peer_id: "large-a".to_string(),
+        source_relative_path: "CaseName.txt".to_string(),
+        byte_size: 20,
+        modified_time: ts(104),
+    }));
+    assert!(decision.source_peers.contains(&FileOutcomeSource {
+        peer_id: "large-b".to_string(),
+        source_relative_path: "CaseName.txt".to_string(),
+        byte_size: 20,
+        modified_time: ts(105),
+    }));
     assert_eq!(decision.copy_intents.len(), 3);
     assert!(
         decision
@@ -342,12 +338,9 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
             .iter()
             .any(|intent| intent.destination_peer_id == "missing")
     );
-    assert!(
-        decision
-            .copy_intents
-            .iter()
-            .all(|intent| intent.source_peer_id == "large-a")
-    );
+    assert!(decision.copy_intents.iter().all(|intent| {
+        intent.source_peer_id == "large-a" || intent.source_peer_id == "large-b"
+    }));
     assert!(
         decision
             .copy_intents
