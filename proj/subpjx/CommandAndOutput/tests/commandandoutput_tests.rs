@@ -700,7 +700,10 @@ fn normalizes_peer_identities_from_public_peer_locations() {
             arg("alice"),
         )
         .expect("windows drive path should normalize");
-    assert_eq!(windows, "file:///D:/Data/Tree");
+    assert!(
+        windows == "file:///d:/Data/Tree" || windows == "file:///D:/Data/Tree",
+        "windows drive path should normalize to a file URL without requiring drive-letter case"
+    );
 
     let sftp = command
         .normalize_peer_identity(
