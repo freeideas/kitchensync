@@ -110,7 +110,7 @@ fn queued_copy(source: &str, destination: &str, relpath: &str) -> QueuedCopy {
 fn open_run(
     copy_queue: &dyn CopyQueue,
     max_active_copies: Option<u32>,
-    max_total_tries: u32,
+    max_total_tries: Option<u32>,
     source_root: &Path,
     destination_root: &Path,
     sink: copyqueue::CopyQueueEventSink,
@@ -129,7 +129,7 @@ fn open_run(
 fn open_run_with_policy(
     copy_queue: &dyn CopyQueue,
     max_active_copies: Option<u32>,
-    max_total_tries: u32,
+    max_total_tries: Option<u32>,
     source_root: &Path,
     destination_root: &Path,
     mutation_policy: CopyMutationPolicy,
@@ -140,8 +140,9 @@ fn open_run_with_policy(
             max_active_copies: max_active_copies.map(|value| {
                 NonZeroU32::new(value).expect("test supplies nonzero max copies")
             }),
-            max_total_tries_per_copy: NonZeroU32::new(max_total_tries)
-                .expect("test supplies nonzero retry count"),
+            max_total_tries_per_copy: max_total_tries.map(|value| {
+                NonZeroU32::new(value).expect("test supplies nonzero retry count")
+            }),
             peers: vec![
                 local_peer("source", source_root),
                 local_peer("destination", destination_root),
@@ -152,7 +153,10 @@ fn open_run_with_policy(
         .expect("open copy queue run")
 }
 
-fn wait_for_event(events: &Arc<Mutex<Vec<CopyQueueEvent>>>, wanted: impl Fn(&CopyQueueEvent) -> bool) {
+fn wait_for_event(
+    events: &Arc<Mutex<Vec<CopyQueueEvent>>>,
+    wanted: impl Fn(&CopyQueueEvent) -> bool,
+) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if events
@@ -169,6 +173,18 @@ fn wait_for_event(events: &Arc<Mutex<Vec<CopyQueueEvent>>>, wanted: impl Fn(&Cop
     }
 }
 
+fn slot_acquires(events: &Arc<Mutex<Vec<CopyQueueEvent>>>) -> Vec<(u32, u32)> {
+    events
+        .lock()
+        .expect("event log lock")
+        .iter()
+        .filter_map(|event| match event {
+            CopyQueueEvent::CopySlotAcquire { active, max } => Some((*active, *max)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn enqueued_copy_can_start_before_the_queue_is_closed_and_uses_default_slot_limit() {
     let source_root = temp_root("early-source");
@@ -177,7 +193,7 @@ fn enqueued_copy_can_start_before_the_queue_is_closed_and_uses_default_slot_limi
 
     let copy_queue = subject();
     let (events, sink) = event_log();
-    let run_id = open_run(&*copy_queue, None, 1, &source_root, &destination_root, sink);
+    let run_id = open_run(&*copy_queue, None, Some(1), &source_root, &destination_root, sink);
 
     copy_queue
         .enqueue(run_id, queued_copy("ready.txt", "ready.txt", "ready.txt"))
@@ -217,7 +233,7 @@ fn configured_active_copy_limit_is_reported_and_never_exceeded() {
 
     let copy_queue = subject();
     let (events, sink) = event_log();
-    let run_id = open_run(&*copy_queue, Some(2), 1, &source_root, &destination_root, sink);
+    let run_id = open_run(&*copy_queue, Some(2), Some(1), &source_root, &destination_root, sink);
 
     for index in 0..4 {
         let path = format!("copy-{index}.txt");
@@ -242,6 +258,64 @@ fn configured_active_copy_limit_is_reported_and_never_exceeded() {
 }
 
 #[test]
+fn same_peer_work_can_fill_the_global_limit_without_a_lower_peer_host_or_connection_limit() {
+    let source_root = temp_root("same-peer-source");
+    let destination_root = temp_root("same-peer-destination");
+    for index in 0..3 {
+        write_file(&source_root, &format!("same-{index}.txt"), "hello world");
+    }
+
+    let copy_queue = subject();
+    let (events, sink) = event_log();
+    let run_id = open_run(&*copy_queue, Some(3), Some(1), &source_root, &destination_root, sink);
+
+    for index in 0..3 {
+        let path = format!("same-{index}.txt");
+        copy_queue
+            .enqueue(run_id, queued_copy(&path, &path, &path))
+            .expect("enqueue copy");
+    }
+
+    let result = copy_queue.close_and_drain(run_id).expect("drain run");
+
+    assert_eq!(result.results.len(), 3);
+    assert!(result
+        .results
+        .iter()
+        .all(|copy| copy.outcome == QueuedCopyOutcome::Succeeded));
+    let acquires = slot_acquires(&events);
+    assert_eq!(acquires.len(), 3);
+    assert!(acquires.iter().all(|(active, max)| *active <= 3 && *max == 3));
+}
+
+#[test]
+fn default_try_limit_allows_three_total_tries_for_each_copy() {
+    let source_root = temp_root("default-tries-source");
+    let destination_root = temp_root("default-tries-destination");
+
+    let copy_queue = subject();
+    let (_events, sink) = event_log();
+    let run_id = open_run(&*copy_queue, Some(1), None, &source_root, &destination_root, sink);
+
+    copy_queue
+        .enqueue(run_id, queued_copy("missing.txt", "missing.txt", "missing.txt"))
+        .expect("enqueue missing copy");
+
+    let result = copy_queue.close_and_drain(run_id).expect("drain run");
+
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].total_tries, 3);
+    assert_eq!(
+        result.results[0].outcome,
+        QueuedCopyOutcome::FailedTryLimit {
+            phase: CopyFailurePhase::ReadSource,
+            transport_error: Some(TransportErrorCategory::NotFound),
+            installation_state: CopyInstallationState::NotInstalled,
+        }
+    );
+}
+
+#[test]
 fn retryable_failure_moves_only_that_copy_behind_other_work_until_its_try_limit() {
     let source_root = temp_root("retry-source");
     let destination_root = temp_root("retry-destination");
@@ -249,7 +323,7 @@ fn retryable_failure_moves_only_that_copy_behind_other_work_until_its_try_limit(
 
     let copy_queue = subject();
     let (events, sink) = event_log();
-    let run_id = open_run(&*copy_queue, Some(1), 2, &source_root, &destination_root, sink);
+    let run_id = open_run(&*copy_queue, Some(1), Some(2), &source_root, &destination_root, sink);
 
     copy_queue
         .enqueue(run_id, queued_copy("missing.txt", "missing.txt", "missing.txt"))
@@ -315,7 +389,7 @@ fn successful_replacement_uses_encoded_swap_paths_archives_old_and_removes_swap(
 
     let copy_queue = subject();
     let (_events, sink) = event_log();
-    let run_id = open_run(&*copy_queue, Some(1), 1, &source_root, &destination_root, sink);
+    let run_id = open_run(&*copy_queue, Some(1), Some(1), &source_root, &destination_root, sink);
 
     copy_queue
         .enqueue(
@@ -367,7 +441,7 @@ fn first_time_destination_uses_swap_new_without_creating_bak() {
 
     let copy_queue = subject();
     let (_events, sink) = event_log();
-    let run_id = open_run(&*copy_queue, Some(1), 1, &source_root, &destination_root, sink);
+    let run_id = open_run(&*copy_queue, Some(1), Some(1), &source_root, &destination_root, sink);
 
     copy_queue
         .enqueue(
@@ -406,7 +480,7 @@ fn dry_run_reads_source_and_acquires_slots_without_destination_mutation() {
     let run_id = open_run_with_policy(
         &*copy_queue,
         Some(1),
-        1,
+        Some(1),
         &source_root,
         &destination_root,
         CopyMutationPolicy::DryRun,
