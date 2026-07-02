@@ -4,11 +4,12 @@
 This concern derives from `specs/sync.md` sections "Rename Compatibility",
 "Displace to BAK", "TMP Staging", "SWAP Directory", and "BAK Directory",
 `specs/multi-tree-sync.md` sections "SWAP Recovery During Traversal" and
-"BAK/TMP Cleanup During Traversal", and `specs/database.md` opening section. It
-covers peer-side SWAP path layout, encoded SWAP basenames, user-data replacement
-recovery, snapshot replacement recovery, inline displacement to nearby BAK
-directories, BAK and TMP path layout, age-based BAK/TMP cleanup, and the rule
-that SWAP directories are recovered rather than purged by age.
+"BAK/TMP Cleanup During Traversal", `specs/database.md` opening section,
+`plan/sftp-client.md`, and `plan/local-fs-ops.md`. It covers peer-side SWAP
+path layout, encoded SWAP basenames, user-data replacement recovery, snapshot
+replacement recovery, inline displacement to nearby BAK directories, BAK and
+TMP path layout, age-based BAK/TMP cleanup, and the rule that SWAP directories
+are recovered rather than purged by age.
 
 ## $REQ_IDs
 - `017.1` -- KitchenSync replaces an existing user file on transports whose `rename(src, dst)` rejects an existing destination.

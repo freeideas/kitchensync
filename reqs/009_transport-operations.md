@@ -2,12 +2,13 @@
 
 ## Behavior
 This concern derives from `specs/sync.md` section "Peer Transports",
-`specs/database.md` opening section, `extart/ephemeral-sftp-server.py`, and
-`plan/sftp-client.md` and `plan/local-file-metadata.md`. It covers the common
-transport operation surface for `file://` and `sftp://` peers, local and SFTP
-metadata behavior, same-filesystem rename to a missing destination, regular
-file and directory listing semantics, symlink and special-file omission, and
-transport-neutral error categories.
+`specs/database.md` opening section, `extart/ephemeral-sftp-server.py`,
+`plan/sftp-client.md`, `plan/local-fs-ops.md`, and
+`plan/local-file-metadata.md`. It covers the common transport operation surface
+for `file://` and `sftp://` peers, local and SFTP metadata behavior,
+same-filesystem rename to a missing destination, regular file and directory
+listing semantics, symlink and special-file omission, and transport-neutral
+error categories.
 
 ## $REQ_IDs
 

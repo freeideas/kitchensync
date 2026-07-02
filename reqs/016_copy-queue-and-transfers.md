@@ -3,8 +3,9 @@
 ## Behavior
 This concern derives from `specs/sync.md` sections "Operation Queue" and "File
 Copy", `specs/concurrency.md` sections "Copy Concurrency" and "Copy Queue
-Tries", and `plan/sftp-client.md`. It covers incremental queuing of copy work,
-the global active-copy limit, copy-slot accounting across schemes, per-copy try
+Tries", `plan/sftp-client.md`, `plan/local-fs-ops.md`, and
+`plan/local-file-metadata.md`. It covers incremental queuing of copy work, the
+global active-copy limit, copy-slot accounting across schemes, per-copy try
 counts and retry ordering, bounded-buffer streaming, local-copy optimization
 limits, the observable file replacement sequence used by queued transfers, and
 transfer failure handling before and after durable replacement state exists.
