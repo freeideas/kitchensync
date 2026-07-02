@@ -63,6 +63,7 @@ are recovered rather than purged by age.
 - `017.49` -- BAK/TMP cleanup leaves `.kitchensync/TMP/<timestamp>/` directories that are not older than `--keep-tmp-days`.
 - `017.50` -- BAK/TMP cleanup does not purge `.kitchensync/SWAP/` directories by age.
 - `017.51` -- SWAP directories left by interrupted work remain until SWAP recovery succeeds.
+- `017.52` -- If SWAP `old`, SWAP `new`, and the target all exist during user-data SWAP recovery, KitchenSync deletes SWAP `new`.
 
 ## Notes
 This file covers peer-side staging state and recovery. Snapshot row effects of
