@@ -3,13 +3,12 @@
 # dependencies = []
 # ///
 
-"""Build the KitchenSync released CLI.
+"""Build the KitchenSync release tree.
 
-The root specs define one shipped product: ``released/kitchensync.exe``, the CLI
-executable itself. There is no launcher, wrapper, plugin, or adapter artifact in
-the specs, so the capability-bearing Rust root binary is copied directly to that
-spec-named path. The ``.exe`` suffix is preserved on every host because the root
-specs require it.
+The root specs define one shipped artifact: ``released/kitchensync.exe``. It is
+the CLI executable, not a launcher or wrapper, so the release build compiles the
+capability-bearing Rust root binary and copies that binary to the spec-named
+path. The ``.exe`` suffix is kept on every host because the specs require it.
 """
 
 from __future__ import annotations
@@ -47,26 +46,11 @@ build_root = _load_module(
 )
 
 
-def _spec_artifact_roles() -> dict[str, str]:
-    roles: dict[str, str] = {}
+def _spec_artifacts() -> list[str]:
     artifacts = common.release_artifacts_from_specs()
-    for artifact in artifacts:
-        roles[artifact] = _role_for_spec_artifact(artifact)
-    return roles
-
-
-def _role_for_spec_artifact(artifact: str) -> str:
-    mention = f"released/{artifact}".lower()
-    for path in sorted((WORKSPACE_ROOT / "specs").glob("*.md")):
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            lowered = line.lower()
-            if mention not in lowered:
-                continue
-            if any(word in lowered for word in ("launcher", "wrapper", "host", "plugin", "adapter")):
-                return "invoker"
-            if "cli" in lowered or "executable" in lowered or "command-line" in lowered:
-                return "cli-executable"
-    return "cli-executable"
+    if artifacts != ["kitchensync.exe"]:
+        raise tc.BuildError("root specs must define only released/kitchensync.exe")
+    return artifacts
 
 
 def _delete_released_tree() -> None:
@@ -83,7 +67,7 @@ def _built_root_binary() -> Path:
     return built
 
 
-def _build_cli_executable(artifact: str, built: Path) -> str:
+def _copy_cli_executable(artifact: str, built: Path) -> str:
     dest = tc.RELEASED_ROOT / artifact
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -94,9 +78,7 @@ def _build_cli_executable(artifact: str, built: Path) -> str:
 
 def main() -> int:
     try:
-        roles = _spec_artifact_roles()
-        if roles != {"kitchensync.exe": "cli-executable"}:
-            raise tc.BuildError("root specs must define only released/kitchensync.exe")
+        artifacts = _spec_artifacts()
 
         subprojects = common.all_subprojects()
         if not subprojects:
@@ -116,9 +98,8 @@ def main() -> int:
             cwd=tc.PROJECT_ROOT,
         )
         copied = [
-            _build_cli_executable(artifact, _built_root_binary())
-            for artifact, role in roles.items()
-            if role == "cli-executable"
+            _copy_cli_executable(artifact, _built_root_binary())
+            for artifact in artifacts
         ]
         print(f"build-released: built {', '.join(copied)}")
         return 0
