@@ -96,7 +96,8 @@ not mean the peer entry was renamed or removed.
 
 DryRunPolicy exposes a completion rule for local temporary snapshots:
 dry-run may leave the local temporary databases updated, but it must not
-upload them to peers at the end of the run.
+upload them to peers at the end of the run, including peers that are
+subordinate for this run.
 
 DryRunPolicy exposes an output marker requirement: a dry-run execution must
 cause stdout to contain the exact phrase `dry run` at least once. The child may
@@ -150,5 +151,5 @@ creation.
 - Dry-run stdout contains `dry run` at least once.
 - Dry-run performs no peer-side directory creation, file creation, content
   write, rename, delete, BAK displacement, modification-time update, snapshot
-  upload, BAK cleanup, or TMP cleanup through `file://` or `sftp://` peer
-  URLs.
+  upload to any peer including subordinate peers, BAK cleanup, or TMP cleanup
+  through `file://` or `sftp://` peer URLs.
