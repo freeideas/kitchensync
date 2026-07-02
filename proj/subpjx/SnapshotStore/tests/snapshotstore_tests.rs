@@ -589,6 +589,16 @@ fn normal_upload_replaces_live_snapshot_with_a_closed_self_contained_database() 
         )
         .unwrap();
 
+    let peer_side_before_upload: i64 = Connection::open(&live)
+        .expect("open live db before upload")
+        .query_row(
+            "SELECT COUNT(*) FROM snapshot WHERE id = 'K5EzsWuLZ04'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count live rows before upload");
+    assert_eq!(peer_side_before_upload, 0);
+
     let upload = store
         .upload_snapshots(run_id, vec!["peer".to_owned()])
         .expect("upload snapshots");
