@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use stagingrecovery_bakdisplacement::{
-    BakDisplacement, BakDisplacementPeer, BakDisplacementPeerScheme, BakDisplacementRequest,
+    BakDisplacement, BakDisplacementFailure, BakDisplacementPeer, BakDisplacementPeerScheme,
+    BakDisplacementRequest,
 };
 
 fn subject() -> Arc<dyn BakDisplacement> {
@@ -115,5 +116,87 @@ fn displacing_directory_preserves_its_subtree_under_bak_destination() {
         )
         .expect("read displaced nested file"),
         "details"
+    );
+}
+
+#[test]
+fn reports_create_failure_with_displacement_path_context() {
+    let root = temp_root("create-failure");
+    write_file(&root, "peer/report.txt", "original");
+    write_file(&root, "peer/.kitchensync", "not a directory");
+
+    let displacement = subject();
+    let error = displacement
+        .displace_to_bak(BakDisplacementRequest {
+            peer: file_peer(&root),
+            parent_path: "peer".to_owned(),
+            basename: "report.txt".to_owned(),
+            bak_timestamp: "2026-07-02_10-32-00_000003Z".to_owned(),
+        })
+        .expect_err("BAK timestamp directory cannot be created");
+
+    assert_eq!(
+        error.failure,
+        BakDisplacementFailure::CreateBakTimestampDirectory
+    );
+    assert_eq!(error.peer_identity, "peer-a");
+    assert_eq!(error.original_path, "peer/report.txt");
+    assert_eq!(
+        error.bak_timestamp_directory,
+        "peer/.kitchensync/BAK/2026-07-02_10-32-00_000003Z"
+    );
+    assert_eq!(
+        error.bak_destination_path,
+        "peer/.kitchensync/BAK/2026-07-02_10-32-00_000003Z/report.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("peer/report.txt")).expect("read original file"),
+        "original"
+    );
+}
+
+#[test]
+fn reports_move_failure_with_displacement_path_context() {
+    let root = temp_root("move-failure");
+    write_file(&root, "peer/report.txt", "original");
+    write_file(
+        &root,
+        "peer/.kitchensync/BAK/2026-07-02_10-33-00_000004Z/report.txt/existing.txt",
+        "existing",
+    );
+
+    let displacement = subject();
+    let error = displacement
+        .displace_to_bak(BakDisplacementRequest {
+            peer: file_peer(&root),
+            parent_path: "peer".to_owned(),
+            basename: "report.txt".to_owned(),
+            bak_timestamp: "2026-07-02_10-33-00_000004Z".to_owned(),
+        })
+        .expect_err("displaced entry cannot be moved to BAK destination");
+
+    assert_eq!(error.failure, BakDisplacementFailure::MoveDisplacedEntry);
+    assert_eq!(error.peer_identity, "peer-a");
+    assert_eq!(error.original_path, "peer/report.txt");
+    assert_eq!(
+        error.bak_timestamp_directory,
+        "peer/.kitchensync/BAK/2026-07-02_10-33-00_000004Z"
+    );
+    assert_eq!(
+        error.bak_destination_path,
+        "peer/.kitchensync/BAK/2026-07-02_10-33-00_000004Z/report.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("peer/report.txt")).expect("read original file"),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            root.join(
+                "peer/.kitchensync/BAK/2026-07-02_10-33-00_000004Z/report.txt/existing.txt"
+            )
+        )
+        .expect("read existing BAK destination entry"),
+        "existing"
     );
 }
