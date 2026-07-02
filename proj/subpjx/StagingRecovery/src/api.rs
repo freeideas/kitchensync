@@ -24,6 +24,15 @@ pub struct SwapRecoveryRequest {
 }
 
 #[derive(Clone)]
+pub struct UserDataSwapRecoveryRequest {
+    pub peer: StagingRecoveryPeerHandle,
+    pub parent_relative_path: String,
+    pub basename: String,
+    pub encoded_basename: String,
+    pub bak_timestamp: String,
+}
+
+#[derive(Clone)]
 pub struct BakDisplacementRequest {
     pub peer: StagingRecoveryPeerHandle,
     pub parent_relative_path: String,
@@ -87,6 +96,7 @@ pub struct StagingRecoveryFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagingRecoveryOperation {
     SwapRecovery,
+    UserDataSwapRecovery,
     BakDisplacement,
     TmpStagingPath,
     Cleanup,
@@ -148,6 +158,40 @@ pub trait StagingRecovery: Send + Sync {
     /// place for a later successful recovery. This method never recovers
     /// `.kitchensync/SWAP/snapshot.db/` and never purges SWAP by age.
     fn recover_swap(&self, request: SwapRecoveryRequest) -> SwapRecoveryResult;
+
+    /// Recovers the one user-data SWAP directory for a target path before a
+    /// caller starts replacing that target.
+    ///
+    /// The parent path is relative to the peer sync root; an empty parent path
+    /// names the sync root. The basename is the live entry name for
+    /// `<parent>/<basename>`, and `encoded_basename` is the single path
+    /// segment naming that target below
+    /// `<parent>/.kitchensync/SWAP/`. The BAK timestamp must already be a
+    /// caller-supplied `YYYY-MM-DD_HH-mm-ss_ffffffZ` string.
+    ///
+    /// A missing SWAP directory for the encoded basename succeeds without
+    /// changing user data. When that SWAP directory exists, this method
+    /// recovers only that encoded child and applies the same `old`, `new`, and
+    /// live-target cases as directory-level SWAP recovery: live target plus
+    /// `old` archives `old` to nearby BAK; `old` plus `new` with no live
+    /// target installs `new` and archives `old`; only `old` restores `old`;
+    /// live target plus only `new` deletes `new`; only `new` installs `new`.
+    /// Any archive destination is always
+    /// `<parent>/.kitchensync/BAK/<timestamp>/<basename>`, and the required
+    /// BAK parents are created before moving `old`.
+    ///
+    /// Success means the encoded SWAP child was absent or was fully recovered
+    /// and its empty SWAP directory was removed. On failure, the caller must
+    /// not start replacement for `<parent>/<basename>`. Unrecovered SWAP state
+    /// must remain in place for a later successful recovery. This method must
+    /// not recover sibling SWAP children, list live user entries, update
+    /// snapshot rows, recover `.kitchensync/SWAP/snapshot.db/`, purge SWAP by
+    /// age, choose another timestamp or encoded basename, retry, suppress
+    /// writes for dry-run mode, or format output.
+    fn recover_user_data_swap(
+        &self,
+        request: UserDataSwapRecoveryRequest,
+    ) -> Result<(), StagingRecoveryFailure>;
 
     /// Moves one existing user entry from its live path into nearby BAK
     /// storage on one peer.
