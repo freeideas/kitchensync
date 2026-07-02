@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::api::*;
+use std::sync::Arc;
 
 struct PeerConnectionsImpl {
     fileurlconnection: std::sync::Arc<dyn peerconnections_fileurlconnection::FileUrlConnection>,
@@ -8,7 +8,10 @@ struct PeerConnectionsImpl {
 }
 
 impl PeerConnections for PeerConnectionsImpl {
-    fn establish_peer_connections( &self, request: PeerConnectionStartupRequest, ) -> PeerConnectionStartupResult {
+    fn establish_peer_connections(
+        &self,
+        request: PeerConnectionStartupRequest,
+    ) -> PeerConnectionStartupResult {
         let result = self.startupcoordinator.coordinate_startup(
             peerconnections_startupcoordinator::StartupCoordinatorRequest {
                 peers: request.peers.into_iter().map(startup_peer).collect(),
@@ -41,8 +44,16 @@ impl PeerConnections for PeerConnectionsImpl {
     }
 }
 
-pub fn new(fileurlconnection: std::sync::Arc<dyn peerconnections_fileurlconnection::FileUrlConnection>, sftpurlconnection: std::sync::Arc<dyn peerconnections_sftpurlconnection::SftpUrlConnection>, startupcoordinator: std::sync::Arc<dyn peerconnections_startupcoordinator::StartupCoordinator>) -> std::sync::Arc<dyn PeerConnections> {
-    Arc::new(PeerConnectionsImpl { fileurlconnection, sftpurlconnection, startupcoordinator })
+pub fn new(
+    fileurlconnection: std::sync::Arc<dyn peerconnections_fileurlconnection::FileUrlConnection>,
+    sftpurlconnection: std::sync::Arc<dyn peerconnections_sftpurlconnection::SftpUrlConnection>,
+    startupcoordinator: std::sync::Arc<dyn peerconnections_startupcoordinator::StartupCoordinator>,
+) -> std::sync::Arc<dyn PeerConnections> {
+    Arc::new(PeerConnectionsImpl {
+        fileurlconnection,
+        sftpurlconnection,
+        startupcoordinator,
+    })
 }
 
 fn startup_peer(
@@ -52,28 +63,13 @@ fn startup_peer(
     let primary_url = urls
         .next()
         .map(startup_url)
-        .unwrap_or_else(empty_startup_url);
+        .expect("validated peer must include a primary URL");
 
     peerconnections_startupcoordinator::StartupCoordinatorPeer {
         identity: peer.identity,
         role: startup_peer_role(peer.role),
         primary_url,
         fallback_urls: urls.map(startup_url).collect(),
-    }
-}
-
-fn empty_startup_url() -> peerconnections_startupcoordinator::StartupCoordinatorUrl {
-    peerconnections_startupcoordinator::StartupCoordinatorUrl {
-        normalized_identity: String::new(),
-        location: peerconnections_startupcoordinator::StartupCoordinatorUrlLocation::File(
-            peerconnections_startupcoordinator::StartupCoordinatorFileUrl {
-                local_peer_root_path: std::path::PathBuf::new(),
-            },
-        ),
-        connection: peerconnections_startupcoordinator::StartupCoordinatorUrlSettings {
-            timeout_conn_seconds: None,
-            timeout_idle_seconds: None,
-        },
     }
 }
 
