@@ -555,9 +555,54 @@ fn peer_live_snapshot_path(peer: &SnapshotPeerHandle) -> Option<PathBuf> {
         return Some(path.join(".kitchensync/snapshot.db"));
     }
 
-    peer.handle
-        .downcast_ref::<String>()
-        .map(|path| PathBuf::from(path).join(".kitchensync/snapshot.db"))
+    if let Some(path) = peer.handle.downcast_ref::<String>() {
+        return Some(PathBuf::from(path).join(".kitchensync/snapshot.db"));
+    }
+
+    file_url_path(&peer.winning_url).map(|path| path.join(".kitchensync/snapshot.db"))
+}
+
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    url.strip_prefix("file://")
+        .map(percent_decode_file_url_path)
+        .or_else(|| Some(PathBuf::from(url)).filter(|path| path.is_absolute()))
+}
+
+fn percent_decode_file_url_path(path: &str) -> PathBuf {
+    let mut bytes = Vec::new();
+    let raw = path.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' && index + 2 < raw.len() {
+            if let Some(byte) = hex_byte(raw[index + 1], raw[index + 2]) {
+                bytes.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        bytes.push(raw[index]);
+        index += 1;
+    }
+
+    let decoded = String::from_utf8_lossy(&bytes).into_owned();
+    if cfg!(windows) && decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':') {
+        PathBuf::from(&decoded[1..])
+    } else {
+        PathBuf::from(decoded)
+    }
+}
+
+fn hex_byte(high: u8, low: u8) -> Option<u8> {
+    Some(hex_digit(high)? * 16 + hex_digit(low)?)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn identity_error(error: snapshotstore_snapshotidentity::SnapshotIdentityError) -> SnapshotStoreError {
