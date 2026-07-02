@@ -38,6 +38,9 @@ pub enum PeerRunRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartupFatalOutcome {
+    FewerThanTwoReachablePeers {
+        exit_code: i32,
+    },
     FirstSyncRequiresCanon {
         exit_code: i32,
         stdout_line: String,
@@ -245,14 +248,16 @@ pub trait TreeSyncPlanner: Send + Sync {
     /// therefore receive no returned role, listing work, decision, or snapshot
     /// update intent for the run.
     ///
-    /// If no reachable peer has snapshot data and no canon peer is designated,
-    /// the fatal outcome has exit code `1` and stdout line `First sync? Mark
-    /// the authoritative peer with a leading +`. If the designated canon peer
-    /// is not reachable, the fatal outcome has exit code `1`. If automatic
-    /// subordination leaves no reachable contributing peer, the fatal outcome
-    /// has an error exit and stdout line `No contributing peer reachable -
-    /// cannot make sync decisions`. A run with at least one reachable
-    /// contributing peer with snapshot history does not require a canon peer.
+    /// If fewer than two peers are reachable, the fatal outcome has exit code
+    /// `1`. If no reachable peer has snapshot data and no canon peer is
+    /// designated, the fatal outcome has exit code `1` and stdout line `First
+    /// sync? Mark the authoritative peer with a leading +`. If the designated
+    /// canon peer is not reachable, the fatal outcome has exit code `1`. If
+    /// automatic subordination leaves no reachable contributing peer, the fatal
+    /// outcome has an error exit and stdout line `No contributing peer
+    /// reachable - cannot make sync decisions`. A run with at least one
+    /// reachable contributing peer with snapshot history does not require a
+    /// canon peer.
     fn decide_startup_roles(&self, request: StartupRoleRequest) -> StartupRoleDecision;
 
     /// Plans sync work for the root and all visible descendant paths.
