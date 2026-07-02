@@ -158,7 +158,7 @@ fn run_scheduled_copy(shared: Arc<SharedRunState>, scheduled: ScheduledCopy) {
         scheduled.attempt.try_number,
     );
 
-    {
+    let should_schedule_more = {
         let mut state = shared.state.lock().expect("queue runner mutex poisoned");
         let run = state.as_mut().expect("queue runner run was not started");
 
@@ -214,10 +214,14 @@ fn run_scheduled_copy(shared: Arc<SharedRunState>, scheduled: ScheduledCopy) {
             }
         }
 
-        shared.changed.notify_all();
+        !run.queue.is_empty() && run.active_copies < scheduled.max_active_copies
+    };
+
+    if should_schedule_more {
+        schedule_available_work(Arc::clone(&shared));
     }
 
-    schedule_available_work(shared);
+    shared.changed.notify_all();
 }
 
 fn copy_result(
