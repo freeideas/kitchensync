@@ -1,14 +1,14 @@
 {
   "decision": "split",
   "architecture_notes": [
-    "Keep CommandAndOutput as a facade over argument parsing, peer identity normalization, and stdout-only reporting."
+    "Keep CommandAndOutput as a small facade over global argument parsing, peer operand parsing, peer identity normalization, and stdout-only reporting."
   ],
   "children": [
     {
       "name": "GlobalArgumentParser",
-      "responsibility": "Parses no-argument help behavior, global options, defaults, command-line excludes, and global validation failures.",
+      "responsibility": "Parses the leading option segment, no-argument help behavior, global run settings, command-line excludes, and global option validation failures.",
       "reqs": [
-        "001.4",
+        "001.5",
         "002.1",
         "002.2",
         "002.3",
@@ -42,24 +42,7 @@
         "002.33",
         "002.34",
         "002.35",
-        "002.36",
-        "002.45",
-        "002.46",
-        "002.47",
-        "002.48",
-        "003.19",
-        "003.20",
-        "003.21",
-        "003.22",
-        "003.23",
-        "003.24",
-        "003.25",
-        "003.26",
-        "003.27",
-        "003.28",
-        "003.29",
-        "003.30",
-        "003.31",
+        "002.42",
         "003.32",
         "003.33",
         "003.34",
@@ -67,6 +50,16 @@
         "003.36",
         "003.37",
         "003.38",
+        "003.39",
+        "003.40",
+        "003.41",
+        "003.42",
+        "003.43",
+        "003.44",
+        "003.45",
+        "003.46",
+        "003.47",
+        "003.48",
         "003.49",
         "003.50",
         "003.51",
@@ -76,25 +69,27 @@
         "003.55",
         "003.56",
         "003.57",
-        "003.58"
+        "003.58",
+        "003.59",
+        "003.60",
+        "003.61"
       ]
     },
     {
       "name": "PeerArgumentParser",
-      "responsibility": "Parses peer operands, peer roles, fallback URL groups, local and SFTP peer forms, and per-URL timeout query settings.",
+      "responsibility": "Parses peer operands, peer roles, fallback location groups, local and SFTP peer forms, and per-URL timeout query settings.",
       "reqs": [
-        "001.5",
         "001.6",
+        "001.7",
+        "001.8",
         "002.4",
         "002.5",
+        "002.36",
         "002.37",
         "002.38",
         "002.39",
         "002.40",
         "002.41",
-        "002.42",
-        "002.43",
-        "002.44",
         "003.1",
         "003.2",
         "003.3",
@@ -113,21 +108,24 @@
         "003.16",
         "003.17",
         "003.18",
-        "003.39",
-        "003.40",
-        "003.41",
-        "003.42",
-        "003.43",
-        "003.44",
-        "003.45",
-        "003.46",
-        "003.47",
-        "003.48"
+        "003.19",
+        "003.20",
+        "003.21",
+        "003.22",
+        "003.23",
+        "003.24",
+        "003.25",
+        "003.26",
+        "003.27",
+        "003.28",
+        "003.29",
+        "003.30",
+        "003.31"
       ]
     },
     {
       "name": "PeerIdentityNormalizer",
-      "responsibility": "Normalizes local path and SFTP peer URL identities before comparison or lookup.",
+      "responsibility": "Normalizes accepted local path and SFTP peer targets into identity strings before comparison or lookup.",
       "reqs": [
         "004.1",
         "004.2",
@@ -147,8 +145,10 @@
     },
     {
       "name": "StdoutReporter",
-      "responsibility": "Formats all command, sync, progress, trace, failure, and completion output as stdout-only plain lines.",
+      "responsibility": "Formats argument, sync, progress, trace, failure, and completion output as stdout-only plain lines.",
       "reqs": [
+        "002.43",
+        "002.45",
         "019.1",
         "019.2",
         "019.3",
@@ -178,7 +178,8 @@
         "019.27",
         "019.28",
         "019.29",
-        "019.30"
+        "019.30",
+        "019.31"
       ]
     }
   ]
