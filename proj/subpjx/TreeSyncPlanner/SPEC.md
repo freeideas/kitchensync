@@ -29,18 +29,22 @@ each reachable peer:
   snapshot history;
 - a reachable peer with snapshot history and no `-` marker is contributing.
 
-The same operation returns the specified fatal startup outcomes. If no reachable
-peer has snapshot data and no canon peer is designated, the outcome is the
-first-sync failure with exit code `1` and the required stdout line `First
-sync? Mark the authoritative peer with a leading +`. If a designated canon peer
+The same operation returns the specified fatal startup outcomes as structured
+facts for the caller to print or exit on. If fewer than two peers are reachable,
+the outcome is a startup failure with exit code `1`. If a designated canon peer
 is not reachable, the outcome is an unreachable-canon failure with exit code
-`1`. If automatic subordination leaves no reachable contributing peer, the
-outcome is the no-contributing-peer failure with an error exit and the required
-stdout line `No contributing peer reachable - cannot make sync decisions`. A
-run with at least one reachable contributing peer with snapshot history does
-not require a canon peer. Peers unreachable at startup are not present in the
-planner's peer set and receive no listings, decisions, or snapshot update
-intents for that run.
+`1`. If no reachable peer has snapshot data and no canon peer is designated,
+the outcome is the first-sync failure with exit code `1` and the required
+stdout line `First sync? Mark the authoritative peer with a leading +`. If
+automatic subordination leaves no reachable contributing peer, the outcome is
+the no-contributing-peer failure with an error exit and the required stdout
+line `No contributing peer reachable - cannot make sync decisions`. A run with
+at least one reachable contributing peer with snapshot history does not require
+a canon peer. Peers unreachable at startup are not present in the planner's
+peer set and receive no listings, decisions, or snapshot update intents for
+that run. Their existing snapshot rows remain untouched; on a later run when
+the peer is reachable again, differences between its live state and those rows
+are ordinary inputs to the planner's decisions.
 
 TreeSyncPlanner exposes a recursive planning operation for the sync root. For
 each traversed directory path, it starts a directory-listing request for every
