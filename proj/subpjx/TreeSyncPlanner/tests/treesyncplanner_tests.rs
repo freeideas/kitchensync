@@ -130,11 +130,18 @@ fn startup_roles_report_first_sync_without_canon() {
     let planner = subject();
 
     let decision = planner.decide_startup_roles(StartupRoleRequest {
-        reachable_peers: vec![StartupPeer {
-            peer_id: "fresh".to_string(),
-            command_line_role: StartupPeerCommandRole::Normal,
-            had_snapshot_at_startup: false,
-        }],
+        reachable_peers: vec![
+            StartupPeer {
+                peer_id: "fresh-left".to_string(),
+                command_line_role: StartupPeerCommandRole::Normal,
+                had_snapshot_at_startup: false,
+            },
+            StartupPeer {
+                peer_id: "fresh-right".to_string(),
+                command_line_role: StartupPeerCommandRole::Normal,
+                had_snapshot_at_startup: false,
+            },
+        ],
         designated_canon_peer_id: None,
     });
 
@@ -143,6 +150,26 @@ fn startup_roles_report_first_sync_without_canon() {
             exit_code: 1,
             stdout_line: "First sync? Mark the authoritative peer with a leading +".to_string(),
         }),
+        decision.fatal_outcome
+    );
+    assert!(decision.peer_roles.is_empty());
+}
+
+#[test]
+fn startup_roles_report_fewer_than_two_reachable_peers() {
+    let planner = subject();
+
+    let decision = planner.decide_startup_roles(StartupRoleRequest {
+        reachable_peers: vec![StartupPeer {
+            peer_id: "only-peer".to_string(),
+            command_line_role: StartupPeerCommandRole::Normal,
+            had_snapshot_at_startup: true,
+        }],
+        designated_canon_peer_id: None,
+    });
+
+    assert_eq!(
+        Some(StartupFatalOutcome::FewerThanTwoReachablePeers { exit_code: 1 }),
         decision.fatal_outcome
     );
     assert!(decision.peer_roles.is_empty());
@@ -261,6 +288,73 @@ fn plan_uses_live_names_excludes_hidden_paths_and_targets_subordinates() {
 }
 
 #[test]
+fn non_canon_listing_failure_is_diagnostic_and_run_local_exclusion() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("canon", PeerRunRole::Contributing, true),
+            peer("failed-target", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            listing("canon", "", vec![file("canon.txt", 10, 100)]),
+            DirectoryListingFact {
+                peer_id: "failed-target".to_string(),
+                relative_directory_path: "".to_string(),
+                tries_used: 2,
+                outcome: DirectoryListingOutcome::Failed {
+                    diagnostic: "timeout".to_string(),
+                },
+            },
+            listing("subordinate", "", Vec::new()),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 2,
+    });
+
+    assert_eq!(
+        vec![(
+            TreeSyncDiagnosticLevel::Error,
+            TreeSyncDiagnosticKind::DirectoryListingFailed,
+            Some("failed-target"),
+            "",
+        )],
+        plan.diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.level,
+                diagnostic.kind,
+                diagnostic.peer_id.as_deref(),
+                diagnostic.relative_path.as_str(),
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    assert!(plan.actions.iter().all(|action| match action {
+        TreeSyncAction::CopyFile(copy) => copy.destination_peer_id != "failed-target",
+        TreeSyncAction::CreateDirectory(create) => create.peer_id != "failed-target",
+        TreeSyncAction::DisplacePath(displace) => displace.peer_id != "failed-target",
+    }));
+    assert!(plan
+        .snapshot_update_intents
+        .iter()
+        .all(|intent| match intent {
+            SnapshotUpdateIntent::UpsertFile { peer_id, .. }
+            | SnapshotUpdateIntent::UpsertDirectory { peer_id, .. }
+            | SnapshotUpdateIntent::Tombstone { peer_id, .. } => peer_id != "failed-target",
+        }));
+    assert!(plan.actions.iter().any(|action| matches!(
+        action,
+        TreeSyncAction::CopyFile(copy)
+            if copy.source_peer_id == "canon"
+                && copy.destination_peer_id == "subordinate"
+                && copy.destination_relative_path == "canon.txt"
+    )));
+}
+
+#[test]
 fn canon_listing_failure_blocks_the_subtree_for_every_peer() {
     let planner = subject();
 
@@ -307,6 +401,58 @@ fn canon_listing_failure_blocks_the_subtree_for_every_peer() {
     assert!(plan.actions.is_empty());
     assert!(plan.snapshot_update_intents.is_empty());
     assert!(plan.directory_visit_intents.is_empty());
+}
+
+#[test]
+fn without_canon_newer_file_vote_wins_and_preserves_source_case() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("left", PeerRunRole::Contributing, false),
+            peer("right", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            listing("left", "", vec![file("Report.TXT", 10, 100)]),
+            listing("right", "", vec![file("Report.TXT", 12, 107)]),
+            listing("subordinate", "", Vec::new()),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 1,
+    });
+
+    let copies = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            TreeSyncAction::CopyFile(copy) => Some((
+                copy.source_peer_id.as_str(),
+                copy.source_relative_path.as_str(),
+                copy.destination_peer_id.as_str(),
+                copy.destination_relative_path.as_str(),
+                copy.winning_byte_size,
+                copy.winning_modified_time,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        vec![
+            ("right", "Report.TXT", "left", "Report.TXT", 12, ts(107)),
+            (
+                "right",
+                "Report.TXT",
+                "subordinate",
+                "Report.TXT",
+                12,
+                ts(107),
+            ),
+        ],
+        copies
+    );
 }
 
 #[test]
