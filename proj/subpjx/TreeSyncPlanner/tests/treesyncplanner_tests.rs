@@ -43,6 +43,13 @@ fn file(name: &str, byte_size: u64, modified_time: i64) -> LiveDirectoryEntry {
     }
 }
 
+fn directory(name: &str) -> LiveDirectoryEntry {
+    LiveDirectoryEntry {
+        name: name.to_string(),
+        kind: LiveEntryKind::Directory,
+    }
+}
+
 fn listing(
     peer_id: &str,
     relative_directory_path: &str,
@@ -62,6 +69,14 @@ fn peer(peer_id: &str, role: PeerRunRole, is_canon: bool) -> PlanningPeer {
         role,
         is_canon,
     }
+}
+
+fn is_at_or_under(path: &str, excluded_directory: &str) -> bool {
+    path == excluded_directory
+        || matches!(
+            path.strip_prefix(excluded_directory),
+            Some(rest) if rest.starts_with('/')
+        )
 }
 
 #[test]
@@ -332,4 +347,193 @@ fn subordinate_only_file_is_displaced_when_contributors_have_no_vote() {
         action,
         TreeSyncAction::CopyFile(copy) if copy.source_relative_path == "extra.txt"
     )));
+}
+
+#[test]
+fn directory_exclude_blocks_recursion_mutations_and_snapshot_updates() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("canon", PeerRunRole::Contributing, true),
+            peer("target", PeerRunRole::Contributing, false),
+        ],
+        accepted_excludes: vec![AcceptedExclude {
+            relative_path: "Ignored".to_string(),
+            kind: AcceptedExcludeKind::DirectorySubtree,
+        }],
+        directory_listing_facts: vec![
+            listing("canon", "", vec![directory("Ignored")]),
+            listing("target", "", Vec::new()),
+            listing("canon", "Ignored", vec![file("child.txt", 10, 100)]),
+            listing("target", "Ignored", Vec::new()),
+        ],
+        snapshot_facts: vec![
+            SnapshotFact {
+                peer_id: "target".to_string(),
+                relative_path: "Ignored".to_string(),
+                row: SnapshotRow {
+                    kind: SnapshotEntryKind::Directory,
+                    byte_size: None,
+                    modified_time: None,
+                    deleted_time: None,
+                    last_seen: Some(ts(100)),
+                },
+            },
+            SnapshotFact {
+                peer_id: "target".to_string(),
+                relative_path: "Ignored/child.txt".to_string(),
+                row: SnapshotRow {
+                    kind: SnapshotEntryKind::File,
+                    byte_size: Some(1),
+                    modified_time: Some(ts(1)),
+                    deleted_time: None,
+                    last_seen: Some(ts(1)),
+                },
+            },
+        ],
+        list_total_tries: 1,
+    });
+
+    assert!(plan.actions.iter().all(|action| match action {
+        TreeSyncAction::CopyFile(copy) => {
+            !is_at_or_under(&copy.source_relative_path, "Ignored")
+                && !is_at_or_under(&copy.destination_relative_path, "Ignored")
+        }
+        TreeSyncAction::CreateDirectory(create) => !is_at_or_under(&create.relative_path, "Ignored"),
+        TreeSyncAction::DisplacePath(displace) => {
+            !is_at_or_under(&displace.relative_path, "Ignored")
+        }
+    }));
+    assert!(plan
+        .snapshot_update_intents
+        .iter()
+        .all(|intent| match intent {
+            SnapshotUpdateIntent::UpsertFile { relative_path, .. }
+            | SnapshotUpdateIntent::UpsertDirectory { relative_path, .. }
+            | SnapshotUpdateIntent::Tombstone { relative_path, .. } => {
+                !is_at_or_under(relative_path, "Ignored")
+            }
+        }));
+    assert!(plan
+        .directory_visit_intents
+        .iter()
+        .all(|intent| !is_at_or_under(&intent.relative_path, "Ignored")));
+}
+
+#[test]
+fn parent_directory_entries_are_finished_before_child_file_work() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("canon", PeerRunRole::Contributing, true),
+            peer("target", PeerRunRole::Contributing, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            listing("canon", "", vec![directory("Child"), file("z.txt", 9, 90)]),
+            listing("target", "", Vec::new()),
+            listing("canon", "Child", vec![file("nested.txt", 10, 100)]),
+            listing("target", "Child", Vec::new()),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 1,
+    });
+
+    assert!(plan.actions.iter().any(|action| matches!(
+        action,
+        TreeSyncAction::CreateDirectory(create)
+            if create.peer_id == "target" && create.relative_path == "Child"
+    )));
+    assert!(plan.directory_visit_intents.iter().any(|intent| {
+        intent.relative_path == "Child"
+            && intent.peer_ids == vec!["canon".to_string(), "target".to_string()]
+    }));
+
+    let z_copy_index = plan
+        .actions
+        .iter()
+        .position(|action| matches!(
+            action,
+            TreeSyncAction::CopyFile(copy) if copy.destination_relative_path == "z.txt"
+        ))
+        .expect("parent file copy should be planned");
+    let nested_copy_index = plan
+        .actions
+        .iter()
+        .position(|action| matches!(
+            action,
+            TreeSyncAction::CopyFile(copy) if copy.destination_relative_path == "Child/nested.txt"
+        ))
+        .expect("child file copy should be planned after parent entries");
+
+    assert!(z_copy_index < nested_copy_index);
+}
+
+#[test]
+fn non_canon_file_beats_directory_and_replaces_losing_paths() {
+    let planner = subject();
+
+    let plan = planner.plan_sync_root(TreeSyncPlanRequest {
+        peers: vec![
+            peer("file-peer", PeerRunRole::Contributing, false),
+            peer("dir-peer", PeerRunRole::Contributing, false),
+            peer("subordinate", PeerRunRole::Subordinate, false),
+        ],
+        accepted_excludes: Vec::new(),
+        directory_listing_facts: vec![
+            listing("file-peer", "", vec![file("Mixed", 11, 110)]),
+            listing("dir-peer", "", vec![directory("Mixed")]),
+            listing("subordinate", "", vec![directory("Mixed")]),
+        ],
+        snapshot_facts: Vec::new(),
+        list_total_tries: 1,
+    });
+
+    let displacements = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            TreeSyncAction::DisplacePath(displace) => Some((
+                displace.peer_id.as_str(),
+                displace.relative_path.as_str(),
+                displace.kind,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![
+            ("dir-peer", "Mixed", DisplacementKind::DirectoryWholeSubtree),
+            (
+                "subordinate",
+                "Mixed",
+                DisplacementKind::DirectoryWholeSubtree,
+            ),
+        ],
+        displacements
+    );
+
+    let copies = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            TreeSyncAction::CopyFile(copy) => Some((
+                copy.source_peer_id.as_str(),
+                copy.source_relative_path.as_str(),
+                copy.destination_peer_id.as_str(),
+                copy.destination_relative_path.as_str(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![
+            ("file-peer", "Mixed", "dir-peer", "Mixed"),
+            ("file-peer", "Mixed", "subordinate", "Mixed"),
+        ],
+        copies
+    );
+    assert!(plan.directory_visit_intents.is_empty());
 }
