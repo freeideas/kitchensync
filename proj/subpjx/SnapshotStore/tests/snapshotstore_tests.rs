@@ -7,8 +7,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use rusqlite::Connection;
 use snapshotstore::{
     SnapshotEntryKind, SnapshotIntendedFileCopy, SnapshotObservedEntry, SnapshotPeerHandle,
-    SnapshotPeerRole, SnapshotPeerScheme, SnapshotRunMode, SnapshotStartupRequest, SnapshotStore,
-    SnapshotStoreError, SNAPSHOT_ROOT_PARENT_ID,
+    SnapshotPeerRole, SnapshotPeerScheme, SnapshotRunMode, SnapshotStartupFailureKind,
+    SnapshotStartupRequest, SnapshotStore, SnapshotStoreError, SNAPSHOT_ROOT_PARENT_ID,
 };
 
 const LIVE_MARKER: &str = "2024-01-01_00-00-00_000001Z";
@@ -128,6 +128,52 @@ fn create_snapshot_db(path: &Path, mod_time_marker: &str) {
         .expect("insert marker row");
 }
 
+fn create_invalid_snapshot_db(path: &Path) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create snapshot parent");
+    }
+
+    let connection = Connection::open(path).expect("open invalid snapshot db");
+    connection
+        .execute_batch("CREATE TABLE snapshot (id TEXT PRIMARY KEY);")
+        .expect("create invalid snapshot schema");
+}
+
+fn create_cleanup_snapshot_db(path: &Path, store: &dyn SnapshotStore) {
+    create_snapshot_db(path, LIVE_MARKER);
+    let connection = Connection::open(path).expect("open cleanup snapshot db");
+    let gone_id = store.path_id("gone.txt").unwrap();
+    let orphan_id = store.path_id("lost/child.txt").unwrap();
+    let orphan_parent_id = store.parent_path_id("lost/child.txt").unwrap();
+
+    connection
+        .execute(
+            "INSERT INTO snapshot
+             (id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time)
+             VALUES (?1, ?2, 'gone.txt', ?3, 9, ?4, ?4)",
+            (
+                gone_id,
+                SNAPSHOT_ROOT_PARENT_ID,
+                LIVE_MARKER,
+                "1970-01-02_00-00-00_000000Z",
+            ),
+        )
+        .expect("insert old tombstone row");
+    connection
+        .execute(
+            "INSERT INTO snapshot
+             (id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time)
+             VALUES (?1, ?2, 'child.txt', ?3, 10, ?4, NULL)",
+            (
+                orphan_id,
+                orphan_parent_id,
+                LIVE_MARKER,
+                "1970-01-02_00-00-00_000000Z",
+            ),
+        )
+        .expect("insert old orphan row");
+}
+
 fn marker_mod_time(path: &Path) -> String {
     let connection = Connection::open(path).expect("open snapshot db");
     connection
@@ -137,6 +183,32 @@ fn marker_mod_time(path: &Path) -> String {
             |row| row.get::<_, String>(0),
         )
         .expect("read marker row")
+}
+
+fn indexed_columns(connection: &Connection) -> Vec<Vec<String>> {
+    let index_names: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_index_list('snapshot') WHERE origin != 'pk'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    index_names
+        .into_iter()
+        .map(|name| {
+            let escaped_name = name.replace('\'', "''");
+            connection
+                .prepare(&format!(
+                    "SELECT name FROM pragma_index_info('{escaped_name}') ORDER BY seqno"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        })
+        .collect()
 }
 
 #[test]
@@ -249,16 +321,10 @@ fn startup_without_live_snapshot_creates_exact_local_database_and_ignores_sideca
         ]
     );
 
-    let indexes: Vec<String> = connection
-        .prepare("SELECT name FROM pragma_index_list('snapshot') ORDER BY name")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert!(indexes.iter().any(|name| name.contains("parent_id")));
-    assert!(indexes.iter().any(|name| name.contains("last_seen")));
-    assert!(indexes.iter().any(|name| name.contains("deleted_time")));
+    let indexes = indexed_columns(&connection);
+    assert!(indexes.contains(&vec!["parent_id".to_owned()]));
+    assert!(indexes.contains(&vec!["last_seen".to_owned()]));
+    assert!(indexes.contains(&vec!["deleted_time".to_owned()]));
 }
 
 #[test]
@@ -389,6 +455,57 @@ fn row_mutations_preserve_snapshot_facts_and_copy_deletion_estimates() {
 }
 
 #[test]
+fn completed_file_displacement_copies_the_previous_last_seen_value() {
+    let store = subject();
+    let peer_root = temp_root("file-displacement-peer");
+    let (run_id, _local_snapshot_path, _) =
+        start_one_peer(&*store, "file-displacement-peer", &peer_root);
+
+    let seen = store
+        .confirm_present(
+            run_id,
+            SnapshotObservedEntry {
+                peer_identity: "peer".to_owned(),
+                relative_path: "old.txt".to_owned(),
+                mod_time: "2024-04-05_06-07-08_000009Z".to_owned(),
+                entry_kind: SnapshotEntryKind::File { byte_size: 21 },
+            },
+        )
+        .unwrap();
+
+    store
+        .complete_file_displacement(run_id, "peer", "old.txt")
+        .unwrap();
+
+    let displaced = store
+        .lookup_row(run_id, "peer", "old.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(displaced.last_seen, Some(seen.clone()));
+    assert_eq!(displaced.deleted_time, Some(seen));
+}
+
+#[test]
+fn cleanup_removes_old_tombstones_and_old_orphan_rows() {
+    let store = subject();
+    let peer_root = temp_root("cleanup-peer");
+    create_cleanup_snapshot_db(&peer_root.join(".kitchensync/snapshot.db"), &*store);
+
+    let (run_id, _local_snapshot_path, had_history) =
+        start_one_peer(&*store, "cleanup-peer", &peer_root);
+    assert!(had_history);
+
+    store.cleanup_peer(run_id, "peer", 1).unwrap();
+
+    assert!(store.lookup_row(run_id, "peer", "gone.txt").unwrap().is_none());
+    assert!(store
+        .lookup_row(run_id, "peer", "lost/child.txt")
+        .unwrap()
+        .is_none());
+    assert!(store.lookup_row(run_id, "peer", "docs").unwrap().is_some());
+}
+
+#[test]
 fn normal_startup_recovers_all_snapshot_swap_states_before_download() {
     let cases = [
         ("old-live-new", true, true, true, LIVE_MARKER),
@@ -424,6 +541,27 @@ fn normal_startup_recovers_all_snapshot_swap_states_before_download() {
         assert!(!old.exists(), "{name} should remove SWAP old");
         assert!(!new.exists(), "{name} should remove SWAP new");
     }
+}
+
+#[test]
+fn invalid_live_snapshot_schema_reports_the_peer_unavailable() {
+    let store = subject();
+    let peer_root = temp_root("invalid-schema-peer");
+    create_invalid_snapshot_db(&peer_root.join(".kitchensync/snapshot.db"));
+
+    let result = store.start_run(SnapshotStartupRequest {
+        run_mode: SnapshotRunMode::Normal,
+        temporary_root: temp_root("invalid-schema-tmp"),
+        peers: vec![local_peer("peer", &peer_root)],
+    });
+
+    assert_eq!(result.available_peers, Vec::new());
+    assert_eq!(result.unavailable_peers.len(), 1);
+    assert_eq!(result.unavailable_peers[0].peer_identity, "peer");
+    assert_eq!(
+        result.unavailable_peers[0].diagnostic.kind,
+        SnapshotStartupFailureKind::LocalDatabaseFailed
+    );
 }
 
 #[test]
@@ -484,7 +622,11 @@ fn dry_run_upload_is_rejected_without_peer_mutation() {
     let store = subject();
     let peer_root = temp_root("dry-run-peer");
     let live = peer_root.join(".kitchensync/snapshot.db");
+    let old = peer_root.join(".kitchensync/SWAP/snapshot.db/old");
+    let new = peer_root.join(".kitchensync/SWAP/snapshot.db/new");
     create_snapshot_db(&live, LIVE_MARKER);
+    create_snapshot_db(&old, OLD_MARKER);
+    create_snapshot_db(&new, NEW_MARKER);
 
     let result = store.start_run(SnapshotStartupRequest {
         run_mode: SnapshotRunMode::DryRun,
@@ -499,4 +641,6 @@ fn dry_run_upload_is_rejected_without_peer_mutation() {
         Err(SnapshotStoreError::DryRunUploadForbidden)
     ));
     assert_eq!(marker_mod_time(&live), LIVE_MARKER);
+    assert_eq!(marker_mod_time(&old), OLD_MARKER);
+    assert_eq!(marker_mod_time(&new), NEW_MARKER);
 }
