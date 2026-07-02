@@ -11,104 +11,201 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import traceback
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
-
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
+KITCHENSYNC = WORKSPACE_ROOT / "released" / "kitchensync.exe"
 
-LITERAL_WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-WORKSPACE_ROOT = (
-    LITERAL_WORKSPACE_ROOT
-    if LITERAL_WORKSPACE_ROOT.exists()
-    else Path(__file__).resolve().parents[1]
-)
-KITCHENSYNC_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
+TS_OLD = "2026-01-01_00-00-00_000000Z"
+TS_MID = "2026-01-01_00-02-00_000000Z"
+TS_NEW = "2026-01-01_00-04-00_000000Z"
+TS_NEWER = "2026-01-01_00-06-00_000000Z"
 
-PRIME64_1 = 11400714785074694791
-PRIME64_2 = 14029467366897019727
-PRIME64_3 = 1609587929392839161
-PRIME64_4 = 9650029242287828579
-PRIME64_5 = 2870177450012600261
+EPOCH_OLD = 1_767_225_600
+EPOCH_MID = EPOCH_OLD + 120
+EPOCH_NEW = EPOCH_OLD + 240
+EPOCH_NEWER = EPOCH_OLD + 360
+
+
+@dataclass
+class Check:
+    name: str
+    func: object
+
+
+class FailureCollector:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+
+    def check(self, condition: bool, message: str) -> None:
+        if not condition:
+            self.failures.append(message)
+
+    def equal(self, actual: object, expected: object, message: str) -> None:
+        if actual != expected:
+            self.failures.append(f"{message}: expected {expected!r}, got {actual!r}")
+
+
+def run_sync(failures: FailureCollector, *args: str) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [str(KITCHENSYNC), "--verbosity", "error", *args],
+        cwd=str(WORKSPACE_ROOT),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        shell=False,
+        check=False,
+    )
+    failures.equal(result.returncode, 0, f"sync exit code for {args}")
+    failures.equal(result.stderr, "", f"sync stderr for {args}")
+    failures.check(
+        "sync complete" in result.stdout.splitlines(),
+        f"sync stdout should contain final completion line for {args}; stdout={result.stdout!r}",
+    )
+    return result
+
+
+def write_text(path: Path, text: str, mtime: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    os.utime(path, (mtime, mtime))
+
+
+def make_dir(path: Path, mtime: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.utime(path, (mtime, mtime))
+
+
+def read_text(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def bak_entries(root: Path, basename: str) -> list[Path]:
+    base = root / ".kitchensync" / "BAK"
+    if not base.exists():
+        return []
+    return [path for path in base.rglob(basename) if path.name == basename]
+
+
+def peer(tmp: Path, name: str) -> Path:
+    path = tmp / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def timestamp_for_epoch(epoch: int) -> str:
+    if epoch == EPOCH_OLD:
+        return TS_OLD
+    if epoch == EPOCH_MID:
+        return TS_MID
+    if epoch == EPOCH_NEW:
+        return TS_NEW
+    if epoch == EPOCH_NEWER:
+        return TS_NEWER
+    raise ValueError(f"no fixture timestamp for epoch {epoch}")
+
+
+XXH_PRIME64_1 = 11400714785074694791
+XXH_PRIME64_2 = 14029467366897019727
+XXH_PRIME64_3 = 1609587929392839161
+XXH_PRIME64_4 = 9650029242287828579
+XXH_PRIME64_5 = 2870177450012600261
 MASK64 = (1 << 64) - 1
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
+def rotl64(value: int, count: int) -> int:
+    return ((value << count) | (value >> (64 - count))) & MASK64
+
+
+def read_u64(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little")
+
+
+def read_u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def xxh64_round(acc: int, lane: int) -> int:
+    acc = (acc + lane * XXH_PRIME64_2) & MASK64
+    acc = rotl64(acc, 31)
+    return (acc * XXH_PRIME64_1) & MASK64
+
+
+def xxh64_merge(acc: int, lane: int) -> int:
+    acc ^= xxh64_round(0, lane)
+    acc = (acc * XXH_PRIME64_1 + XXH_PRIME64_4) & MASK64
+    return acc
+
+
 def xxh64(data: bytes) -> int:
-    def rol(value: int, bits: int) -> int:
-        return ((value << bits) | (value >> (64 - bits))) & MASK64
-
-    def round_acc(acc: int, lane: int) -> int:
-        acc = (acc + lane * PRIME64_2) & MASK64
-        acc = rol(acc, 31)
-        acc = (acc * PRIME64_1) & MASK64
-        return acc
-
-    def merge_round(acc: int, lane: int) -> int:
-        acc ^= round_acc(0, lane)
-        acc = (acc * PRIME64_1 + PRIME64_4) & MASK64
-        return acc
-
     index = 0
     length = len(data)
     if length >= 32:
-        v1 = (PRIME64_1 + PRIME64_2) & MASK64
-        v2 = PRIME64_2
+        v1 = (XXH_PRIME64_1 + XXH_PRIME64_2) & MASK64
+        v2 = XXH_PRIME64_2
         v3 = 0
-        v4 = (-PRIME64_1) & MASK64
+        v4 = (-XXH_PRIME64_1) & MASK64
         limit = length - 32
         while index <= limit:
-            v1 = round_acc(v1, int.from_bytes(data[index : index + 8], "little"))
+            v1 = xxh64_round(v1, read_u64(data, index))
             index += 8
-            v2 = round_acc(v2, int.from_bytes(data[index : index + 8], "little"))
+            v2 = xxh64_round(v2, read_u64(data, index))
             index += 8
-            v3 = round_acc(v3, int.from_bytes(data[index : index + 8], "little"))
+            v3 = xxh64_round(v3, read_u64(data, index))
             index += 8
-            v4 = round_acc(v4, int.from_bytes(data[index : index + 8], "little"))
+            v4 = xxh64_round(v4, read_u64(data, index))
             index += 8
-        h64 = (
-            rol(v1, 1)
-            + rol(v2, 7)
-            + rol(v3, 12)
-            + rol(v4, 18)
+        acc = (
+            rotl64(v1, 1)
+            + rotl64(v2, 7)
+            + rotl64(v3, 12)
+            + rotl64(v4, 18)
         ) & MASK64
-        h64 = merge_round(h64, v1)
-        h64 = merge_round(h64, v2)
-        h64 = merge_round(h64, v3)
-        h64 = merge_round(h64, v4)
+        acc = xxh64_merge(acc, v1)
+        acc = xxh64_merge(acc, v2)
+        acc = xxh64_merge(acc, v3)
+        acc = xxh64_merge(acc, v4)
     else:
-        h64 = PRIME64_5
-    h64 = (h64 + length) & MASK64
+        acc = XXH_PRIME64_5
+
+    acc = (acc + length) & MASK64
     while index + 8 <= length:
-        lane = int.from_bytes(data[index : index + 8], "little")
-        h64 ^= round_acc(0, lane)
-        h64 = (rol(h64, 27) * PRIME64_1 + PRIME64_4) & MASK64
+        lane = xxh64_round(0, read_u64(data, index))
+        acc ^= lane
+        acc = (rotl64(acc, 27) * XXH_PRIME64_1 + XXH_PRIME64_4) & MASK64
         index += 8
     if index + 4 <= length:
-        lane4 = int.from_bytes(data[index : index + 4], "little")
-        h64 ^= (lane4 * PRIME64_1) & MASK64
-        h64 = (rol(h64, 23) * PRIME64_2 + PRIME64_3) & MASK64
+        acc ^= (read_u32(data, index) * XXH_PRIME64_1) & MASK64
+        acc = (rotl64(acc, 23) * XXH_PRIME64_2 + XXH_PRIME64_3) & MASK64
         index += 4
     while index < length:
-        h64 ^= (data[index] * PRIME64_5) & MASK64
-        h64 = (rol(h64, 11) * PRIME64_1) & MASK64
+        acc ^= (data[index] * XXH_PRIME64_5) & MASK64
+        acc = (rotl64(acc, 11) * XXH_PRIME64_1) & MASK64
         index += 1
-    h64 ^= h64 >> 33
-    h64 = (h64 * PRIME64_2) & MASK64
-    h64 ^= h64 >> 29
-    h64 = (h64 * PRIME64_3) & MASK64
-    h64 ^= h64 >> 32
-    return h64 & MASK64
+
+    acc ^= acc >> 33
+    acc = (acc * XXH_PRIME64_2) & MASK64
+    acc ^= acc >> 29
+    acc = (acc * XXH_PRIME64_3) & MASK64
+    acc ^= acc >> 32
+    return acc & MASK64
 
 
 def base62_11(value: int) -> str:
-    chars = []
+    chars: list[str] = []
     for _ in range(11):
-        value, digit = divmod(value, 62)
-        chars.append(BASE62[digit])
+        value, rem = divmod(value, 62)
+        chars.append(BASE62[rem])
     return "".join(reversed(chars))
 
 
@@ -117,31 +214,17 @@ def path_id(relpath: str) -> str:
 
 
 def parent_id(relpath: str) -> str:
-    if "/" not in relpath:
+    parent = str(Path(relpath).parent).replace("\\", "/")
+    if parent in ("", "."):
         return path_id("/")
-    return path_id(relpath.rsplit("/", 1)[0])
+    return path_id(parent)
 
 
-def ts(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime(
-        "%Y-%m-%d_%H-%M-%S_%fZ"
-    )
-
-
-def touch_file(path: Path, text: str, epoch: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
-    os.utime(path, (epoch, epoch))
-
-
-def touch_dir(path: Path, epoch: int) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    os.utime(path, (epoch, epoch))
-
-
-def make_snapshot(peer: Path, rows: list[dict[str, object]]) -> None:
-    db_path = peer / ".kitchensync" / "snapshot.db"
+def create_snapshot(root: Path, rows: list[tuple[str, int, str, str | None, str | None]]) -> None:
+    db_path = root / ".kitchensync" / "snapshot.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute(
@@ -157,8 +240,12 @@ def make_snapshot(peer: Path, rows: list[dict[str, object]]) -> None:
             )
             """
         )
-        for row in rows:
-            relpath = str(row["path"])
+        conn.execute("CREATE INDEX idx_snapshot_parent_id ON snapshot(parent_id)")
+        conn.execute("CREATE INDEX idx_snapshot_last_seen ON snapshot(last_seen)")
+        conn.execute("CREATE INDEX idx_snapshot_deleted_time ON snapshot(deleted_time)")
+        for relpath, byte_size, mod_time, last_seen, deleted_time in rows:
+            normalized = relpath.replace("\\", "/")
+            basename = normalized.rsplit("/", 1)[-1]
             conn.execute(
                 """
                 INSERT INTO snapshot
@@ -166,357 +253,304 @@ def make_snapshot(peer: Path, rows: list[dict[str, object]]) -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    path_id(relpath),
-                    parent_id(relpath),
-                    relpath.rsplit("/", 1)[-1],
-                    row["mod_time"],
-                    row["byte_size"],
-                    row.get("last_seen"),
-                    row.get("deleted_time"),
+                    path_id(normalized),
+                    parent_id(normalized),
+                    basename,
+                    mod_time,
+                    byte_size,
+                    last_seen,
+                    deleted_time,
                 ),
             )
-        conn.commit()
 
 
-def run_sync(*peers: str, extra_args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
-    args = [str(KITCHENSYNC_EXE)]
-    if extra_args:
-        args.extend(extra_args)
-    args.extend(peers)
-    return subprocess.run(
-        args,
-        cwd=str(WORKSPACE_ROOT),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=45,
-        check=False,
-    )
+def seed_snapshot_from_live(root: Path, deleted: dict[str, str | None] | None = None) -> None:
+    rows: list[tuple[str, int, str, str | None, str | None]] = []
+    deleted = deleted or {}
+    for path in sorted(root.rglob("*")):
+        if ".kitchensync" in path.parts:
+            continue
+        relpath = path.relative_to(root).as_posix()
+        if path.is_dir():
+            rows.append((relpath, -1, timestamp_for_epoch(EPOCH_OLD), TS_OLD, deleted.get(relpath)))
+        elif path.is_file():
+            size = path.stat().st_size
+            rows.append((relpath, size, timestamp_for_epoch(int(path.stat().st_mtime)), TS_OLD, deleted.get(relpath)))
+    for relpath, deleted_time in deleted.items():
+        if not (root / relpath).exists() and not any(row[0] == relpath for row in rows):
+            rows.append((relpath, -1, TS_OLD, TS_OLD, deleted_time))
+    create_snapshot(root, rows)
 
 
-def assert_run_ok(result: subprocess.CompletedProcess[str], label: str) -> None:
-    assert result.returncode == 0, (
-        f"{label}: expected exit 0, got {result.returncode}\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-    assert result.stderr == "", f"{label}: expected empty stderr, got {result.stderr!r}"
+def assert_no_entry(failures: FailureCollector, root: Path, relpath: str, message: str) -> None:
+    failures.check(not (root / relpath).exists(), message)
 
 
-def bak_matches(peer: Path, relative_parts: tuple[str, ...]) -> list[Path]:
-    root = peer / ".kitchensync" / "BAK"
-    if not root.exists():
-        return []
-    matches = []
-    for timestamp_dir in root.iterdir():
-        candidate = timestamp_dir.joinpath(*relative_parts)
-        if candidate.exists():
-            matches.append(candidate)
-    return matches
+def check_canon_directory_and_type_rules(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_canon_") as raw:
+        tmp = Path(raw)
+        canon = peer(tmp, "canon")
+        other = peer(tmp, "other")
+        subordinate = peer(tmp, "subordinate")
+
+        make_dir(canon / "SharedDir", EPOCH_NEW)
+        write_text(canon / "SharedDir" / "CanonOnly.txt", "from canon\n", EPOCH_NEW)
+        write_text(canon / "FileWins", "canon file\n", EPOCH_NEW)
+        make_dir(other / "FileWins", EPOCH_OLD)
+        write_text(other / "FileWins" / "old.txt", "old directory\n", EPOCH_OLD)
+        make_dir(canon / "DirWins", EPOCH_NEW)
+        write_text(canon / "DirWins" / "inside.txt", "inside\n", EPOCH_NEW)
+        write_text(other / "DirWins", "old file\n", EPOCH_OLD)
+        write_text(other / "CanonMissing", "remove me\n", EPOCH_OLD)
+        write_text(subordinate / "CanonMissing", "remove me too\n", EPOCH_OLD)
+        write_text(canon / "MiXeDCase.TXT", "case kept\n", EPOCH_NEWER)
+
+        run_sync(failures, f"+{canon}", str(other), f"-{subordinate}")
+
+        for target in (other, subordinate):
+            failures.check((target / "SharedDir").is_dir(), "014.2 canon live directory should exist on every active peer")
+            failures.equal(read_text(target / "SharedDir" / "CanonOnly.txt"), "from canon\n", "014.18 canon-created directory should be recursed into")
+            assert_no_entry(failures, target, "CanonMissing", "014.3 and 014.28 canon missing path should be absent on active peers")
+            failures.equal(read_text(target / "FileWins"), "canon file\n", "014.25 and 014.26 canon file should replace peer directory")
+            failures.check((target / "DirWins").is_dir(), "014.27 canon directory should replace peer file")
+            failures.equal(read_text(target / "DirWins" / "inside.txt"), "inside\n", "014.27 canon directory contents should sync")
+            failures.check((target / "MiXeDCase.TXT").is_file(), "014.36 synced filename should preserve source case")
+            failures.check(not (target / "mixedcase.txt").exists(), "014.36 sync should not invent a different filename case")
+
+        failures.check(bak_entries(other, "FileWins"), "014.25 canon file should displace losing directory to BAK")
+        failures.check(bak_entries(other, "DirWins"), "014.27 canon directory should displace losing file to BAK")
+        failures.check(bak_entries(other, "CanonMissing"), "014.28 missing canon path should displace active peer path to BAK")
 
 
-def case_canon_directory_creation_and_deletion(base: Path) -> None:
-    p1 = base / "canon"
-    p2 = base / "receiver"
-    touch_file(p1 / "Shared" / "note.txt", "canon\n", 1_735_000_000)
-    result = run_sync("+" + str(p1), str(p2))
-    assert_run_ok(result, "014.2 canon live directory")
-    assert (p2 / "Shared").is_dir(), "014.2: canon live directory was not created"
-    assert (p2 / "Shared" / "note.txt").read_text(encoding="utf-8") == "canon\n"
+def check_all_live_directory_votes_and_subordinate_cleanup(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_live_votes_") as raw:
+        tmp = Path(raw)
+        a = peer(tmp, "a")
+        b = peer(tmp, "b")
+        sub = peer(tmp, "sub")
 
-    shutil.rmtree(p1 / "Shared")
-    result = run_sync("+" + str(p1), str(p2))
-    assert_run_ok(result, "014.3 canon missing directory")
-    assert not (p2 / "Shared").exists(), "014.3: canon-missing path still exists"
+        make_dir(a / "Everywhere", EPOCH_OLD)
+        write_text(a / "Everywhere" / "a.txt", "a\n", EPOCH_OLD)
+        make_dir(b / "Everywhere", EPOCH_NEWER)
+        os.utime(b / "Everywhere", (EPOCH_NEWER, EPOCH_NEWER))
+        make_dir(sub / "OnlySub", EPOCH_OLD)
+        write_text(sub / "OnlySub" / "sub.txt", "sub\n", EPOCH_OLD)
+        seed_snapshot_from_live(a)
+        seed_snapshot_from_live(b)
+        seed_snapshot_from_live(sub)
 
+        run_sync(failures, str(a), str(b), f"-{sub}")
 
-def case_all_live_directory_votes_create_missing(base: Path) -> None:
-    p1 = base / "p1"
-    p2 = base / "p2"
-    p3 = base / "p3"
-    touch_dir(p1 / "empty", 1_735_000_100)
-    touch_dir(p2 / "empty", 1_735_000_200)
-    make_snapshot(
-        p1,
-        [{"path": "empty", "mod_time": ts(1_735_000_100), "byte_size": -1, "last_seen": ts(1_735_000_100)}],
-    )
-    make_snapshot(
-        p2,
-        [{"path": "empty", "mod_time": ts(1_735_000_199), "byte_size": -1, "last_seen": ts(1_735_000_100)}],
-    )
-    make_snapshot(p3, [])
-    result = run_sync(str(p1), str(p2), str(p3))
-    assert_run_ok(result, "014.4 live directory votes")
-    assert (p3 / "empty").is_dir(), "014.4: live directory was not created on peer with no row"
+        failures.check((a / "Everywhere").is_dir(), "014.1 directory mtime differences should not delete a live directory")
+        failures.check((b / "Everywhere").is_dir(), "014.4 directory live on all contributing voters should survive")
+        failures.check((sub / "Everywhere").is_dir(), "014.4 surviving directory should be created on subordinate peer")
+        failures.equal(read_text(b / "Everywhere" / "a.txt"), "a\n", "014.18 surviving directory should recurse into child files")
+        assert_no_entry(failures, sub, "OnlySub", "014.23 subordinate-only directory should be displaced")
+        failures.check(bak_entries(sub, "OnlySub"), "014.23 subordinate-only directory should move to BAK")
 
 
-def case_empty_directory_deletion_ignores_directory_mtime(base: Path) -> None:
-    live = base / "live"
-    absent = base / "absent"
-    target = base / "target"
-    touch_dir(live / "empty", 1_735_001_000)
-    make_snapshot(
-        live,
-        [{"path": "empty", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_000)}],
-    )
-    make_snapshot(
-        absent,
-        [{
-            "path": "empty",
-            "mod_time": ts(1_735_000_000),
-            "byte_size": -1,
-            "last_seen": ts(1_735_000_200),
-            "deleted_time": ts(1_735_000_200),
-        }],
-    )
-    make_snapshot(target, [])
-    result = run_sync(str(live), str(absent), str(target))
-    assert_run_ok(result, "014.1 empty directory deletion")
-    assert not (live / "empty").exists(), "014.1/014.14: empty live directory survived by directory mtime"
-    assert not (target / "empty").exists(), "014.15: deletion winner recreated a missing directory"
-    assert bak_matches(live, ("empty",)), "014.13: displaced directory was not moved to BAK"
+def check_live_directory_votes_despite_snapshot_and_no_row_abstention(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_snapshot_votes_") as raw:
+        tmp = Path(raw)
+        live = peer(tmp, "live")
+        no_row = peer(tmp, "no_row")
+        target = peer(tmp, "target")
+
+        make_dir(live / "RowDiffers", EPOCH_NEW)
+        write_text(live / "RowDiffers" / "fresh.txt", "fresh\n", EPOCH_NEW)
+        create_snapshot(live, [("RowDiffers", -1, TS_OLD, TS_OLD, TS_OLD)])
+        create_snapshot(no_row, [("unrelated.txt", 1, TS_OLD, TS_OLD, None)])
+        create_snapshot(target, [("unrelated.txt", 1, TS_OLD, TS_OLD, None)])
+
+        run_sync(failures, str(live), str(no_row), str(target))
+
+        failures.check((no_row / "RowDiffers").is_dir(), "014.5 live directory should vote for existence even when snapshot row differs")
+        failures.check((target / "RowDiffers").is_dir(), "014.6 no-row absent peer should not vote against live directory")
+        failures.equal(read_text(target / "RowDiffers" / "fresh.txt"), "fresh\n", "014.18 live directory survival should recurse")
 
 
-def case_directory_deletion_uses_last_seen_when_deleted_time_absent(base: Path) -> None:
-    live = base / "live"
-    absent = base / "absent"
-    touch_dir(live / "gone")
-    make_snapshot(
-        live,
-        [{"path": "gone", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_000)}],
-    )
-    make_snapshot(
-        absent,
-        [{"path": "gone", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_400)}],
-    )
-    result = run_sync(str(live), str(absent))
-    assert_run_ok(result, "014.8 directory deletion last_seen")
-    assert not (live / "gone").exists(), "014.8: absent row with no deleted_time did not delete empty directory"
+def check_directory_deletion_wins_with_deleted_time_and_whole_displacement(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_delete_deleted_time_") as raw:
+        tmp = Path(raw)
+        live = peer(tmp, "live")
+        absent_deleted = peer(tmp, "absent_deleted")
+        absent_old = peer(tmp, "absent_old")
+        target = peer(tmp, "target")
+
+        make_dir(live / "DeletedWins", EPOCH_OLD)
+        write_text(live / "DeletedWins" / "old.txt", "old\n", EPOCH_OLD)
+        make_dir(target / "DeletedWins", EPOCH_OLD)
+        write_text(target / "DeletedWins" / "target.txt", "target\n", EPOCH_OLD)
+        create_snapshot(live, [("DeletedWins", -1, TS_OLD, TS_OLD, None), ("DeletedWins/old.txt", 4, TS_OLD, TS_OLD, None)])
+        create_snapshot(target, [("DeletedWins", -1, TS_OLD, TS_OLD, None), ("DeletedWins/target.txt", 7, TS_OLD, TS_OLD, None)])
+        create_snapshot(absent_deleted, [("DeletedWins", -1, TS_OLD, TS_OLD, TS_NEWER)])
+        create_snapshot(absent_old, [("DeletedWins", -1, TS_OLD, TS_OLD, TS_MID)])
+
+        run_sync(failures, str(live), str(absent_deleted), str(absent_old), str(target))
+
+        for root in (live, target):
+            assert_no_entry(failures, root, "DeletedWins", "014.7, 014.12, and 014.13 newest deleted_time should delete live directory")
+            failures.check(bak_entries(root, "DeletedWins"), "014.24 directory displacement should move the whole directory to BAK")
+        assert_no_entry(failures, absent_deleted, "DeletedWins", "014.15 deletion winner should not recreate missing peer directory")
+        assert_no_entry(failures, absent_old, "DeletedWins", "014.15 deletion winner should not recreate any absent peer directory")
 
 
-def case_directory_survives_and_recurses(base: Path) -> None:
-    live = base / "live"
-    absent = base / "absent"
-    touch_file(live / "dir" / "old.txt", "old\n", 1_735_000_100)
-    touch_file(live / "dir" / "new.txt", "new\n", 1_735_000_300)
-    touch_dir(live / "dir" / "subdir", 1_735_000_400)
-    make_snapshot(
-        live,
-        [
-            {"path": "dir", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_000)},
-            {"path": "dir/old.txt", "mod_time": ts(1_735_000_100), "byte_size": 4, "last_seen": ts(1_735_000_100)},
-            {"path": "dir/new.txt", "mod_time": ts(1_735_000_200), "byte_size": 4, "last_seen": ts(1_735_000_200)},
-            {"path": "dir/subdir", "mod_time": ts(1_735_000_400), "byte_size": -1, "last_seen": ts(1_735_000_400)},
-        ],
-    )
-    make_snapshot(
-        absent,
-        [
-            {
-                "path": "dir",
-                "mod_time": ts(1_735_000_000),
-                "byte_size": -1,
-                "last_seen": ts(1_735_000_200),
-                "deleted_time": ts(1_735_000_200),
-            },
-            {
-                "path": "dir/old.txt",
-                "mod_time": ts(1_735_000_100),
-                "byte_size": 4,
-                "last_seen": ts(1_735_000_200),
-                "deleted_time": ts(1_735_000_200),
-            },
-        ],
-    )
-    result = run_sync(str(live), str(absent))
-    assert_run_ok(result, "014.17 surviving directory")
-    assert (absent / "dir").is_dir(), "014.17: directory with newer file evidence did not survive"
-    assert (absent / "dir" / "new.txt").read_text(encoding="utf-8") == "new\n", (
-        "014.18/014.19: sync did not recurse and propagate newer child file"
-    )
-    assert not (live / "dir" / "old.txt").exists(), "014.20: older child file was not removed during recursion"
-    assert (live / "dir" / "subdir").is_dir(), (
-        "014.10: child directory mtime appears to have been treated as file survival evidence"
-    )
+def check_directory_deletion_wins_with_last_seen_and_no_files(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_delete_last_seen_") as raw:
+        tmp = Path(raw)
+        live_empty = peer(tmp, "live_empty")
+        absent = peer(tmp, "absent")
+        target = peer(tmp, "target")
+
+        make_dir(live_empty / "EmptyTree" / "child", EPOCH_NEWER)
+        make_dir(target / "EmptyTree", EPOCH_NEWER)
+        create_snapshot(live_empty, [("EmptyTree", -1, TS_OLD, TS_OLD, None), ("EmptyTree/child", -1, TS_OLD, TS_OLD, None)])
+        create_snapshot(target, [("EmptyTree", -1, TS_OLD, TS_OLD, None)])
+        create_snapshot(absent, [("EmptyTree", -1, TS_OLD, TS_NEW, None)])
+
+        run_sync(failures, str(live_empty), str(absent), str(target))
+
+        assert_no_entry(failures, live_empty, "EmptyTree", "014.8 and 014.14 last_seen deletion should win when live subtree has no files")
+        assert_no_entry(failures, target, "EmptyTree", "014.11 directories under live tree should not provide survival evidence")
+        failures.check(bak_entries(live_empty, "EmptyTree"), "014.10 and 014.11 empty live directory tree should be displaced")
 
 
-def case_newest_directory_deletion_displaces_whole_subtree(base: Path) -> None:
-    live = base / "live"
-    old_delete = base / "old_delete"
-    new_delete = base / "new_delete"
-    touch_file(live / "tree" / "nested" / "file.txt", "keep?\n", 1_735_000_300)
-    make_snapshot(
-        live,
-        [
-            {"path": "tree", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_000)},
-            {"path": "tree/nested", "mod_time": ts(1_735_000_000), "byte_size": -1, "last_seen": ts(1_735_000_000)},
-            {"path": "tree/nested/file.txt", "mod_time": ts(1_735_000_300), "byte_size": 6, "last_seen": ts(1_735_000_300)},
-        ],
-    )
-    delete_rows = [
-        {
-            "path": "tree",
-            "mod_time": ts(1_735_000_000),
-            "byte_size": -1,
-            "last_seen": ts(1_735_000_000),
-            "deleted_time": ts(1_735_000_100),
-        }
-    ]
-    make_snapshot(old_delete, delete_rows)
-    make_snapshot(
-        new_delete,
-        [{
-            "path": "tree",
-            "mod_time": ts(1_735_000_000),
-            "byte_size": -1,
-            "last_seen": ts(1_735_000_000),
-            "deleted_time": ts(1_735_000_400),
-        }],
-    )
-    result = run_sync(str(live), str(old_delete), str(new_delete))
-    assert_run_ok(result, "014.12 newest directory deletion")
-    assert not (live / "tree").exists(), "014.12/014.13: newest deletion estimate did not win"
-    assert bak_matches(live, ("tree", "nested", "file.txt")), (
-        "014.24: directory was not displaced as one subtree before child visits"
-    )
+def check_directory_survives_and_recurses_by_child_file_rules(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_survival_") as raw:
+        tmp = Path(raw)
+        live = peer(tmp, "live")
+        absent = peer(tmp, "absent")
+        target = peer(tmp, "target")
+
+        make_dir(live / "Survives", EPOCH_OLD)
+        write_text(live / "Survives" / "new.txt", "new\n", EPOCH_NEWER)
+        write_text(live / "Survives" / "old.txt", "old\n", EPOCH_OLD)
+        create_snapshot(live, [
+            ("Survives", -1, TS_OLD, TS_OLD, None),
+            ("Survives/new.txt", 4, TS_NEWER, TS_OLD, None),
+            ("Survives/old.txt", 4, TS_OLD, TS_OLD, None),
+        ])
+        create_snapshot(absent, [
+            ("Survives", -1, TS_OLD, TS_NEW, None),
+            ("Survives/new.txt", 4, TS_OLD, TS_NEW, None),
+            ("Survives/old.txt", 4, TS_OLD, TS_NEW, None),
+        ])
+        create_snapshot(target, [("seed.txt", 5, TS_OLD, TS_OLD, None)])
+
+        run_sync(failures, str(live), str(absent), str(target))
+
+        for root in (live, absent, target):
+            failures.check((root / "Survives").is_dir(), "014.17 directory should survive when file evidence is within tolerance/newer")
+            failures.equal(read_text(root / "Survives" / "new.txt"), "new\n", "014.19 newer child content should propagate when directory survives")
+            assert_no_entry(failures, root, "Survives/old.txt", "014.20 older child content should be removed entry by entry")
+        failures.check(bak_entries(live, "old.txt"), "014.20 older child file should be displaced, not whole directory")
 
 
-def case_absent_snapshot_rows_delete_subordinate_directory(base: Path) -> None:
-    p1 = base / "p1"
-    p2 = base / "p2"
-    sub = base / "sub"
-    touch_dir(sub / "orphan")
-    make_snapshot(
-        p1,
-        [{
-            "path": "orphan",
-            "mod_time": ts(1_735_000_000),
-            "byte_size": -1,
-            "last_seen": ts(1_735_000_000),
-            "deleted_time": ts(1_735_000_000),
-        }],
-    )
-    make_snapshot(p2, [])
-    make_snapshot(sub, [])
-    result = run_sync(str(p1), str(p2), "-" + str(sub))
-    assert_run_ok(result, "014.22 absent snapshot rows")
-    assert not (sub / "orphan").exists(), "014.22: subordinate directory survived absent snapshot decision"
+def check_all_snapshot_absent_directory_displacement(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_all_absent_") as raw:
+        tmp = Path(raw)
+        a = peer(tmp, "a")
+        b = peer(tmp, "b")
+        sub = peer(tmp, "sub")
 
-    p3 = base / "p3"
-    p4 = base / "p4"
-    sub2 = base / "sub2"
-    touch_dir(sub2 / "never")
-    make_snapshot(p3, [])
-    make_snapshot(p4, [])
-    make_snapshot(sub2, [])
-    result = run_sync(str(p3), str(p4), "-" + str(sub2))
-    assert_run_ok(result, "014.23 no contributing live or snapshot row")
-    assert not (sub2 / "never").exists(), "014.23: subordinate no-opinion directory was not displaced"
+        make_dir(sub / "GoneEverywhere", EPOCH_OLD)
+        write_text(sub / "GoneEverywhere" / "sub.txt", "sub\n", EPOCH_OLD)
+        create_snapshot(a, [("GoneEverywhere", -1, TS_OLD, TS_OLD, TS_NEW)])
+        create_snapshot(b, [("GoneEverywhere", -1, TS_OLD, TS_MID, None)])
+        create_snapshot(sub, [("GoneEverywhere", -1, TS_OLD, TS_OLD, None), ("GoneEverywhere/sub.txt", 4, TS_OLD, TS_OLD, None)])
+
+        run_sync(failures, str(a), str(b), f"-{sub}")
+
+        assert_no_entry(failures, sub, "GoneEverywhere", "014.22 absent snapshot-only directory should displace active peer copy")
+        failures.check(bak_entries(sub, "GoneEverywhere"), "014.22 displaced snapshot-only directory should be recoverable in BAK")
 
 
-def case_canon_type_conflicts(base: Path) -> None:
-    p1 = base / "canon_file"
-    p2 = base / "dir_loser"
-    touch_file(p1 / "item", "file wins\n", 1_735_000_500)
-    touch_file(p2 / "item" / "nested.txt", "directory loses\n", 1_735_000_400)
-    result = run_sync("+" + str(p1), str(p2))
-    assert_run_ok(result, "014.25 canon file type conflict")
-    assert (p2 / "item").is_file(), "014.25: canon file did not replace directory"
-    assert (p2 / "item").read_text(encoding="utf-8") == "file wins\n"
+def check_type_conflict_without_canon_and_subordinate_rules(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_type_conflict_") as raw:
+        tmp = Path(raw)
+        file_old = peer(tmp, "file_old")
+        file_new = peer(tmp, "file_new")
+        directory = peer(tmp, "directory")
+        sub_file = peer(tmp, "sub_file")
+        sub_dir = peer(tmp, "sub_dir")
 
-    p3 = base / "canon_dir"
-    p4 = base / "file_loser"
-    touch_file(p3 / "item" / "inside.txt", "directory wins\n", 1_735_000_600)
-    touch_file(p4 / "item", "file loses\n", 1_735_000_700)
-    result = run_sync("+" + str(p3), str(p4))
-    assert_run_ok(result, "014.26 canon directory type conflict")
-    assert (p4 / "item").is_dir(), "014.26: canon directory did not replace file"
-    assert (p4 / "item" / "inside.txt").read_text(encoding="utf-8") == "directory wins\n"
+        write_text(file_old / "Conflict", "old file\n", EPOCH_OLD)
+        write_text(file_new / "Conflict", "new file\n", EPOCH_NEWER)
+        make_dir(directory / "Conflict", EPOCH_MID)
+        write_text(directory / "Conflict" / "inside.txt", "directory loses\n", EPOCH_MID)
+        write_text(sub_file / "OnlySubFile", "subordinate should not make file win\n", EPOCH_NEWER)
+        make_dir(directory / "OnlySubFile", EPOCH_OLD)
+        write_text(directory / "OnlySubFile" / "dir.txt", "contributing directory\n", EPOCH_OLD)
+        make_dir(sub_dir / "Conflict", EPOCH_OLD)
+        write_text(sub_dir / "Conflict" / "sub.txt", "sub loses\n", EPOCH_OLD)
 
-    p5 = base / "canon_missing"
-    p6 = base / "path_present"
-    p5.mkdir(parents=True, exist_ok=True)
-    touch_file(p6 / "gone" / "nested.txt", "remove\n", 1_735_000_800)
-    result = run_sync("+" + str(p5), str(p6))
-    assert_run_ok(result, "014.27 canon missing type conflict")
-    assert not (p6 / "gone").exists(), "014.27: missing canon path did not displace active path"
+        seed_snapshot_from_live(file_old)
+        seed_snapshot_from_live(file_new)
+        seed_snapshot_from_live(directory)
+        seed_snapshot_from_live(sub_file)
+        seed_snapshot_from_live(sub_dir)
 
+        run_sync(failures, str(file_old), str(file_new), str(directory), f"-{sub_file}", f"-{sub_dir}")
 
-def case_bidirectional_type_conflicts(base: Path) -> None:
-    file_peer = base / "file_peer"
-    dir_peer = base / "dir_peer"
-    sub = base / "subordinate"
-    touch_file(file_peer / "same", "contributing file\n", 1_735_001_000)
-    touch_file(dir_peer / "same" / "inside.txt", "contributing directory\n", 1_735_001_100)
-    touch_file(sub / "same" / "inside.txt", "subordinate directory\n", 1_735_001_200)
-    make_snapshot(file_peer, [{"path": "same", "mod_time": ts(1_735_001_000), "byte_size": 18, "last_seen": ts(1_735_001_000)}])
-    make_snapshot(dir_peer, [{"path": "same", "mod_time": ts(1_735_001_100), "byte_size": -1, "last_seen": ts(1_735_001_100)}])
-    make_snapshot(sub, [])
-    result = run_sync(str(file_peer), str(dir_peer), "-" + str(sub))
-    assert_run_ok(result, "014.28 contributing file beats directory")
-    assert (dir_peer / "same").is_file(), "014.28: contributing file did not beat contributing directory"
-    assert (sub / "same").is_file(), "014.31: subordinate losing type was not replaced"
-    assert (dir_peer / "same").read_text(encoding="utf-8") == "contributing file\n"
-
-    dir_only = base / "dir_only"
-    no_opinion = base / "no_opinion"
-    sub_file = base / "sub_file"
-    touch_file(dir_only / "path" / "inside.txt", "directory outcome\n", 1_735_001_300)
-    touch_file(sub_file / "path", "subordinate file must not win\n", 1_735_001_400)
-    make_snapshot(dir_only, [{"path": "path", "mod_time": ts(1_735_001_300), "byte_size": -1, "last_seen": ts(1_735_001_300)}])
-    make_snapshot(no_opinion, [])
-    make_snapshot(sub_file, [])
-    result = run_sync(str(dir_only), str(no_opinion), "-" + str(sub_file))
-    assert_run_ok(result, "014.30 subordinate file ignored")
-    assert (sub_file / "path").is_dir(), "014.30: subordinate file made file type win over contributing directory"
-    assert (sub_file / "path" / "inside.txt").read_text(encoding="utf-8") == "directory outcome\n"
+        for root in (file_old, file_new, directory, sub_file, sub_dir):
+            failures.equal(read_text(root / "Conflict"), "new file\n", "014.29, 014.31, and 014.32 file winner should sync to all active peers")
+        failures.check(bak_entries(directory, "Conflict"), "014.30 losing contributing directory should be displaced to BAK")
+        failures.check(bak_entries(sub_dir, "Conflict"), "014.34 subordinate losing directory type should be displaced to BAK")
+        failures.check((directory / "OnlySubFile").is_dir(), "014.33 subordinate file should not beat contributing directory")
+        failures.check((sub_file / "OnlySubFile").is_dir(), "014.35 subordinate wrong type should be replaced with winning directory")
+        failures.check(bak_entries(sub_file, "OnlySubFile"), "014.34 subordinate losing file type should be displaced to BAK")
 
 
-def case_case_preservation(base: Path) -> None:
-    p1 = base / "source"
-    p2 = base / "dest"
-    touch_file(p1 / "CamelCase.TXT", "case\n", 1_735_002_000)
-    result = run_sync("+" + str(p1), str(p2))
-    assert_run_ok(result, "014.32 filename case")
-    names = {entry.name for entry in p2.iterdir() if entry.name != ".kitchensync"}
-    assert "CamelCase.TXT" in names, f"014.32: synced names did not preserve exact case: {sorted(names)}"
-    assert "camelcase.txt" not in names, "014.32: destination used a different filename case"
+def check_canon_directory_makes_subordinate_file_directory(failures: FailureCollector) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks014_canon_subordinate_") as raw:
+        tmp = Path(raw)
+        canon = peer(tmp, "canon")
+        normal = peer(tmp, "normal")
+        sub = peer(tmp, "sub")
+
+        make_dir(canon / "CanonDir", EPOCH_NEW)
+        write_text(canon / "CanonDir" / "content.txt", "content\n", EPOCH_NEW)
+        write_text(sub / "CanonDir", "wrong type\n", EPOCH_OLD)
+
+        run_sync(failures, f"+{canon}", str(normal), f"-{sub}")
+
+        failures.check((sub / "CanonDir").is_dir(), "014.35 subordinate path should be replaced with canon winning directory")
+        failures.equal(read_text(sub / "CanonDir" / "content.txt"), "content\n", "014.27 canon directory should sync after replacing subordinate file")
+        failures.check(bak_entries(sub, "CanonDir"), "014.34 subordinate losing file should be displaced to BAK")
 
 
 def main() -> int:
-    failures: list[str] = []
-    scenarios = [
-        case_canon_directory_creation_and_deletion,
-        case_all_live_directory_votes_create_missing,
-        case_empty_directory_deletion_ignores_directory_mtime,
-        case_directory_deletion_uses_last_seen_when_deleted_time_absent,
-        case_directory_survives_and_recurses,
-        case_newest_directory_deletion_displaces_whole_subtree,
-        case_absent_snapshot_rows_delete_subordinate_directory,
-        case_canon_type_conflicts,
-        case_bidirectional_type_conflicts,
-        case_case_preservation,
+    failures = FailureCollector()
+    failures.check(KITCHENSYNC.is_file(), f"released executable should exist at {KITCHENSYNC}")
+
+    checks = [
+        Check("canon directory/type/case rules", check_canon_directory_and_type_rules),
+        Check("all-live directory votes and subordinate cleanup", check_all_live_directory_votes_and_subordinate_cleanup),
+        Check("live vote despite snapshot and no-row abstention", check_live_directory_votes_despite_snapshot_and_no_row_abstention),
+        Check("directory deletion by deleted_time", check_directory_deletion_wins_with_deleted_time_and_whole_displacement),
+        Check("directory deletion by last_seen with no file evidence", check_directory_deletion_wins_with_last_seen_and_no_files),
+        Check("directory survival and child file rules", check_directory_survives_and_recurses_by_child_file_rules),
+        Check("snapshot-only absent directory displacement", check_all_snapshot_absent_directory_displacement),
+        Check("type conflict without canon", check_type_conflict_without_canon_and_subordinate_rules),
+        Check("canon directory replaces subordinate file", check_canon_directory_makes_subordinate_file_directory),
     ]
 
-    # not reasonably testable: 014.21 requires forcing repeatable listing
-    # failure for one subtree through the released local-file peer surface
-    # without relying on host-specific permissions.
+    for check in checks:
+        try:
+            check.func(failures)
+        except Exception as exc:
+            failures.failures.append(f"{check.name}: unexpected exception: {exc!r}")
 
-    with tempfile.TemporaryDirectory(prefix="kitchensync_014_") as temp_name:
-        base = Path(temp_name)
-        for scenario in scenarios:
-            scenario_base = base / scenario.__name__
-            scenario_base.mkdir(parents=True, exist_ok=True)
-            try:
-                scenario(scenario_base)
-            except Exception:
-                failures.append(f"{scenario.__name__} failed:\n{traceback.format_exc()}")
+    # not reasonably testable: 014.21 requires forcing repeated listing failure
+    # for a live subtree after startup without sabotaging the local filesystem or
+    # probing an SFTP helper protocol in this authoring job.
 
-    if failures:
-        print("\n\n".join(failures))
+    if failures.failures:
+        print("FAIL")
+        for index, failure in enumerate(failures.failures, start=1):
+            print(f"{index}. {failure}")
         return 1
-    print("test_014_directory_and_type_decisions: all checks passed")
+    print("PASS")
     return 0
 
 
