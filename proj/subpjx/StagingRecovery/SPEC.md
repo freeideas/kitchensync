@@ -27,11 +27,22 @@ child is treated as the encoded basename for one target entry in the same
 parent directory and is recovered before live entries from that parent are used
 for sync decisions.
 
+StagingRecovery also exposes an operation to recover the one user-data SWAP
+directory for a target `<parent>/<basename>` before another child starts
+replacement of that path. If recovery for that encoded basename does not
+succeed, the operation reports failure and the caller must not start the
+replacement.
+
 For a target `<parent>/<basename>` and SWAP directory
 `<parent>/.kitchensync/SWAP/<encoded-basename>/`, user-data recovery applies
 these cases:
 
-- If `old` and the target both exist, leave the target in place, move `old` to
+- If `old`, `new`, and the target all exist, leave the target in place, delete
+  `new`, move `old` to
+  `<parent>/.kitchensync/BAK/<timestamp>/<basename>`, and remove the empty SWAP
+  directory.
+- If `old` and the target both exist while `new` is missing, leave the target
+  in place, move `old` to
   `<parent>/.kitchensync/BAK/<timestamp>/<basename>`, and remove the empty SWAP
   directory.
 - If `old` and `new` both exist while the target is missing, rename `new` to
