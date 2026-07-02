@@ -200,6 +200,56 @@ fn lists_every_active_peer_before_awaiting_and_returns_sorted_live_entries() {
 }
 
 #[test]
+fn groups_peers_that_report_the_same_live_entry_name() {
+    let subject = live_directory_walk::new();
+    let starts = Arc::new(Mutex::new(Vec::new()));
+
+    let result = subject.list_directory(LiveDirectoryWalkDirectoryRequest {
+        relative_directory_path: "root".to_string(),
+        active_peers: vec![
+            static_peer(
+                "canon",
+                LiveDirectoryWalkPeerRole::Contributing,
+                true,
+                vec![file("shared")],
+                Arc::clone(&starts),
+                2,
+            ),
+            static_peer(
+                "contributor",
+                LiveDirectoryWalkPeerRole::Contributing,
+                false,
+                vec![file("shared")],
+                Arc::clone(&starts),
+                2,
+            ),
+        ],
+        list_total_tries: 1,
+    });
+
+    assert!(result.diagnostics.is_empty());
+    assert!(result.failed_subtrees.is_empty());
+    assert!(result.subtree_skips.is_empty());
+    assert_eq!(1, result.entry_facts.len());
+
+    let shared_entry = &result.entry_facts[0];
+    assert_eq!("root", shared_entry.relative_directory_path);
+    assert_eq!("shared", shared_entry.entry_name);
+
+    let mut peer_ids: Vec<String> = shared_entry
+        .peer_entries
+        .iter()
+        .map(|entry| entry.peer_id.clone())
+        .collect();
+    peer_ids.sort();
+    assert_eq!(vec!["canon".to_string(), "contributor".to_string()], peer_ids);
+    assert!(shared_entry
+        .peer_entries
+        .iter()
+        .all(|entry| entry.kind == file("shared").kind));
+}
+
+#[test]
 fn non_canon_listing_failure_is_retried_excluded_and_does_not_persist_to_later_runs() {
     let subject = live_directory_walk::new();
     let starts = Arc::new(Mutex::new(Vec::new()));
@@ -312,6 +362,79 @@ fn non_canon_listing_failure_is_retried_excluded_and_does_not_persist_to_later_r
     assert_eq!(vec!["canon-file", "offline-file"], later_entry_names);
     assert!(later_result.failed_subtrees.is_empty());
     assert!(later_result.subtree_skips.is_empty());
+}
+
+#[test]
+fn peer_that_succeeds_on_retry_remains_eligible_and_contributes_entries() {
+    let subject = live_directory_walk::new();
+    let starts = Arc::new(Mutex::new(Vec::new()));
+
+    let result = subject.list_directory(LiveDirectoryWalkDirectoryRequest {
+        relative_directory_path: "retry-branch".to_string(),
+        active_peers: vec![
+            scripted_peer(
+                "canon",
+                LiveDirectoryWalkPeerRole::Contributing,
+                true,
+                vec![Ok(vec![file("canon-file")])],
+                Arc::clone(&starts),
+            ),
+            scripted_peer(
+                "eventual",
+                LiveDirectoryWalkPeerRole::Contributing,
+                false,
+                vec![
+                    Err(listing_error("first listing failure")),
+                    Ok(vec![file("eventual-file")]),
+                ],
+                Arc::clone(&starts),
+            ),
+        ],
+        list_total_tries: 2,
+    });
+
+    let eventual_attempts: Vec<u32> = starts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.peer_id == "eventual")
+        .map(|request| request.attempt_number)
+        .collect();
+    assert_eq!(vec![1, 2], eventual_attempts);
+
+    assert!(result.diagnostics.is_empty());
+    assert!(result.failed_subtrees.is_empty());
+    assert!(result.subtree_skips.is_empty());
+
+    let entry_names: Vec<String> = result
+        .entry_facts
+        .iter()
+        .map(|entry| entry.entry_name.clone())
+        .collect();
+    assert_eq!(vec!["canon-file", "eventual-file"], entry_names);
+
+    let eventual_entry = result
+        .entry_facts
+        .iter()
+        .find(|entry| entry.entry_name == "eventual-file")
+        .expect("successful retry contributes live entries");
+    assert_eq!(
+        vec![LiveDirectoryPeerEntryFact {
+            peer_id: "eventual".to_string(),
+            kind: file("eventual-file").kind,
+        }],
+        eventual_entry.peer_entries
+    );
+    let eventual_eligibility = eventual_entry
+        .peer_eligibility
+        .iter()
+        .find(|eligibility| eligibility.peer_id == "eventual")
+        .expect("successful retry remains eligible");
+    assert!(eventual_eligibility.eligible);
+    assert_eq!(
+        LiveDirectoryPeerEligibilityReason::ListedDirectory,
+        eventual_eligibility.reason
+    );
 }
 
 #[test]
