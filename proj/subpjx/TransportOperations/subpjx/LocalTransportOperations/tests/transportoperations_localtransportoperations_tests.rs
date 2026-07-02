@@ -103,6 +103,14 @@ fn local_file_peer_streams_bytes_and_reports_directory_metadata() {
     assert_eq!(LocalTransportEntryType::Directory, entries[0].metadata.entry_type);
     assert_eq!(-1, entries[0].metadata.byte_size);
 
+    let entries = transport
+        .list_dir(&transport_root, "alpha/bravo")
+        .expect("list immediate file child");
+    assert_eq!(1, entries.len());
+    assert_eq!("file.txt", entries[0].child_name);
+    assert_eq!(LocalTransportEntryType::File, entries[0].metadata.entry_type);
+    assert_eq!(11, entries[0].metadata.byte_size);
+
     let read_handle = transport
         .open_read(&transport_root, "alpha/bravo/file.txt")
         .expect("open regular file for reading");
@@ -161,6 +169,34 @@ fn local_file_peer_mutates_entries_inside_the_connected_root() {
             .as_slice()
     );
 
+    let next_write_handle = transport
+        .open_write(&transport_root, "next-source.txt")
+        .expect("open second source file for writing");
+    transport
+        .write(next_write_handle, b"new content")
+        .expect("write second source content");
+    transport
+        .close_write(next_write_handle)
+        .expect("close second source writer");
+    assert!(
+        transport
+            .rename(&transport_root, "next-source.txt", "renamed.txt")
+            .is_err(),
+        "rename rejects an existing destination"
+    );
+    assert_eq!(
+        b"new content",
+        fs::read(root.path().join("next-source.txt"))
+            .expect("source remains when destination already exists")
+            .as_slice()
+    );
+    assert_eq!(
+        b"move me",
+        fs::read(root.path().join("renamed.txt"))
+            .expect("destination remains unchanged when rename is rejected")
+            .as_slice()
+    );
+
     let file_time = UNIX_EPOCH + Duration::from_secs(1_700_000_123);
     transport
         .set_mod_time(&transport_root, "renamed.txt", file_time)
@@ -187,6 +223,25 @@ fn local_file_peer_mutates_entries_inside_the_connected_root() {
             .expect("stat directory after setting modification time")
             .modification_time
     );
+
+    let child_write_handle = transport
+        .open_write(&transport_root, "empty/child/file.txt")
+        .expect("open file in directory");
+    transport
+        .write(child_write_handle, b"still here")
+        .expect("write file in directory");
+    transport
+        .close_write(child_write_handle)
+        .expect("close file in directory");
+    assert_eq!(
+        LocalTransportErrorCategory::IoError,
+        transport
+            .delete_dir(&transport_root, "empty/child")
+            .expect_err("non-empty directory is not deleted")
+    );
+    transport
+        .delete_file(&transport_root, "empty/child/file.txt")
+        .expect("delete child file before deleting directory");
 
     transport
         .delete_file(&transport_root, "renamed.txt")
@@ -227,18 +282,12 @@ fn local_file_peer_rejects_paths_that_escape_the_connected_root() {
     let transport_root = root.transport_root();
     let transport = subject();
 
-    assert_eq!(
-        LocalTransportErrorCategory::NotFound,
-        transport
-            .stat(&transport_root, &escaped_path)
-            .expect_err("parent path cannot be statted through local transport")
-    );
-    assert_eq!(
-        LocalTransportErrorCategory::NotFound,
-        transport
-            .open_write(&transport_root, &escaped_path)
-            .expect_err("parent path cannot be opened for writing")
-    );
+    transport
+        .stat(&transport_root, &escaped_path)
+        .expect_err("parent path cannot be statted through local transport");
+    transport
+        .open_write(&transport_root, &escaped_path)
+        .expect_err("parent path cannot be opened for writing");
     assert_eq!(
         b"outside",
         fs::read(&outside_file.path)
