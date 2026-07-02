@@ -9,328 +9,436 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-
 LITERAL_WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-LITERAL_RELEASED_EXE = LITERAL_WORKSPACE_ROOT / "released" / "kitchensync.exe"
-SCRIPT_WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = LITERAL_WORKSPACE_ROOT if LITERAL_WORKSPACE_ROOT.exists() else SCRIPT_WORKSPACE_ROOT
-RELEASED_EXE = LITERAL_RELEASED_EXE if LITERAL_RELEASED_EXE.exists() else WORKSPACE_ROOT / "released" / "kitchensync.exe"
+WORKSPACE_ROOT = (
+    LITERAL_WORKSPACE_ROOT
+    if LITERAL_WORKSPACE_ROOT.exists()
+    else Path(__file__).resolve().parents[1]
+)
+KITCHENSYNC_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
 
-TS_FORMAT = "%Y-%m-%d_%H-%M-%S_%fZ"
+TIMESTAMP_REPLACEMENT = "2024-01-02_03-04-05_000000Z"
+OLD_LAST_SEEN = "2024-01-03_00-00-00_000000Z"
+OLDER_LAST_SEEN = "2024-01-02_00-00-00_000000Z"
+OLD_TOMBSTONE = "2000-01-01_00-00-00_000000Z"
 
-# not reasonably testable: 015.8, 015.9, 015.10, 015.11, 015.12
-# The destination row state before a queued copy completes is local working
-# state and is not uploaded to a peer snapshot until the released process exits.
-# not reasonably testable: 015.14, 015.15
-# Observing a clean app exit before a queued copy finishes needs timing hooks or
-# forced interruption of the product, outside the specified happy-path surface.
-# not reasonably testable: 015.17, 015.19
-# Failed directory creation and failed displacement require sabotaging peer
-# filesystem operations, which the testing philosophy excludes.
-# not reasonably testable: 015.25
-# Cleanup not delaying sync decisions is a scheduling guarantee without a stable
-# end-to-end observation from process exit, stdout, stderr, or final peer files.
-
-
-def timestamp_text(year: int, month: int, day: int, hour: int = 0) -> str:
-    return datetime(year, month, day, hour, tzinfo=timezone.utc).strftime(TS_FORMAT)
+PRIME64_1 = 11400714785074694791
+PRIME64_2 = 14029467366897019727
+PRIME64_3 = 1609587929392839161
+PRIME64_4 = 9650029242287828579
+PRIME64_5 = 2870177450012600261
+MASK64 = (1 << 64) - 1
+BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
-def parse_timestamp(value: str) -> datetime:
-    return datetime.strptime(value, TS_FORMAT).replace(tzinfo=timezone.utc)
+def rol64(value, bits):
+    return ((value << bits) | (value >> (64 - bits))) & MASK64
 
 
-def set_file_time(path: Path, when: datetime) -> None:
+def round64(acc, lane):
+    acc = (acc + lane * PRIME64_2) & MASK64
+    acc = rol64(acc, 31)
+    return (acc * PRIME64_1) & MASK64
+
+
+def merge_round(acc, lane):
+    acc ^= round64(0, lane)
+    return (acc * PRIME64_1 + PRIME64_4) & MASK64
+
+
+def xxhash64(data):
+    data = data.encode("utf-8")
+    length = len(data)
+    offset = 0
+    if length >= 32:
+        v1 = (PRIME64_1 + PRIME64_2) & MASK64
+        v2 = PRIME64_2
+        v3 = 0
+        v4 = (-PRIME64_1) & MASK64
+        limit = length - 32
+        while offset <= limit:
+            v1 = round64(v1, int.from_bytes(data[offset : offset + 8], "little"))
+            offset += 8
+            v2 = round64(v2, int.from_bytes(data[offset : offset + 8], "little"))
+            offset += 8
+            v3 = round64(v3, int.from_bytes(data[offset : offset + 8], "little"))
+            offset += 8
+            v4 = round64(v4, int.from_bytes(data[offset : offset + 8], "little"))
+            offset += 8
+        acc = (
+            rol64(v1, 1) + rol64(v2, 7) + rol64(v3, 12) + rol64(v4, 18)
+        ) & MASK64
+        acc = merge_round(acc, v1)
+        acc = merge_round(acc, v2)
+        acc = merge_round(acc, v3)
+        acc = merge_round(acc, v4)
+    else:
+        acc = PRIME64_5
+    acc = (acc + length) & MASK64
+    while offset + 8 <= length:
+        lane = round64(0, int.from_bytes(data[offset : offset + 8], "little"))
+        acc ^= lane
+        acc = (rol64(acc, 27) * PRIME64_1 + PRIME64_4) & MASK64
+        offset += 8
+    if offset + 4 <= length:
+        acc ^= int.from_bytes(data[offset : offset + 4], "little") * PRIME64_1
+        acc = (rol64(acc, 23) * PRIME64_2 + PRIME64_3) & MASK64
+        offset += 4
+    while offset < length:
+        acc ^= data[offset] * PRIME64_5
+        acc = (rol64(acc, 11) * PRIME64_1) & MASK64
+        offset += 1
+    acc ^= acc >> 33
+    acc = (acc * PRIME64_2) & MASK64
+    acc ^= acc >> 29
+    acc = (acc * PRIME64_3) & MASK64
+    acc ^= acc >> 32
+    return acc & MASK64
+
+
+def base62_11(value):
+    chars = []
+    for _ in range(11):
+        value, rem = divmod(value, 62)
+        chars.append(BASE62[rem])
+    return "".join(reversed(chars))
+
+
+def path_id(relpath):
+    return base62_11(xxhash64(relpath))
+
+
+def parent_id(relpath):
+    parent = Path(relpath).parent.as_posix()
+    return path_id("/") if parent == "." else path_id(parent)
+
+
+def basename(relpath):
+    return Path(relpath).name
+
+
+def format_mtime(path):
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S_%fZ"
+    )
+
+
+def set_mtime(path, stamp):
+    when = datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S_%fZ").replace(
+        tzinfo=timezone.utc
+    )
     seconds = when.timestamp()
     os.utime(path, (seconds, seconds))
 
 
-def peer_snapshot(peer: Path) -> Path:
+def write_file(path, text, stamp):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    set_mtime(path, stamp)
+
+
+def snapshot_path(peer):
     return peer / ".kitchensync" / "snapshot.db"
 
 
-def connect_snapshot(peer: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(str(peer_snapshot(peer)))
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def rows_by_basename(peer: Path, basename: str) -> list[sqlite3.Row]:
-    with connect_snapshot(peer) as con:
-        return list(con.execute("SELECT * FROM snapshot WHERE basename = ?", (basename,)))
-
-
-def one_row(peer: Path, basename: str) -> sqlite3.Row | None:
-    rows = rows_by_basename(peer, basename)
-    if len(rows) != 1:
-        return None
-    return rows[0]
-
-
-def insert_snapshot_row(
-    peer: Path,
-    row_id: str,
-    parent_id: str,
-    basename: str,
-    mod_time: str,
-    byte_size: int,
-    last_seen: str | None,
-    deleted_time: str | None,
-) -> None:
-    with connect_snapshot(peer) as con:
-        con.execute(
+def create_snapshot(peer, rows):
+    db_path = snapshot_path(peer)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
             """
-            INSERT OR REPLACE INTO snapshot
-                (id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            CREATE TABLE snapshot (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                basename TEXT NOT NULL,
+                mod_time TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                last_seen TEXT,
+                deleted_time TEXT
+            )
+            """
+        )
+        db.execute("CREATE INDEX snapshot_parent_id ON snapshot(parent_id)")
+        db.execute("CREATE INDEX snapshot_last_seen ON snapshot(last_seen)")
+        db.execute("CREATE INDEX snapshot_deleted_time ON snapshot(deleted_time)")
+        for relpath, mod_time, byte_size, last_seen, deleted_time in rows:
+            db.execute(
+                """
+                INSERT INTO snapshot
+                    (id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    path_id(relpath),
+                    parent_id(relpath),
+                    basename(relpath),
+                    mod_time,
+                    byte_size,
+                    last_seen,
+                    deleted_time,
+                ),
+            )
+
+
+def read_row(peer, relpath):
+    with sqlite3.connect(snapshot_path(peer)) as db:
+        row = db.execute(
+            """
+            SELECT id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time
+            FROM snapshot
+            WHERE id = ?
             """,
-            (row_id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time),
-        )
-        con.commit()
-
-
-def run_kitchensync(args: list[str], failures: list[str], label: str, timeout: int = 45) -> subprocess.CompletedProcess[str] | None:
-    try:
-        result = subprocess.run(
-            [str(RELEASED_EXE), *args],
-            cwd=str(WORKSPACE_ROOT),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            shell=False,
-        )
-    except Exception as exc:
-        failures.append(f"{label}: failed to launch or wait for KitchenSync: {exc}")
+            (path_id(relpath),),
+        ).fetchone()
+    if row is None:
         return None
-
-    if result.returncode != 0:
-        failures.append(
-            f"{label}: expected exit 0, got {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
-        )
-    if result.stderr != "":
-        failures.append(f"{label}: expected empty stderr, got {result.stderr!r}")
-    return result
+    keys = ("id", "parent_id", "basename", "mod_time", "byte_size", "last_seen", "deleted_time")
+    return dict(zip(keys, row))
 
 
-def check(condition: bool, failures: list[str], message: str) -> None:
+def run_sync(args):
+    return subprocess.run(
+        [str(KITCHENSYNC_EXE), *[str(arg) for arg in args]],
+        cwd=str(WORKSPACE_ROOT),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=40,
+        check=False,
+    )
+
+
+def check(failures, condition, message):
     if not condition:
         failures.append(message)
 
 
-def assert_row_present(peer: Path, basename: str, failures: list[str], label: str) -> sqlite3.Row | None:
-    row = one_row(peer, basename)
-    if row is None:
-        failures.append(f"{label}: expected exactly one snapshot row for {basename!r} in {peer}")
-    return row
+def check_success(failures, result, label):
+    check(failures, result.returncode == 0, f"{label}: expected exit 0, got {result.returncode}; stdout={result.stdout!r}")
+    check(failures, result.stderr == "", f"{label}: stderr must be empty, got {result.stderr!r}")
+    check(failures, "sync complete" in result.stdout.splitlines(), f"{label}: missing sync complete line")
 
 
-def check_present_file_row(
-    peer: Path,
-    file_path: Path,
-    failures: list[str],
-    label: str,
-) -> sqlite3.Row | None:
-    row = assert_row_present(peer, file_path.name, failures, label)
-    if row is None:
-        return None
-    stat = file_path.stat()
-    row_mtime = parse_timestamp(row["mod_time"])
-    fs_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-    check(abs((row_mtime - fs_mtime).total_seconds()) <= 5, failures, f"{label}: mod_time does not match file mtime")
-    check(row["byte_size"] == stat.st_size, failures, f"{label}: byte_size does not match file size")
-    check(row["last_seen"] is not None, failures, f"{label}: last_seen should be set")
-    check(row["deleted_time"] is None, failures, f"{label}: deleted_time should be NULL")
-    return row
+def scenario_present_copy_and_directory(failures):
+    with tempfile.TemporaryDirectory(prefix="ks015_present_") as tmp:
+        root = Path(tmp)
+        peer_a = root / "a"
+        peer_b = root / "b"
+        peer_a.mkdir()
+        peer_b.mkdir()
+        write_file(peer_a / "alpha.txt", "alpha\n", TIMESTAMP_REPLACEMENT)
+        (peer_a / "emptydir").mkdir()
+        set_mtime(peer_a / "emptydir", TIMESTAMP_REPLACEMENT)
+
+        result = run_sync(["--verbosity", "error", f"+{peer_a}", peer_b])
+        check_success(failures, result, "present/copy/directory run")
+
+        check(failures, (peer_b / "alpha.txt").read_text(encoding="utf-8") == "alpha\n", "015.13: copied file content should exist on destination")
+        source_row = read_row(peer_a, "alpha.txt")
+        dest_row = read_row(peer_b, "alpha.txt")
+        dir_row = read_row(peer_b, "emptydir")
+        check(failures, source_row is not None, "015.1-015.4: source listing should create alpha.txt snapshot row")
+        if source_row:
+            check(failures, source_row["mod_time"] == format_mtime(peer_a / "alpha.txt"), "015.1: listed source row should record current mod_time")
+            check(failures, source_row["byte_size"] == 6, "015.2: listed source row should record current byte_size")
+            check(failures, source_row["last_seen"] is not None, "015.3: listed source row should record last_seen")
+            check(failures, source_row["deleted_time"] is None, "015.4: listed source row should clear deleted_time")
+        check(failures, dest_row is not None, "015.13: destination copy should create alpha.txt snapshot row")
+        if dest_row:
+            check(failures, dest_row["mod_time"] == format_mtime(peer_a / "alpha.txt"), "015.8: destination row should record winning mod_time after copy")
+            check(failures, dest_row["byte_size"] == 6, "015.9: destination row should record winning byte_size after copy")
+            check(failures, dest_row["deleted_time"] is None, "015.10: destination row should have deleted_time NULL after copy")
+            check(failures, dest_row["last_seen"] is not None, "015.13: completed copy should set destination last_seen")
+        check(failures, dir_row is not None, "015.16-015.19: created directory should have a snapshot row")
+        if dir_row:
+            check(failures, dir_row["mod_time"] == format_mtime(peer_b / "emptydir"), "015.16: created directory row should record current mod_time")
+            check(failures, dir_row["byte_size"] == -1, "015.17: created directory row should record byte_size -1")
+            check(failures, dir_row["last_seen"] is not None, "015.18: created directory row should record last_seen")
+            check(failures, dir_row["deleted_time"] is None, "015.19: created directory row should clear deleted_time")
 
 
-def scenario_listing_copy_and_directory_creation(root: Path, failures: list[str]) -> None:
-    peer_a = root / "present_a"
-    peer_b = root / "present_b"
-    peer_a.mkdir()
-    peer_b.mkdir()
+def scenario_absence_and_file_displacement(failures):
+    with tempfile.TemporaryDirectory(prefix="ks015_absence_") as tmp:
+        root = Path(tmp)
+        peer_a = root / "a"
+        peer_b = root / "b"
+        peer_a.mkdir()
+        peer_b.mkdir()
+        write_file(peer_b / "gone.txt", "gone\n", "2024-01-01_00-00-00_000000Z")
+        write_file(peer_b / "tomb.txt", "tomb\n", "2024-01-01_00-00-00_000000Z")
+        create_snapshot(
+            peer_a,
+            [
+                ("gone.txt", "2024-01-01_00-00-00_000000Z", 5, OLD_LAST_SEEN, None),
+                ("tomb.txt", "2024-01-01_00-00-00_000000Z", 5, OLDER_LAST_SEEN, OLD_LAST_SEEN),
+            ],
+        )
+        create_snapshot(
+            peer_b,
+            [
+                ("gone.txt", "2024-01-01_00-00-00_000000Z", 5, OLDER_LAST_SEEN, None),
+                ("tomb.txt", "2024-01-01_00-00-00_000000Z", 5, OLDER_LAST_SEEN, None),
+            ],
+        )
 
-    source_file = peer_a / "alpha.txt"
-    source_file.write_text("alpha contents\n", encoding="utf-8", newline="\n")
-    set_file_time(source_file, datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
-    (peer_a / "emptydir").mkdir()
+        result = run_sync(["--verbosity", "error", peer_a, peer_b])
+        check_success(failures, result, "absence/file displacement run")
 
-    run_kitchensync([f"+{peer_a}", str(peer_b)], failures, "present/copy/directory")
-
-    check((peer_b / "alpha.txt").read_text(encoding="utf-8") == "alpha contents\n", failures, "015.13: copied file content missing on destination")
-    check((peer_b / "emptydir").is_dir(), failures, "015.16: destination directory was not created")
-
-    check_present_file_row(peer_a, source_file, failures, "015.1-015.4 source listing")
-    check_present_file_row(peer_b, peer_b / "alpha.txt", failures, "015.13 completed copy")
-
-    dir_row = assert_row_present(peer_b, "emptydir", failures, "015.16 directory creation")
-    if dir_row is not None:
-        check(dir_row["byte_size"] == -1, failures, "015.16: directory snapshot byte_size should be -1")
-        check(dir_row["last_seen"] is not None, failures, "015.16: directory last_seen should be set after creation")
-        check(dir_row["deleted_time"] is None, failures, "015.16: directory deleted_time should be NULL")
-
-
-def scenario_confirmed_absence_and_tombstone_idempotence(root: Path, failures: list[str]) -> None:
-    peer_a = root / "absence_a"
-    peer_b = root / "absence_b"
-    peer_a.mkdir()
-    peer_b.mkdir()
-
-    file_a = peer_a / "gone.txt"
-    file_a.write_text("delete me\n", encoding="utf-8", newline="\n")
-    set_file_time(file_a, datetime(2020, 2, 1, tzinfo=timezone.utc))
-    run_kitchensync([f"+{peer_a}", str(peer_b)], failures, "absence initial")
-
-    before = assert_row_present(peer_b, "gone.txt", failures, "absence initial row")
-    if before is None:
-        return
-    previous_last_seen = before["last_seen"]
-    check(previous_last_seen is not None, failures, "absence setup: initial last_seen should be set")
-
-    (peer_b / "gone.txt").unlink()
-    run_kitchensync([str(peer_a), str(peer_b)], failures, "absence delete decision")
-
-    tombstone = assert_row_present(peer_b, "gone.txt", failures, "015.5-015.6 tombstone")
-    if tombstone is not None:
-        check(tombstone["deleted_time"] == previous_last_seen, failures, "015.5: deleted_time should equal previous last_seen")
-        check(tombstone["last_seen"] == previous_last_seen, failures, "015.6: last_seen should not change when absence is confirmed")
-
-    run_kitchensync([str(peer_a), str(peer_b)], failures, "absence tombstone idempotence")
-    after = assert_row_present(peer_b, "gone.txt", failures, "015.7 existing tombstone")
-    if after is not None and tombstone is not None:
-        check(dict(after) == dict(tombstone), failures, "015.7: existing tombstone row changed on repeated absence")
-
-    peer_a_row = assert_row_present(peer_a, "gone.txt", failures, "015.18 displaced source")
-    if peer_a_row is not None:
-        check(peer_a_row["deleted_time"] == peer_a_row["last_seen"], failures, "015.18: displaced entry should copy last_seen to deleted_time")
-        check(not (peer_a / "gone.txt").exists(), failures, "015.18: displaced source file still exists at original path")
+        gone_a = read_row(peer_a, "gone.txt")
+        tomb_a = read_row(peer_a, "tomb.txt")
+        gone_b = read_row(peer_b, "gone.txt")
+        check(failures, not (peer_b / "gone.txt").exists(), "015.21: losing live file should be displaced from peer")
+        if gone_a:
+            check(failures, gone_a["deleted_time"] == OLD_LAST_SEEN, "015.5: confirmed absent row should copy previous last_seen into deleted_time")
+            check(failures, gone_a["last_seen"] == OLD_LAST_SEEN, "015.6: confirmed absent row should not change last_seen")
+        else:
+            failures.append("015.5-015.6: gone.txt row missing after confirmed absence")
+        if tomb_a:
+            check(failures, tomb_a["last_seen"] == OLDER_LAST_SEEN and tomb_a["deleted_time"] == OLD_LAST_SEEN, "015.7: existing tombstone row should not change")
+        else:
+            failures.append("015.7: tomb.txt tombstone row missing")
+        if gone_b:
+            check(failures, gone_b["deleted_time"] == OLDER_LAST_SEEN, "015.21: displaced file row should use previous last_seen as deleted_time")
+        else:
+            failures.append("015.21: displaced gone.txt row missing on peer_b")
 
 
-def scenario_directory_displacement_cascade(root: Path, failures: list[str]) -> None:
-    peer_a = root / "cascade_a"
-    peer_b = root / "cascade_b"
-    peer_c = root / "cascade_c"
-    for peer in (peer_a, peer_b, peer_c):
-        peer.mkdir()
+def scenario_directory_displacement_cascade(failures):
+    with tempfile.TemporaryDirectory(prefix="ks015_cascade_") as tmp:
+        root = Path(tmp)
+        peer_a = root / "a"
+        peer_b = root / "b"
+        peer_c = root / "c"
+        for peer in (peer_a, peer_b, peer_c):
+            peer.mkdir()
+        for peer in (peer_a, peer_c):
+            write_file(peer / "conflict" / "child.txt", "child\n", "2024-01-01_00-00-00_000000Z")
+            write_file(peer / "conflict" / "old_tomb.txt", "old\n", "2024-01-01_00-00-00_000000Z")
+            write_file(peer / "outside.txt", "outside\n", "2024-01-01_00-00-00_000000Z")
+        write_file(peer_b / "conflict", "winning file\n", "2024-01-04_00-00-00_000000Z")
 
-    folder = peer_a / "folder"
-    folder.mkdir()
-    live = folder / "live.txt"
-    old = folder / "old.txt"
-    outside = peer_a / "outside.txt"
-    live.write_text("live\n", encoding="utf-8", newline="\n")
-    old.write_text("old\n", encoding="utf-8", newline="\n")
-    outside.write_text("outside\n", encoding="utf-8", newline="\n")
-    for path in (live, old, outside):
-        set_file_time(path, datetime(2020, 3, 1, tzinfo=timezone.utc))
+        create_snapshot(
+            peer_a,
+            [
+                ("conflict", "2024-01-01_00-00-00_000000Z", -1, "2024-01-03_00-00-00_000000Z", None),
+                ("conflict/child.txt", "2024-01-01_00-00-00_000000Z", 6, "2024-01-02_00-00-00_000000Z", None),
+                ("conflict/old_tomb.txt", "2024-01-01_00-00-00_000000Z", 4, "2024-01-02_00-00-00_000000Z", "2024-01-02_00-00-00_000000Z"),
+                ("outside.txt", "2024-01-01_00-00-00_000000Z", 8, "2024-01-02_00-00-00_000000Z", None),
+            ],
+        )
+        create_snapshot(
+            peer_b,
+            [("conflict", "2024-01-04_00-00-00_000000Z", 13, "2024-01-04_00-00-01_000000Z", None)],
+        )
+        create_snapshot(
+            peer_c,
+            [
+                ("conflict", "2024-01-01_00-00-00_000000Z", -1, "2024-01-05_00-00-00_000000Z", None),
+                ("conflict/child.txt", "2024-01-01_00-00-00_000000Z", 6, "2024-01-02_00-00-00_000000Z", None),
+            ],
+        )
 
-    run_kitchensync([f"+{peer_a}", str(peer_b), str(peer_c)], failures, "cascade initial")
+        result = run_sync(["--verbosity", "error", peer_a, peer_b, peer_c])
+        check_success(failures, result, "directory cascade run")
 
-    old.unlink()
-    run_kitchensync([f"+{peer_a}", str(peer_b), str(peer_c)], failures, "cascade create existing tombstone")
-    old_b_tombstone = assert_row_present(peer_b, "old.txt", failures, "015.21 setup tombstone")
-    old_c_tombstone = assert_row_present(peer_c, "old.txt", failures, "015.23 setup tombstone")
-    outside_b_before = assert_row_present(peer_b, "outside.txt", failures, "015.22 setup outside")
-    outside_c_before = assert_row_present(peer_c, "outside.txt", failures, "015.23 setup outside")
-
-    shutil.rmtree(folder)
-    run_kitchensync([f"+{peer_a}", str(peer_b), str(peer_c)], failures, "cascade directory displacement")
-
-    for peer, old_before, outside_before, peer_label in (
-        (peer_b, old_b_tombstone, outside_b_before, "peer B"),
-        (peer_c, old_c_tombstone, outside_c_before, "peer C"),
-    ):
-        folder_row = assert_row_present(peer, "folder", failures, f"015.20 {peer_label} folder")
-        live_row = assert_row_present(peer, "live.txt", failures, f"015.20 {peer_label} descendant")
-        if folder_row is not None and live_row is not None:
-            check(folder_row["deleted_time"] is not None, failures, f"015.20 {peer_label}: folder deleted_time should be set")
-            check(live_row["deleted_time"] == folder_row["deleted_time"], failures, f"015.20 {peer_label}: descendant should inherit directory deletion estimate")
-        old_after = assert_row_present(peer, "old.txt", failures, f"015.21 {peer_label} existing tombstone")
-        if old_before is not None and old_after is not None:
-            check(dict(old_after) == dict(old_before), failures, f"015.21 {peer_label}: existing tombstone changed during cascade")
-        outside_after = assert_row_present(peer, "outside.txt", failures, f"015.22 {peer_label} outside row")
-        if outside_before is not None and outside_after is not None:
-            check(outside_after["deleted_time"] == outside_before["deleted_time"], failures, f"015.22 {peer_label}: outside row was tombstoned by cascade")
-            check(outside_after["byte_size"] == outside_before["byte_size"], failures, f"015.22 {peer_label}: outside byte_size changed unexpectedly")
-        check(not (peer / "folder").exists(), failures, f"015.18/015.23 {peer_label}: displaced folder still exists at original path")
-
-    a_folder = assert_row_present(peer_a, "folder", failures, "015.23 canon peer absence row")
-    if a_folder is not None:
-        check(a_folder["deleted_time"] is not None, failures, "015.23: canon peer should record its own absence, not receive another peer cascade")
-
-
-def scenario_cleanup_old_rows(root: Path, failures: list[str]) -> None:
-    peer_a = root / "cleanup_a"
-    peer_b = root / "cleanup_b"
-    peer_a.mkdir()
-    peer_b.mkdir()
-    keep = peer_a / "keep.txt"
-    keep.write_text("keep\n", encoding="utf-8", newline="\n")
-    set_file_time(keep, datetime(2020, 4, 1, tzinfo=timezone.utc))
-
-    run_kitchensync([f"+{peer_a}", str(peer_b)], failures, "cleanup initial")
-
-    ancient = timestamp_text(2000, 1, 1)
-    insert_snapshot_row(
-        peer_b,
-        "oldTomb0001",
-        "rootSent001",
-        "ancient-tombstone.txt",
-        ancient,
-        10,
-        ancient,
-        ancient,
-    )
-    insert_snapshot_row(
-        peer_b,
-        "oldOrph0001",
-        "missing00001",
-        "ancient-orphan.txt",
-        ancient,
-        11,
-        ancient,
-        None,
-    )
-
-    run_kitchensync(["--keep-del-days", "1", f"+{peer_a}", str(peer_b)], failures, "cleanup old rows")
-
-    check(rows_by_basename(peer_b, "ancient-tombstone.txt") == [], failures, "015.24: old tombstone row was not cleaned up")
-    check(rows_by_basename(peer_b, "ancient-orphan.txt") == [], failures, "015.26: old orphan non-tombstone row was not cleaned up")
-    check((peer_b / "keep.txt").exists(), failures, "cleanup scenario: normal sync decision did not proceed")
+        a_dir = read_row(peer_a, "conflict")
+        a_child = read_row(peer_a, "conflict/child.txt")
+        a_tomb = read_row(peer_a, "conflict/old_tomb.txt")
+        a_outside = read_row(peer_a, "outside.txt")
+        c_child = read_row(peer_c, "conflict/child.txt")
+        b_child = read_row(peer_b, "conflict/child.txt")
+        if a_dir and a_child:
+            check(failures, a_dir["deleted_time"] == "2024-01-03_00-00-00_000000Z", "015.21: displaced directory row should use its previous last_seen")
+            check(failures, a_child["deleted_time"] == "2024-01-03_00-00-00_000000Z", "015.23: descendant row should receive directory deletion estimate")
+        else:
+            failures.append("015.21/015.23: peer_a displaced directory or child row missing")
+        if a_tomb:
+            check(failures, a_tomb["deleted_time"] == "2024-01-02_00-00-00_000000Z", "015.24: already tombstoned descendant should not change")
+        else:
+            failures.append("015.24: existing tombstone descendant missing")
+        if a_outside:
+            check(failures, a_outside["deleted_time"] is None, "015.25: cascade should not change rows outside displaced subtree")
+        else:
+            failures.append("015.25: outside row missing")
+        if c_child:
+            check(failures, c_child["deleted_time"] == "2024-01-05_00-00-00_000000Z", "015.26: each peer cascade should use only its own snapshot database")
+        else:
+            failures.append("015.26: peer_c child row missing")
+        check(failures, b_child is None, "015.26: peer_b snapshot should not receive descendant rows from another peer")
 
 
-def main() -> int:
-    failures: list[str] = []
-    check(RELEASED_EXE.exists(), failures, f"released executable does not exist: {RELEASED_EXE}")
+def scenario_snapshot_cleanup(failures):
+    with tempfile.TemporaryDirectory(prefix="ks015_cleanup_") as tmp:
+        root = Path(tmp)
+        peer_a = root / "a"
+        peer_b = root / "b"
+        peer_a.mkdir()
+        peer_b.mkdir()
+        write_file(peer_b / "survivor.txt", "survives\n", "2024-01-04_00-00-00_000000Z")
+        create_snapshot(
+            peer_a,
+            [
+                ("old_tomb.txt", "2000-01-01_00-00-00_000000Z", 1, "2000-01-01_00-00-00_000000Z", OLD_TOMBSTONE),
+                ("stale/orphan.txt", "2000-01-01_00-00-00_000000Z", 1, "2000-01-01_00-00-00_000000Z", None),
+                ("survivor.txt", "2000-01-01_00-00-00_000000Z", 8, "2000-01-01_00-00-00_000000Z", OLD_TOMBSTONE),
+            ],
+        )
+        create_snapshot(
+            peer_b,
+            [("survivor.txt", "2024-01-04_00-00-00_000000Z", 8, "2024-01-04_00-00-01_000000Z", None)],
+        )
 
-    with tempfile.TemporaryDirectory(prefix="kitchensync-015-") as temp_name:
-        root = Path(temp_name)
+        result = run_sync(["--verbosity", "error", "--keep-del-days", "1", peer_a, peer_b])
+        check_success(failures, result, "snapshot cleanup run")
+
+        check(failures, read_row(peer_a, "old_tomb.txt") is None, "015.27: old tombstone row should be removed by cleanup")
+        check(failures, read_row(peer_a, "stale/orphan.txt") is None, "015.29: old unreachable non-tombstone row should be removed by cleanup")
+        check(failures, (peer_a / "survivor.txt").exists(), "015.28: sync decision should still copy live file even with eligible cleanup rows present")
+
+
+def main():
+    failures = []
+    if not KITCHENSYNC_EXE.exists():
+        failures.append(f"released executable does not exist: {KITCHENSYNC_EXE}")
+    else:
         for scenario in (
-            scenario_listing_copy_and_directory_creation,
-            scenario_confirmed_absence_and_tombstone_idempotence,
+            scenario_present_copy_and_directory,
+            scenario_absence_and_file_displacement,
             scenario_directory_displacement_cascade,
-            scenario_cleanup_old_rows,
+            scenario_snapshot_cleanup,
         ):
             try:
-                scenario(root, failures)
+                scenario(failures)
+            except subprocess.TimeoutExpired as exc:
+                failures.append(f"{scenario.__name__}: process timed out after {exc.timeout} seconds")
             except Exception as exc:
-                failures.append(f"{scenario.__name__}: unexpected exception: {exc}")
+                failures.append(f"{scenario.__name__}: unexpected test error: {exc!r}")
+
+    # not reasonably testable: 015.8, 015.9, 015.10, 015.11, 015.12
+    #   The required state exists after enqueue but before copy completion; the
+    #   released CLI exposes no stable pause point for inspecting that moment.
+    # not reasonably testable: 015.14, 015.15
+    #   Forcing process exit during a queued copy would depend on timing and file
+    #   size rather than a specified, observable product control.
+    # not reasonably testable: 015.20, 015.22
+    #   Directory creation and displacement failure require intentionally broken
+    #   filesystem permissions or transport faults, outside happy-path E2E setup.
 
     if failures:
+        print("FAIL")
         for failure in failures:
-            print(f"FAIL: {failure}")
+            print(f"- {failure}")
         return 1
-
-    print("test_015_snapshot_row_updates_and_cleanup passed")
+    print("PASS")
     return 0
 
 
