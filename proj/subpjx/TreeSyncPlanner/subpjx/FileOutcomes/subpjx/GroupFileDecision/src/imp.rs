@@ -17,6 +17,7 @@ struct LiveCandidate {
 struct ExistingWinner {
     byte_size: u64,
     modified_time: SyncTimestamp,
+    max_live_modified_time: SyncTimestamp,
     sources: Vec<usize>,
 }
 
@@ -141,6 +142,7 @@ fn decide_with_canon(
         let winner = ExistingWinner {
             byte_size: file.byte_size,
             modified_time: file.modified_time,
+            max_live_modified_time: file.modified_time,
             sources,
         };
         return existing_file_output(request, winner, Some(canon_index));
@@ -432,7 +434,7 @@ fn base_vote_statuses(
         PeerFileState::DeletedFile { .. } => vec![PeerFileDecisionStatus::VotedForDeletion],
         PeerFileState::AbsentUnconfirmed { last_seen } => {
             if let Some(last_seen) = last_seen {
-                if more_than_tolerance_newer(*last_seen, winner.modified_time) {
+                if more_than_tolerance_newer(*last_seen, winner.max_live_modified_time) {
                     return vec![PeerFileDecisionStatus::VotedForDeletion];
                 }
             }
@@ -533,6 +535,7 @@ fn select_live_winner(live_candidates: &[LiveCandidate]) -> Option<ExistingWinne
     Some(ExistingWinner {
         byte_size: winning_byte_size,
         modified_time: winning_modified_time,
+        max_live_modified_time: max_modified_time,
         sources,
     })
 }
@@ -549,7 +552,7 @@ fn deletion_voter_indexes(
             PeerFileState::AbsentUnconfirmed {
                 last_seen: Some(last_seen),
             } => live_winner.and_then(|winner| {
-                if more_than_tolerance_newer(*last_seen, winner.modified_time) {
+                if more_than_tolerance_newer(*last_seen, winner.max_live_modified_time) {
                     Some(*index)
                 } else {
                     None
