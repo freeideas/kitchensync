@@ -2,9 +2,9 @@ use std::time::{Duration, SystemTime};
 
 use treesyncplanner_directoryoutcomes::{
     new, DirectoryDisplacementOrdering, DirectoryGroupOutcome, DirectoryOutcomeDecision,
-    DirectoryOutcomeRequest, DirectoryOutcomeResult, DirectoryOutcomes, DirectoryPeerDirectoryOutcome,
-    DirectoryPeerInput, DirectoryPeerRole, DirectorySnapshotFact, DirectorySubtreeBlockReason,
-    DirectorySurvivalEvidence,
+    DirectoryOutcomeInvalidReason, DirectoryOutcomeRequest, DirectoryOutcomeResult,
+    DirectoryOutcomes, DirectoryPeerDirectoryOutcome, DirectoryPeerInput, DirectoryPeerRole,
+    DirectorySnapshotFact, DirectorySubtreeBlockReason, DirectorySurvivalEvidence,
 };
 
 fn subject() -> std::sync::Arc<dyn DirectoryOutcomes> {
@@ -120,6 +120,31 @@ fn recursion_peers(decision: &DirectoryOutcomeDecision) -> Option<Vec<String>> {
         .map(|recursion| recursion.peer_identities.clone())
 }
 
+fn invalid_reason(result: DirectoryOutcomeResult) -> DirectoryOutcomeInvalidReason {
+    match result {
+        DirectoryOutcomeResult::InvalidInput(invalid) => {
+            assert_eq!(invalid.relative_path, "recipes");
+            invalid.reason
+        }
+        other => panic!("expected invalid input, got {other:?}"),
+    }
+}
+
+fn assert_peer_id_set(actual: Vec<String>, expected: &[&str]) {
+    let mut actual = actual;
+    let mut expected = expected
+        .iter()
+        .map(|peer_identity| peer_identity.to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+fn assert_optional_peer_id_set(actual: Option<Vec<String>>, expected: &[&str]) {
+    assert_peer_id_set(actual.expect("expected recursion peers"), expected);
+}
+
 #[test]
 fn canon_live_directory_exists_on_every_active_target() {
     let result = subject().decide_directory(request(
@@ -146,15 +171,11 @@ fn canon_live_directory_exists_on_every_active_target() {
         peer_outcome(&decision, "subordinate"),
         DirectoryPeerDirectoryOutcome::CreateDirectory
     );
-    assert_eq!(creation_peers(&decision), vec!["missing", "subordinate"]);
+    assert_peer_id_set(creation_peers(&decision), &["missing", "subordinate"]);
     assert!(decision.displacement_intents.is_empty());
-    assert_eq!(
+    assert_optional_peer_id_set(
         recursion_peers(&decision),
-        Some(vec![
-            "canon".to_string(),
-            "missing".to_string(),
-            "subordinate".to_string()
-        ])
+        &["canon", "missing", "subordinate"],
     );
 }
 
@@ -186,7 +207,7 @@ fn canon_missing_path_displaces_live_active_targets_without_recursion() {
         DirectoryPeerDirectoryOutcome::DirectoryAbsent
     );
     assert!(decision.creation_intents.is_empty());
-    assert_eq!(displacement_peers(&decision), vec!["live", "subordinate"]);
+    assert_peer_id_set(displacement_peers(&decision), &["live", "subordinate"]);
     assert!(decision
         .displacement_intents
         .iter()
@@ -225,14 +246,14 @@ fn non_canon_all_voting_contributors_live_makes_directory_exist() {
         peer_outcome(&decision, "subordinate_missing"),
         DirectoryPeerDirectoryOutcome::CreateDirectory
     );
-    assert_eq!(
+    assert_optional_peer_id_set(
         recursion_peers(&decision),
-        Some(vec![
-            "live_with_old_snapshot".to_string(),
-            "live_without_snapshot".to_string(),
-            "non_voting_missing".to_string(),
-            "subordinate_missing".to_string()
-        ])
+        &[
+            "live_with_old_snapshot",
+            "live_without_snapshot",
+            "non_voting_missing",
+            "subordinate_missing",
+        ],
     );
 }
 
@@ -256,13 +277,9 @@ fn live_directory_conflict_uses_deleted_time_before_last_seen() {
         peer_outcome(&decision, "target_missing"),
         DirectoryPeerDirectoryOutcome::CreateDirectory
     );
-    assert_eq!(
+    assert_optional_peer_id_set(
         recursion_peers(&decision),
-        Some(vec![
-            "live".to_string(),
-            "absent".to_string(),
-            "target_missing".to_string()
-        ])
+        &["live", "absent", "target_missing"],
     );
     assert!(decision.displacement_intents.is_empty());
 }
@@ -316,16 +333,16 @@ fn live_directory_conflict_uses_newest_deletion_estimate() {
 
     let decision = decision(result);
     assert_eq!(decision.group_outcome, DirectoryGroupOutcome::Absent);
-    assert_eq!(
+    assert_peer_id_set(
         displacement_peers(&decision),
-        vec!["live", "subordinate_live"]
+        &["live", "subordinate_live"],
     );
     assert!(decision.creation_intents.is_empty());
     assert!(decision.recursion.is_none());
 }
 
 #[test]
-fn survival_within_five_second_tolerance_keeps_recursion_and_child_file_eligibility() {
+fn survival_within_five_second_tolerance_keeps_recursion() {
     let result = subject().decide_directory(request(
         vec![
             contributing("live", true, None),
@@ -344,15 +361,13 @@ fn survival_within_five_second_tolerance_keeps_recursion_and_child_file_eligibil
         peer_outcome(&decision, "missing_target"),
         DirectoryPeerDirectoryOutcome::CreateDirectory
     );
-    assert_eq!(
+    assert_optional_peer_id_set(
         recursion_peers(&decision),
-        Some(vec![
-            "live".to_string(),
-            "absent".to_string(),
-            "missing_target".to_string()
-        ])
+        &["live", "absent", "missing_target"],
     );
     assert!(decision.displacement_intents.is_empty());
+    // Child file decisions are delegated to file rules and are not directly
+    // observable through this interface.
 }
 
 #[test]
@@ -398,13 +413,9 @@ fn failed_survival_evidence_collection_blocks_the_subtree_without_intents() {
     match result {
         DirectoryOutcomeResult::SubtreeBlocked(block) => {
             assert_eq!(block.relative_path, "recipes");
-            assert_eq!(
+            assert_peer_id_set(
                 block.blocked_peer_identities,
-                vec![
-                    "live".to_string(),
-                    "absent".to_string(),
-                    "subordinate".to_string()
-                ]
+                &["live", "absent", "subordinate"],
             );
             assert_eq!(
                 block.reason,
@@ -434,7 +445,7 @@ fn absent_snapshot_history_displaces_active_peers_that_still_have_directory() {
         peer_outcome(&decision, "subordinate_live"),
         DirectoryPeerDirectoryOutcome::DisplaceDirectory
     );
-    assert_eq!(displacement_peers(&decision), vec!["subordinate_live"]);
+    assert_peer_id_set(displacement_peers(&decision), &["subordinate_live"]);
     assert!(decision.creation_intents.is_empty());
     assert!(decision.recursion.is_none());
 }
@@ -461,11 +472,105 @@ fn no_contributing_votes_displaces_subordinate_live_directories() {
         peer_outcome(&decision, "subordinate_live"),
         DirectoryPeerDirectoryOutcome::DisplaceDirectory
     );
-    assert_eq!(displacement_peers(&decision), vec!["subordinate_live"]);
+    assert_peer_id_set(displacement_peers(&decision), &["subordinate_live"]);
     assert!(decision.creation_intents.is_empty());
     assert!(decision.recursion.is_none());
     assert_eq!(
         decision.displacement_intents[0].ordering,
         DirectoryDisplacementOrdering::WholeDirectoryPreOrder
+    );
+}
+
+#[test]
+fn empty_peer_set_is_invalid_input() {
+    let result =
+        subject().decide_directory(request(vec![], None, DirectorySurvivalEvidence::NotNeeded));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::EmptyPeerSet
+    );
+}
+
+#[test]
+fn duplicate_peer_identity_is_invalid_input() {
+    let result = subject().decide_directory(request(
+        vec![
+            contributing("same_peer", true, None),
+            contributing("same_peer", false, None),
+        ],
+        None,
+        DirectorySurvivalEvidence::NotNeeded,
+    ));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::DuplicatePeerIdentity("same_peer".to_string())
+    );
+}
+
+#[test]
+fn canon_peer_that_is_not_active_is_invalid_input() {
+    let result = subject().decide_directory(request(
+        vec![contributing("active_peer", true, None)],
+        Some("missing_canon"),
+        DirectorySurvivalEvidence::NotNeeded,
+    ));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::CanonPeerNotActive("missing_canon".to_string())
+    );
+}
+
+#[test]
+fn conflict_absent_voter_without_deletion_estimate_is_invalid_input() {
+    let result = subject().decide_directory(request(
+        vec![
+            contributing("live", true, None),
+            contributing("absent_without_estimate", false, Some(snapshot(None, None))),
+        ],
+        None,
+        DirectorySurvivalEvidence::NewestLiveFile {
+            modification_time: at(1_000),
+        },
+    ));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::MissingContributingPeerDeletionEstimate(
+            "absent_without_estimate".to_string()
+        )
+    );
+}
+
+#[test]
+fn missing_survival_evidence_for_live_directory_conflict_is_invalid_input() {
+    let result = subject().decide_directory(request(
+        vec![
+            contributing("live", true, None),
+            contributing("absent", false, Some(snapshot(Some(at(1_000)), None))),
+        ],
+        None,
+        DirectorySurvivalEvidence::NotNeeded,
+    ));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::SurvivalEvidenceMissingForLiveDirectoryConflict
+    );
+}
+
+#[test]
+fn survival_evidence_for_non_conflict_is_invalid_input() {
+    let result = subject().decide_directory(request(
+        vec![contributing("live", true, None)],
+        None,
+        DirectorySurvivalEvidence::NoLiveFiles,
+    ));
+
+    assert_eq!(
+        invalid_reason(result),
+        DirectoryOutcomeInvalidReason::SurvivalEvidenceSuppliedForNonConflict
     );
 }
