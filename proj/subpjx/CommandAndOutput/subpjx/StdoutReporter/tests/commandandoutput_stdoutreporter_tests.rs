@@ -11,6 +11,60 @@ use commandandoutput_stdoutreporter::{
 const HELPER_ENV: &str = "KITCHENSYNC_STDOUTREPORTER_HELPER";
 const START_MARKER: &str = "STDOUTREPORTER_CAPTURE_START";
 const END_MARKER: &str = "STDOUTREPORTER_CAPTURE_END";
+const HELP_TEXT: &str = r#"Usage: kitchensync [options] <peer> <peer> [<peer>...]
+
+Synchronize file trees across multiple peers.
+
+Running with no arguments prints this help. See the specs for full behavior.
+
+Peers:
+  /path or c:\path                 Local path (same as file://)
+  sftp://user@host/path            Remote over SSH
+  sftp://user@host:port/path       Non-standard SSH port
+  sftp://host/path                 Remote over SSH, current OS user
+  sftp://user:password@host/path   Inline password (prefer SSH keys)
+
+Prefix modifiers:
+  +<peer>                          Canon - this peer's state wins all conflicts
+  -<peer>                          Subordinate - overwritten to match the group
+
+Fallback URLs (multiple paths to the same data):
+  [url1,url2,...]                  Try in order, first that connects wins
+  +[url1,url2,...]                 Canon peer with fallbacks
+  -[url1,url2,...]                 Subordinate peer with fallbacks
+
+Per-URL settings (query string, inside quotes):
+  "sftp://host/path?timeout-conn=60"     Connection timeout for this URL
+  "sftp://host/path?timeout-idle=10"     SFTP idle keep-alive TTL for this URL
+  "sftp://host/path?timeout-conn=60&timeout-idle=10"  Combine multiple
+
+Options:
+  --dry-run          Read-only and plan, but make no peer changes
+  --max-copies N     Max active file copies across the whole run (default: 10)
+  --retries-copy N   Give up copying after this many tries (default: 3)
+  --retries-list N   Give up listing after this many tries (default: 3)
+  --timeout-conn N   SSH handshake timeout in seconds (default: 30)
+  --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)
+  --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)
+  -x RELPATH         Exclude relative slash path from sync; repeatable
+  --keep-tmp-days N  Delete stale TMP staging after N days (default: 2)
+  --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)
+  --keep-del-days N  Forget deletion records after N days (default: 180)
+
+Quick start:
+  kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)
+  kitchensync c:/photos sftp://host/photos            Bidirectional
+  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
+  kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password
+
+Canon (+) is required on first sync when no peer has snapshot history.
+After the first sync, bidirectional sync works without canon.
+
+Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
+
+Displaced files are recoverable from nearby:
+  .kitchensync/BAK/ directories (kept for --keep-bak-days days).
+"#;
 
 fn run_helper(mode: &str) -> String {
     let exe = env::current_exe().expect("current test executable path");
@@ -82,20 +136,12 @@ fn assert_plain_lines(output: &str) {
 #[test]
 fn argument_failure_writes_error_then_help_to_stdout_at_every_verbosity() {
     let output = run_helper("argument_failure_all_verbosities");
-
-    assert_eq!(
-        concat!(
-            "invalid peer argument\n",
-            "Usage: kitchensync [OPTIONS] <PEERS>\n",
-            "invalid peer argument\n",
-            "Usage: kitchensync [OPTIONS] <PEERS>\n",
-            "invalid peer argument\n",
-            "Usage: kitchensync [OPTIONS] <PEERS>\n",
-            "invalid peer argument\n",
-            "Usage: kitchensync [OPTIONS] <PEERS>\n",
-        ),
-        output
+    let expected = format!(
+        "{0}{1}{0}{1}{0}{1}{0}{1}",
+        "invalid peer argument\n", HELP_TEXT
     );
+
+    assert_eq!(expected, output);
     assert_plain_lines(&output);
 }
 
@@ -249,7 +295,7 @@ fn emit_argument_failure_all_verbosities() {
         reporter.report_argument_validation_failure(
             verbosity,
             "invalid peer argument".to_string(),
-            "Usage: kitchensync [OPTIONS] <PEERS>\n".to_string(),
+            HELP_TEXT.to_string(),
         );
     }
 }
