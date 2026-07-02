@@ -120,6 +120,39 @@ fn displacing_directory_preserves_its_subtree_under_bak_destination() {
 }
 
 #[test]
+fn completed_displacement_is_not_successful_again_for_the_same_request() {
+    let root = temp_root("repeat");
+    write_file(&root, "peer/report.txt", "original");
+
+    let displacement = subject();
+    let request = BakDisplacementRequest {
+        peer: file_peer(&root),
+        parent_path: "peer".to_owned(),
+        basename: "report.txt".to_owned(),
+        bak_timestamp: "2026-07-02_10-31-30_000005Z".to_owned(),
+    };
+
+    let record = displacement
+        .displace_to_bak(request.clone())
+        .expect("first displacement succeeds");
+    let error = displacement
+        .displace_to_bak(request)
+        .expect_err("same completed displacement is not successful again");
+
+    assert_eq!(error.failure, BakDisplacementFailure::MoveDisplacedEntry);
+    assert_eq!(error.original_path, record.original_path);
+    assert_eq!(error.bak_destination_path, record.bak_destination_path);
+    assert!(!root.join("peer/report.txt").exists());
+    assert_eq!(
+        fs::read_to_string(
+            root.join("peer/.kitchensync/BAK/2026-07-02_10-31-30_000005Z/report.txt")
+        )
+        .expect("read displaced file"),
+        "original"
+    );
+}
+
+#[test]
 fn reports_create_failure_with_displacement_path_context() {
     let root = temp_root("create-failure");
     write_file(&root, "peer/report.txt", "original");
