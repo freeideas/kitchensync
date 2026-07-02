@@ -117,8 +117,8 @@ impl StdoutReporter for StdoutReporterImpl {
         }
     }
 
-    fn report_completion(&self, _verbosity: StdoutVerbosity, message: String) {
-        println!("{}", message);
+    fn report_completion(&self, _verbosity: StdoutVerbosity, _message: String) {
+        println!("sync complete");
     }
 }
 
