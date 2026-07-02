@@ -14,8 +14,9 @@ supplied, for the peer argument parser owned by a sibling.
 
 ## Responsibilities
 
-GlobalArgumentParser exposes an operation that accepts the raw process
-argument list and the exact fenced help screen text from `specs/help.md`.
+GlobalArgumentParser exposes an operation that accepts the process argument
+list after the executable name and the exact fenced help screen text from
+`specs/help.md`.
 
 When the argument list is empty, the operation returns a help result with:
 
@@ -68,11 +69,16 @@ The successful global settings use these defaults when an option is absent:
 - deletion-record retention age is `180` days;
 - command-line excludes are an empty list.
 
-GlobalArgumentParser returns the unparsed peer operand list after the global
-options. Peer operands begin at the first argument that is not a global option
-being consumed by this child. After the peer operand list has begun, remaining
-arguments are peer operand strings rather than global options. This preserves
-the product command shape: options first, then peers.
+GlobalArgumentParser returns the unparsed peer operand list after the leading
+global options. Peer operands begin at the first argument that is not a global
+option being consumed by this child. After the peer operand list has begun,
+remaining arguments are peer operand strings rather than global options, so a
+global option placed after a peer is not applied to the run settings. This
+preserves the product command shape: options first, then peers.
+
+In the leading option segment, any `--` option name other than the accepted
+global options is an unrecognized flag. `-x` is the only single-hyphen option
+this child consumes.
 
 A non-help invocation fails global validation when:
 
@@ -124,7 +130,8 @@ only records the parsed settings that later children use.
   by the exact help text on stdout, exit code `1`, and empty stderr.
 - Successful non-help parsing never writes output and never changes stderr.
 - Only the documented global options are accepted in the global option area.
-- Options are parsed before peer operands, and peer operand order is preserved.
+- Global options are parsed before peer operands, and peer operand order is
+  preserved.
 - Positive-integer settings are stored as positive integer values.
 - Verbosity is stored as one of `error`, `info`, `debug`, or `trace`.
 - Command-line excludes are stored as valid relative slash paths in the order
