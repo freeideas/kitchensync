@@ -552,6 +552,49 @@ fn absent_unconfirmed_votes_deletion_only_when_last_seen_is_more_than_five_secon
 }
 
 #[test]
+fn absent_unconfirmed_deletion_vote_uses_maximum_live_modification_time() {
+    let output = decide(vec![
+        peer(
+            "newest-smaller-live",
+            GroupFileDecisionPeerRole::Contributing,
+            PeerFileState::ModifiedLiveFile(live_file(10, 110)),
+        ),
+        peer(
+            "larger-live-within-tolerance",
+            GroupFileDecisionPeerRole::Contributing,
+            PeerFileState::ModifiedLiveFile(live_file(20, 106)),
+        ),
+        peer(
+            "absent-after-winner-but-not-after-max-live",
+            GroupFileDecisionPeerRole::Contributing,
+            PeerFileState::AbsentUnconfirmed {
+                last_seen: Some(ts(114)),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        output.group_outcome,
+        FileGroupOutcome::ExistingFile {
+            byte_size: 20,
+            modified_time: ts(106),
+        }
+    );
+    assert_eq!(
+        copy_destinations(&output),
+        vec![
+            "absent-after-winner-but-not-after-max-live",
+            "newest-smaller-live"
+        ]
+    );
+    assert_status(
+        &output,
+        "absent-after-winner-but-not-after-max-live",
+        PeerFileDecisionStatus::DidNotVote,
+    );
+}
+
+#[test]
 fn all_contributors_absent_with_no_row_produces_no_file_and_displaces_subordinate_live_file() {
     let output = decide(vec![
         peer(
