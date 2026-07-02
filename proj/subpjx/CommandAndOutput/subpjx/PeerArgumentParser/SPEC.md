@@ -2,28 +2,28 @@
 
 ## Purpose
 
-PeerArgumentParser owns the peer-operand part of a non-help KitchenSync
+PeerArgumentParser owns the peer operand part of a non-help KitchenSync
 invocation. It turns the ordered peer strings left after global option parsing
-into validated peer records that describe peer role, fallback targets, target
-kind, SFTP connection fields, and URL-level timeout overrides.
+into validated peer descriptions.
 
-This child does not parse global flags, print help, normalize peer identities,
-or connect to peers. It returns structured success or a validation failure for
-its caller to report through the command facade.
+The parsed descriptions preserve command-line order and state each peer's role,
+fallback locations, local or SFTP target form, SFTP connection fields, and
+per-URL timeout settings. This child reports validation failures to its caller;
+it does not print help text or write output.
 
 ## Responsibilities
 
-PeerArgumentParser exposes an operation that accepts:
+PeerArgumentParser exposes one parsing operation. The operation accepts:
 
 - The ordered peer operands from the command line.
-- The already-parsed global connection timeout.
-- The already-parsed global idle timeout.
-- The current operating-system username supplied by the command facade.
+- The parsed global connection timeout in seconds.
+- The parsed global idle timeout in seconds.
+- The current operating-system username.
 
-The operation returns either a parsed peer list in command-line order or one
-validation failure. A valid non-help invocation has at least two peer operands.
-Additional peer operands after the first two are accepted. Fewer than two peer
-operands is a validation failure.
+The operation returns either a parsed peer list or one validation failure. A
+valid non-help invocation has at least two peer operands. Additional peer
+operands after the first two are accepted. Fewer than two peer operands is a
+validation failure.
 
 Each peer operand may begin with one role marker:
 
@@ -35,11 +35,16 @@ At most one peer in the parsed list may be canon. More than one canon peer is a
 validation failure. Multiple subordinate peers are valid.
 
 A bracketed operand is one peer with multiple fallback targets. The parser
-recognizes a bracketed operand after removing one optional leading role marker.
-It splits the bracket contents on commas, parses each member with the same
-single-target rules, and preserves member order exactly as given. The leading
-role marker applies to the whole fallback peer. Role marker characters inside
-the brackets are part of the member text and are not parsed as per-member roles.
+recognizes the bracket after reading the one optional leading role marker. A
+leading `+` before the opening bracket marks the whole fallback peer as canon.
+A leading `-` before the opening bracket marks the whole fallback peer as
+subordinate. The role marker for a bracketed peer is determined only by the
+character before the opening bracket.
+
+The parser splits bracket contents on commas, parses each member with the same
+single-target rules, and preserves member order. Local paths and SFTP URLs are
+valid fallback locations. Role marker characters inside the brackets are part
+of the member text and are not parsed as per-member roles.
 
 Each peer target is one of:
 
@@ -48,10 +53,10 @@ Each peer target is one of:
 - An SFTP peer when the target is an `sftp://` URL.
 
 Local file peers include Unix-style absolute paths, Windows drive paths, and
-relative paths. A Windows drive path is local even though it contains a colon.
-The parser records the accepted local path or local file URL as a local peer
-target; absolute path resolution and file URL identity creation are outside
-this child.
+relative paths. A path with no URL scheme is treated as a local file peer. A
+Windows drive path is local even though it contains a colon. The parser records
+the accepted local path or local file URL as a local peer target; absolute path
+resolution and local identity URL creation are outside this child.
 
 For SFTP targets, the parser records:
 
@@ -60,8 +65,8 @@ For SFTP targets, the parser records:
 - Optional inline password.
 - SSH port.
 - Remote absolute path.
-- URL-level connection timeout.
-- URL-level idle timeout.
+- Effective connection timeout for that URL.
+- Effective idle timeout for that URL.
 
 An SFTP URL in the form `sftp://user@host/path` uses the named user and SSH
 port `22`. An SFTP URL in the form `sftp://user@host:port/path` uses the named
@@ -72,21 +77,25 @@ Percent-encoded `@` and `:` characters in the password are decoded as password
 characters. The path portion of the SFTP URL is recorded as an absolute path
 from the remote filesystem root.
 
-The only accepted URL query parameters are `timeout-conn` and `timeout-idle`.
-`timeout-conn` is parsed as the connection timeout for that URL.
-`timeout-idle` is parsed as the idle keep-alive timeout for that URL. Each value
-must be a positive integer; zero, negative numbers, empty strings, fractional
-numbers, and non-numeric strings are invalid. A URL-level timeout overrides the
-matching global timeout for that URL only; when a timeout query parameter is
-absent, the parsed target keeps the matching global timeout. The parser rejects
+The only accepted URL query parameters on peer URLs are `timeout-conn` and
+`timeout-idle`. `timeout-conn=N` supplies the connection timeout for that URL.
+`timeout-idle=N` supplies the idle keep-alive timeout for that URL. A URL may
+combine both parameters when both values are valid. Each value must be a
+positive integer; zero, negative numbers, empty strings, fractional numbers,
+and non-numeric strings are invalid.
+
+A URL-level `timeout-conn` value overrides the global connection timeout for
+that URL only. A URL-level `timeout-idle` value overrides the global idle
+timeout for that URL only. When a timeout query parameter is absent, the target
+uses the matching global timeout supplied by the caller. The parser rejects
 `max-copies` as a URL query parameter and rejects every URL query parameter
 other than `timeout-conn` and `timeout-idle`.
 
 A validation failure owned by this child reports one reason to its caller. The
 reason must identify whether the failure is too few peer operands, more than
-one canon peer, an unsupported peer URL form, an unsupported query parameter,
-or an invalid URL timeout value. The exact user-visible wording belongs to the
-command facade.
+one canon peer, an unsupported peer target, an unsupported query parameter, or
+an invalid URL timeout value. The command facade owns the exact user-visible
+wording, help text, exit code, and stdout-only reporting.
 
 ## Boundaries
 
@@ -100,8 +109,7 @@ global option defaults, verbosity, copy limits, retry counts, retention ages, or
 command-line excludes. Those belong to the global argument parser.
 
 PeerArgumentParser does not read the operating-system username itself. The
-caller supplies that value so command-facing code controls host-environment
-access.
+caller supplies that value.
 
 PeerArgumentParser does not normalize peer identities. It does not lowercase
 schemes or hosts for identity, remove default ports for identity, strip query
@@ -112,8 +120,7 @@ paths to `file://` URLs.
 PeerArgumentParser does not choose which fallback target to use, connect to
 SFTP, authenticate, list files, create directories, or make sync decisions. Its
 invariant is that every successful result is a complete syntactic description of
-the peer operands, with command-line peer order and fallback target order
-preserved.
+the peer operands.
 
 ## Invariants
 
