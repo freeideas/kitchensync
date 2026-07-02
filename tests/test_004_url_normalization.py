@@ -2,210 +2,318 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-
 from __future__ import annotations
 
+import getpass
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
-
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+WORKSPACE = Path("/home/ace/Desktop/prjx/kitchensync")
+if not WORKSPACE.exists():
+    WORKSPACE = Path(__file__).resolve().parents[1]
 
-WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-RELEASED_EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
+PRODUCT = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
+if not PRODUCT.exists():
+    PRODUCT = WORKSPACE / "released" / "kitchensync.exe"
 
-
-def workspace_root() -> Path:
-    if WORKSPACE_ROOT.exists():
-        return WORKSPACE_ROOT
-    return Path(__file__).resolve().parents[1]
-
-
-def released_exe() -> Path:
-    if RELEASED_EXE.exists():
-        return RELEASED_EXE
-    return workspace_root() / "released" / "kitchensync.exe"
+SFTP_SERVER = WORKSPACE / "extart" / "ephemeral-sftp-server.py"
 
 
-def file_url(path: Path) -> str:
-    return path.resolve().as_uri()
+def bundled_uv() -> Path:
+    if sys.platform.startswith("win"):
+        return WORKSPACE / "aitc" / "bin" / "uv.exe"
+    if sys.platform == "darwin":
+        return WORKSPACE / "aitc" / "bin" / "uv.mac"
+    return WORKSPACE / "aitc" / "bin" / "uv.linux"
 
 
-def child_file_url(parent: Path, child_url_segment: str) -> str:
-    return file_url(parent).rstrip("/") + "/" + child_url_segment
+def record(failures: list[str], condition: bool, message: str) -> None:
+    if not condition:
+        failures.append(message)
 
 
-def run_kitchensync(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(released_exe()), *args],
-        cwd=str(cwd),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=20,
-        check=False,
+def run_product(
+    failures: list[str],
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    label: str,
+    timeout: float = 35.0,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        completed = subprocess.run(
+            [str(PRODUCT), *args],
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        failures.append(f"{label}: released product timed out")
+        return None
+
+    record(failures, completed.returncode == 0, f"{label}: exit code {completed.returncode}, stdout={completed.stdout!r}, stderr={completed.stderr!r}")
+    record(failures, completed.stderr == "", f"{label}: stderr must be empty, got {completed.stderr!r}")
+    record(failures, "sync complete" in completed.stdout.splitlines(), f"{label}: stdout must include sync complete, got {completed.stdout!r}")
+    return completed
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def assert_file_text(failures: list[str], path: Path, expected: str, label: str) -> None:
+    if not path.exists():
+        failures.append(f"{label}: expected file {path} to exist")
+        return
+    actual = path.read_text(encoding="utf-8")
+    record(failures, actual == expected, f"{label}: expected {expected!r}, got {actual!r}")
+
+
+def test_local_path_normalization(failures: list[str], root: Path) -> None:
+    source = root / "local-source"
+    bare_dest = root / "bare-dest"
+    relative_dest = root / "relative-dest"
+    source.mkdir()
+    write_text(source / "item.txt", "local normalization\n")
+
+    run_product(
+        failures,
+        ["--verbosity", "error", "+" + str(source), str(bare_dest)],
+        cwd=root,
+        label="004.1 bare path becomes file URL",
+    )
+    assert_file_text(
+        failures,
+        bare_dest / "item.txt",
+        "local normalization\n",
+        "004.1 bare path becomes file URL",
     )
 
+    run_product(
+        failures,
+        ["--verbosity", "error", "+" + str(source), "relative-dest"],
+        cwd=root,
+        label="004.3 relative path resolves from cwd",
+    )
+    assert_file_text(
+        failures,
+        relative_dest / "item.txt",
+        "local normalization\n",
+        "004.3 relative path resolves from cwd",
+    )
 
-def expect_same_identity(
-    failures: list[str],
-    label: str,
-    peer_a: str,
-    peer_b: str,
-    cwd: Path,
-) -> None:
-    result = run_kitchensync(["--dry-run", f"+{peer_a}", peer_b], cwd)
-    if result.stderr != "":
-        failures.append(f"{label}: stderr should be empty, got {result.stderr!r}")
-    if result.returncode == 0:
-        failures.append(
-            f"{label}: normalized duplicate peers should not form two distinct "
-            f"reachable peers; stdout was {result.stdout!r}"
-        )
-
-
-def expect_distinct_identity(
-    failures: list[str],
-    label: str,
-    peer_a: str,
-    peer_b: str,
-    cwd: Path,
-) -> None:
-    result = run_kitchensync(["--dry-run", f"+{peer_a}", peer_b], cwd)
-    if result.stderr != "":
-        failures.append(f"{label}: stderr should be empty, got {result.stderr!r}")
-    if result.returncode != 0:
-        failures.append(
-            f"{label}: distinct normalized peers should be accepted; "
-            f"exit {result.returncode}, stdout {result.stdout!r}"
-        )
-    if "dry run" not in result.stdout.lower():
-        failures.append(f"{label}: dry-run stdout should mention dry run")
-
-
-def make_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def check_local_file_url_normalization(failures: list[str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="ks-url-norm-") as tmp_text:
-        tmp = Path(tmp_text)
-
-        bare = make_dir(tmp / "bare")
-        expect_same_identity(
+    if os.name == "nt":
+        drive_dest = root / "drive-dest"
+        run_product(
             failures,
-            "004.1 bare local path becomes file URL",
-            str(bare),
-            file_url(bare),
-            tmp,
+            ["--verbosity", "error", "+" + str(source), str(drive_dest)],
+            cwd=root,
+            label="004.2 Windows drive path becomes file URL",
         )
-
-        relative = make_dir(tmp / "relative")
-        expect_same_identity(
+        assert_file_text(
             failures,
-            "004.3 relative path resolves from cwd before identity comparison",
-            "relative",
-            file_url(relative),
-            tmp,
+            drive_dest / "item.txt",
+            "local normalization\n",
+            "004.2 Windows drive path becomes file URL",
         )
+    # not reasonably testable: 004.2 on non-Windows hosts has no native Windows drive path.
 
-        scheme = make_dir(tmp / "scheme")
-        expect_same_identity(
+
+class SftpServer:
+    def __init__(self, failures: list[str], home: Path, user: str, password: str) -> None:
+        self.failures = failures
+        self.home = home
+        self.user = user
+        self.password = password
+        self.process: subprocess.Popen[str] | None = None
+        self.port: int | None = None
+
+    def __enter__(self) -> "SftpServer":
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        env["USERPROFILE"] = str(self.home)
+        self.process = subprocess.Popen(
+            [
+                str(bundled_uv()),
+                "run",
+                "--script",
+                str(SFTP_SERVER),
+                "--user",
+                self.user,
+                "--password",
+                self.password,
+            ],
+            cwd=str(WORKSPACE),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+        assert self.process.stdout is not None
+        assert self.process.stderr is not None
+        line = self.process.stdout.readline().strip()
+        try:
+            self.port = int(line)
+        except ValueError:
+            self.failures.append(f"SFTP server did not print a port, got {line!r}")
+            self.close()
+            return self
+
+        host_key_line = ""
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            stderr_line = self.process.stderr.readline()
+            if stderr_line.startswith("host key: "):
+                host_key_line = stderr_line.removeprefix("host key: ").strip()
+                break
+            if self.process.poll() is not None:
+                break
+        if not host_key_line:
+            self.failures.append("SFTP server did not print a host key")
+            self.close()
+            return self
+
+        ssh_dir = self.home / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        known_hosts = ssh_dir / "known_hosts"
+        known_hosts.write_text(
+            f"[localhost]:{self.port} {host_key_line}\n"
+            f"[LOCALHOST]:{self.port} {host_key_line}\n"
+            f"[127.0.0.1]:{self.port} {host_key_line}\n",
+            encoding="ascii",
+            newline="\n",
+        )
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5.0)
+
+    def url(self, path: str, *, host: str = "localhost", scheme: str = "sftp") -> str:
+        if self.port is None:
+            return "sftp://invalid.invalid/missing"
+        return f"{scheme}://{self.user}:{self.password}@{host}:{self.port}{path}"
+
+
+def test_sftp_url_normalization(failures: list[str], root: Path) -> None:
+    home = root / "home"
+    user = "urlnormuser"
+    password = "pw"
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    env.pop("SSH_AUTH_SOCK", None)
+
+    with SftpServer(failures, home, user, password) as server:
+        if server.port is None:
+            return
+
+        source = root / "sftp-source"
+        roundtrip = root / "sftp-roundtrip"
+        source.mkdir()
+        write_text(source / "marker.txt", "sftp normalized identity\n")
+
+        variant = server.url(
+            "/UrlNorm//Space%41/?timeout-conn=5&timeout-idle=5",
+            host="LOCALHOST",
+            scheme="SFTP",
+        )
+        normalized = server.url("/UrlNorm/SpaceA")
+
+        run_product(
             failures,
-            "004.4 file URL scheme comparison is case-insensitive",
-            file_url(scheme).replace("file://", "FILE://", 1),
-            file_url(scheme),
-            tmp,
+            ["--verbosity", "error", "+" + str(source), variant],
+            cwd=root,
+            env=env,
+            label="004.4/004.5/004.7/004.8/004.9/004.10/004.12/004.14 SFTP variant upload",
         )
-
-        slash = make_dir(tmp / "slash" / "leaf")
-        expect_same_identity(
+        run_product(
             failures,
-            "004.8 consecutive path slashes collapse before identity comparison",
-            child_file_url(tmp / "slash", "/leaf"),
-            file_url(slash),
-            tmp,
+            ["--verbosity", "error", "+" + normalized, str(roundtrip)],
+            cwd=root,
+            env=env,
+            label="004.4/004.5/004.7/004.8/004.9/004.10/004.12/004.14 SFTP normalized lookup",
         )
-
-        trailing = make_dir(tmp / "trailing")
-        expect_same_identity(
+        assert_file_text(
             failures,
-            "004.9 trailing path slash is removed before identity comparison",
-            file_url(trailing) + "/",
-            file_url(trailing),
-            tmp,
+            roundtrip / "marker.txt",
+            "sftp normalized identity\n",
+            "SFTP normalized URL should address the same peer root",
         )
 
-        unreserved = make_dir(tmp / "tilde~name")
-        expect_same_identity(
+        reserved_source = root / "reserved-source"
+        reserved_result = root / "reserved-result"
+        reserved_source.mkdir()
+        write_text(reserved_source / "reserved.txt", "reserved stays encoded\n")
+
+        encoded_reserved = server.url("/Reserved%2FSlash")
+        literal_reserved = server.url("/Reserved/Slash")
+        run_product(
             failures,
-            "004.10 percent-encoded unreserved path characters are decoded",
-            child_file_url(tmp, "tilde%7Ename"),
-            file_url(unreserved),
-            tmp,
+            ["--verbosity", "error", "+" + str(reserved_source), encoded_reserved],
+            cwd=root,
+            env=env,
+            label="004.11 encoded reserved upload",
         )
-
-        encoded_reserved = make_dir(tmp / "encoded%2Fslash")
-        decoded_reserved = make_dir(tmp / "encoded" / "slash")
-        expect_distinct_identity(
+        run_product(
             failures,
-            "004.11 percent-encoded reserved path characters remain encoded",
-            child_file_url(tmp, "encoded%2Fslash"),
-            file_url(decoded_reserved),
-            tmp,
+            ["--verbosity", "error", "+" + literal_reserved, str(reserved_result)],
+            cwd=root,
+            env=env,
+            label="004.11 literal reserved comparison root",
         )
-        if not encoded_reserved.exists():
-            failures.append("004.11 setup directory unexpectedly disappeared")
-
-        query = make_dir(tmp / "query")
-        expect_same_identity(
+        record(
             failures,
-            "004.12 query parameters are stripped from peer identity",
-            file_url(query) + "?timeout-conn=30&timeout-idle=30",
-            file_url(query),
-            tmp,
+            not (reserved_result / "reserved.txt").exists(),
+            "004.11 percent-encoded reserved slash must not identify the literal slash path",
         )
 
-        if os.name == "nt":
-            drive = make_dir(tmp / "drive")
-            expect_same_identity(
-                failures,
-                "004.2 Windows drive path becomes file URL",
-                str(drive),
-                file_url(drive),
-                tmp,
-            )
-        else:
-            # not reasonably testable: 004.2 requires a Windows drive path.
-            pass
+    # not reasonably testable: 004.6 needs observing identity removal for port 22,
+    # but the offline test SFTP server is required to bind an OS-assigned non-22 port.
+    # not reasonably testable: 004.13 requires no SFTP username while still
+    # authenticating; authentication fallback behavior belongs to requirement 005.
 
 
 def main() -> int:
     failures: list[str] = []
+    if not PRODUCT.exists():
+        failures.append(f"released product missing: {PRODUCT}")
+    if not SFTP_SERVER.exists():
+        failures.append(f"ephemeral SFTP server missing: {SFTP_SERVER}")
 
-    if not released_exe().exists():
-        failures.append(f"released executable does not exist: {released_exe()}")
-    else:
-        check_local_file_url_normalization(failures)
-
-    # not reasonably testable: 004.5 requires observing SFTP hostname identity
-    # without a product surface that prints normalized peer URLs.
-    # not reasonably testable: 004.6 requires observing default SFTP port identity
-    # without binding a test SFTP server to port 22.
-    # not reasonably testable: 004.7 requires observing non-default SFTP port
-    # identity without a normalized peer URL surface.
-    # not reasonably testable: 004.13 requires observing implicit OS username
-    # insertion separately from SFTP authentication.
-    # not reasonably testable: 004.14 requires observing explicit SFTP username
-    # retention separately from SFTP authentication.
+    with tempfile.TemporaryDirectory(prefix="kitchensync-url-normalization-") as temp:
+        root = Path(temp)
+        test_local_path_normalization(failures, root)
+        test_sftp_url_normalization(failures, root)
 
     if failures:
         print("FAIL")
