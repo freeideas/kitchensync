@@ -10,6 +10,7 @@ path = "src/lib.rs"
 "transportoperations" = { path = "../TransportOperations" }
 "snapshotstore" = { path = "../SnapshotStore" }
 "stagingrecovery" = { path = "../StagingRecovery" }
+"dryrunpolicy" = { path = "../DryRunPolicy" }
 "copyqueue_queuerunner" = { path = "subpjx/QueueRunner" }
 "copyqueue_stagedtransfer" = { path = "subpjx/StagedTransfer" }
 "percent-encoding" = "2.3.1"
