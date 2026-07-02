@@ -47,6 +47,17 @@ fn recover_swap_repairs_direct_children_before_live_listing() {
         "folder/.kitchensync/SWAP/kept-target.txt/old",
         "archived old",
     );
+    write_file(&root, "folder/complete-conflict.txt", "live target");
+    write_file(
+        &root,
+        "folder/.kitchensync/SWAP/complete-conflict.txt/old",
+        "archived old",
+    );
+    write_file(
+        &root,
+        "folder/.kitchensync/SWAP/complete-conflict.txt/new",
+        "discarded new",
+    );
     write_file(
         &root,
         "folder/.kitchensync/SWAP/new-wins.txt/new",
@@ -89,6 +100,20 @@ fn recover_swap_repairs_direct_children_before_live_listing() {
         ),
         "archived old"
     );
+    assert_eq!(
+        read_file(&root, "folder/complete-conflict.txt"),
+        "live target"
+    );
+    assert_eq!(
+        read_file(
+            &root,
+            "folder/.kitchensync/BAK/2026-07-02_12-00-00_000000Z/complete-conflict.txt",
+        ),
+        "archived old"
+    );
+    assert!(!root
+        .join("folder/.kitchensync/SWAP/complete-conflict.txt/new")
+        .exists());
     assert_eq!(read_file(&root, "folder/new-wins.txt"), "new content");
     assert_eq!(read_file(&root, "folder/old-restores.txt"), "restored old");
     assert_eq!(read_file(&root, "folder/new-and-old.txt"), "installed new");
@@ -101,6 +126,9 @@ fn recover_swap_repairs_direct_children_before_live_listing() {
     );
     assert_eq!(read_file(&root, "folder/new-conflict.txt"), "live target");
     assert!(!root.join("folder/.kitchensync/SWAP/kept-target.txt").exists());
+    assert!(!root
+        .join("folder/.kitchensync/SWAP/complete-conflict.txt")
+        .exists());
     assert!(!root.join("folder/.kitchensync/SWAP/new-wins.txt").exists());
     assert!(!root.join("folder/.kitchensync/SWAP/old-restores.txt").exists());
     assert!(!root.join("folder/.kitchensync/SWAP/new-and-old.txt").exists());
