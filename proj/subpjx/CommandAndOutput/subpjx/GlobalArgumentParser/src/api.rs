@@ -42,19 +42,33 @@ pub enum GlobalVerbosity {
 }
 
 pub trait GlobalArgumentParser: Send + Sync {
-    /// Parses the process argument list into either an immediate command output
-    /// or the global run settings plus the remaining peer operand strings.
+    /// Parses the process argument list after the executable name into either
+    /// an immediate command output or the global run settings plus the remaining
+    /// peer operand strings.
     ///
     /// An empty argument list always returns `GlobalArgumentParseResult::Help`
     /// with stdout equal to the supplied help text verbatim, exit code 0, empty
-    /// stderr, and no run request. Non-help parsing consumes only documented
-    /// global options before the first peer operand; once peer operands begin,
-    /// every remaining argument is preserved as a peer operand string in its
-    /// original order. Repeated `-x` options append valid relative slash paths
-    /// to the excludes list in command-line order. Successful parsing applies
-    /// the documented defaults, stores numeric settings as positive integers,
-    /// stores verbosity as one of error, info, debug, or trace, never writes
-    /// stdout, and never writes stderr.
+    /// stderr, and no run request. The parser does not read the help file; the
+    /// supplied help text is returned verbatim for help and validation failures.
+    ///
+    /// Non-help parsing consumes only documented global options before the first
+    /// peer operand: `--dry-run`; `--max-copies N`; `--retries-copy N`;
+    /// `--retries-list N`; `--timeout-conn N`; `--timeout-idle N`;
+    /// `--keep-tmp-days N`; `--keep-bak-days N`; `--keep-del-days N`;
+    /// `--verbosity LEVEL`; and repeated `-x RELPATH`. Once peer operands
+    /// begin, every remaining argument is preserved as a peer operand string in
+    /// its original order, even if it looks like a global option. Repeated `-x`
+    /// options append valid relative slash paths to the excludes list in
+    /// command-line order.
+    ///
+    /// Successful parsing applies these defaults: dry run disabled, maximum
+    /// copies 10, copy retries 3, listing retries 3, connection timeout 30
+    /// seconds, idle timeout 30 seconds, verbosity `info`, TMP retention 2 days,
+    /// BAK retention 90 days, deletion-record retention 180 days, and no
+    /// excludes. Successful parsing stores numeric settings as positive
+    /// integers, stores verbosity as one of error, info, debug, or trace, returns
+    /// no stdout, returns empty stderr, does not print, and does not terminate
+    /// the process.
     ///
     /// A non-help validation failure owned by this parser returns
     /// `GlobalArgumentParseResult::ValidationFailure` with stdout containing
