@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use treesyncplanner_fileoutcomes_peerfileclassification::{
-    new, ClassifiedPeerLiveFile, PeerFileClassification, PeerFileClassificationRequest,
-    PeerFileClassificationResult, PeerFileClassificationState, PeerFilePresenceFact,
-    PeerFileSnapshotRow, PeerFileTimestamp, PeerLiveFileFact,
+    new, ClassifiedPeerLiveFile, PeerFileClassification, PeerFileClassificationError,
+    PeerFileClassificationRequest, PeerFileClassificationResult, PeerFileClassificationState,
+    PeerFilePresenceFact, PeerFileSnapshotRow, PeerFileTimestamp, PeerLiveFileFact,
 };
 
 const PEER_ID: &str = "peer-a";
@@ -52,6 +52,11 @@ fn request(
 fn classify(request: PeerFileClassificationRequest) -> PeerFileClassificationResult {
     let subject: Arc<dyn PeerFileClassification> = new();
     subject.classify_peer_file(request).unwrap()
+}
+
+fn classify_error(request: PeerFileClassificationRequest) -> PeerFileClassificationError {
+    let subject: Arc<dyn PeerFileClassification> = new();
+    subject.classify_peer_file(request).unwrap_err()
 }
 
 fn expected_live(byte_size: u64, modified_time: PeerFileTimestamp) -> ClassifiedPeerLiveFile {
@@ -229,4 +234,29 @@ fn live_file_exactly_five_seconds_from_snapshot_time_is_unchanged() {
         earlier_result.state,
         PeerFileClassificationState::UnchangedLiveFile(expected_live(42, earlier_live_time))
     );
+}
+
+#[test]
+fn live_file_with_non_deleted_snapshot_missing_comparison_metadata_is_invalid_input() {
+    let modified_time = timestamp(1_700_000_000);
+
+    let missing_byte_size_error = classify_error(request(
+        live_fact(42, modified_time),
+        Some(snapshot_row(None, Some(modified_time), None)),
+        None,
+    ));
+    let missing_modified_time_error = classify_error(request(
+        live_fact(42, modified_time),
+        Some(snapshot_row(Some(42), None, None)),
+        None,
+    ));
+
+    assert!(matches!(
+        missing_byte_size_error,
+        PeerFileClassificationError::InvalidInput(_)
+    ));
+    assert!(matches!(
+        missing_modified_time_error,
+        PeerFileClassificationError::InvalidInput(_)
+    ));
 }
