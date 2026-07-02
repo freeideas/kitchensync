@@ -50,8 +50,8 @@ fn assert_validation_failure(args: Vec<String>) {
 
 #[test]
 fn no_arguments_return_verbatim_help_stdout_exit_zero_and_empty_stderr() {
-    let supplied_help = "caller supplied help text\n";
-    let result = parse_with_help(Vec::new(), supplied_help);
+    let supplied_help = help_text();
+    let result = parse_with_help(Vec::new(), &supplied_help);
     let GlobalArgumentParseResult::Help(output) = result else {
         panic!("expected help result");
     };
@@ -287,4 +287,5 @@ fn excludes_reject_invalid_relative_slash_paths() {
 #[test]
 fn unrecognized_flag_in_global_option_area_fails_validation() {
     assert_validation_failure(vec![arg("--unknown"), arg("/a")]);
+    assert_validation_failure(vec![arg("-z"), arg("/a")]);
 }
