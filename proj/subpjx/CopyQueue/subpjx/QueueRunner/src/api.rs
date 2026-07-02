@@ -8,7 +8,7 @@ pub type QueueRunnerEventSink = Arc<dyn Fn(QueueRunnerEvent) + Send + Sync>;
 #[derive(Clone)]
 pub struct QueueRunnerRunConfig {
     pub max_active_copies: Option<u32>,
-    pub max_total_tries_per_copy: u32,
+    pub max_total_tries_per_copy: Option<u32>,
     pub transfer_operation: QueueRunnerTransferOperation,
     pub event_sink: QueueRunnerEventSink,
 }
@@ -121,14 +121,16 @@ pub trait QueueRunner: Send + Sync {
     /// per-copy total try limit, staged-transfer operation, and event sink.
     ///
     /// `None` for `max_active_copies` means the run uses the default global
-    /// maximum of `10`; `Some(N)` means the run uses `N`. The maximum is one
-    /// global pool shared by every supported source and destination scheme
-    /// combination: file to file, file to SFTP, SFTP to file, and SFTP to
-    /// SFTP. The run must not create a lower per-peer, per-host, or
-    /// per-connection limit. Directory listing, snapshot download, snapshot
-    /// upload, directory creation, and BAK, TMP, or SWAP cleanup are outside
-    /// this slot pool. The first staged-transfer call for a queued copy counts
-    /// as try `1`, and the configured total try limit includes that first try.
+    /// maximum of `10`; `Some(N)` means the run uses `N`. `None` for
+    /// `max_total_tries_per_copy` means the run uses the default total try
+    /// limit of `3`; `Some(N)` means the run allows at most `N` total tries
+    /// for each queued copy, including the first try. The maximum active copy
+    /// count is one global pool shared by every supported source and
+    /// destination scheme combination: file to file, file to SFTP, SFTP to
+    /// file, and SFTP to SFTP. The run must not create a lower per-peer,
+    /// per-host, or per-connection limit. Directory listing, snapshot
+    /// download, snapshot upload, directory creation, and BAK, TMP, or SWAP
+    /// cleanup are outside this slot pool.
     fn start_run(&self, config: QueueRunnerRunConfig);
 
     /// Enqueues one already-eligible file copy for the active run.
@@ -150,17 +152,21 @@ pub trait QueueRunner: Send + Sync {
     ///
     /// Closing means traversal will not enqueue more copies. Draining finishes
     /// only after every queued copy has succeeded, been skipped for this run,
-    /// or reached its copy try limit. Every staged-transfer try acquires one
-    /// global slot just before the transfer operation begins, emits a slot
-    /// acquire event with the active count after acquisition and the global
-    /// maximum, and releases exactly that slot once after the transfer
-    /// operation has returned. The release event reports the active count after
-    /// release and the same global maximum. On success, the copy is recorded
-    /// complete and is not queued again. On skip, the copy is recorded skipped
-    /// for the run and is not queued again. On failure before the copy reaches
-    /// its total try limit, only that copy's try count is incremented, the same
-    /// copy is placed behind other queued copy work, and other queued work
-    /// continues in the same run. On failure at the total try limit, the copy
-    /// is recorded failed for the run and is not requeued again in that run.
+    /// or reached its copy try limit. Every staged-transfer try emits one copy
+    /// start event for the attempt, acquires one global slot just before the
+    /// transfer operation begins, emits a slot acquire event with the active
+    /// count after acquisition and the global maximum, calls the staged-transfer
+    /// operation, emits the matching transfer success, transfer skip, or
+    /// transfer failure event from that result, and releases exactly that slot
+    /// once after the transfer operation has returned. The release event
+    /// reports the active count after release and the same global maximum. On
+    /// success, the copy is recorded complete and is not queued again. On skip,
+    /// the copy is recorded skipped for the run and is not queued again. On
+    /// failure before the copy reaches its total try limit, only that copy's
+    /// try count is incremented, the same copy is placed behind other queued
+    /// copy work, the slot for the failed try is released, and other queued
+    /// work continues in the same run. On failure at the total try limit, the
+    /// copy is recorded failed for the run and is not requeued again in that
+    /// run.
     fn close_and_drain(&self) -> QueueRunnerRunResult;
 }
