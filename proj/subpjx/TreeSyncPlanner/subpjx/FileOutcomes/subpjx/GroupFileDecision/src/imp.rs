@@ -376,11 +376,10 @@ fn existing_statuses(
     if live_matches(&peer.classification, winner.byte_size, winner.modified_time) {
         statuses.push(PeerFileDecisionStatus::MatchedWinner);
         statuses.push(PeerFileDecisionStatus::IdenticalSource);
+        statuses.push(PeerFileDecisionStatus::NotSelectedForCopy);
 
         if peer_index == selected_source_index && any_copy_intent {
             statuses.push(PeerFileDecisionStatus::SelectedAsCopySource);
-        } else {
-            statuses.push(PeerFileDecisionStatus::NotSelectedForCopy);
         }
     } else {
         statuses.push(PeerFileDecisionStatus::NeedsCopy);
