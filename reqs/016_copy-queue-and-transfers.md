@@ -26,26 +26,28 @@ transfer failure handling before and after durable replacement state exists.
 - `016.13` -- KitchenSync imposes no per-peer active-copy limit lower than the global active file-copy limit.
 - `016.14` -- KitchenSync imposes no per-host active-copy limit lower than the global active file-copy limit.
 - `016.15` -- KitchenSync imposes no per-connection active-copy limit lower than the global active file-copy limit.
-- `016.16` -- Each queued file copy tracks its own failed-copy tries independently of other queued file copies.
-- `016.17` -- `--retries-copy N` allows at most `N` total tries for each queued file copy, including the first try.
-- `016.18` -- After a copy try fails before reaching its `--retries-copy` total-try limit, KitchenSync moves that queued copy behind other queued copy work.
-- `016.19` -- After a copy try fails before reaching its `--retries-copy` total-try limit, other queued copy work continues in the same run.
-- `016.20` -- After a queued copy reaches its `--retries-copy` total-try limit, KitchenSync does not requeue that copy again in the same run.
-- `016.21` -- Copy try limits apply the same way to local copies, SFTP copies, and mixed-scheme copies.
-- `016.22` -- Each transfer writes replacement content to `<target-parent>/.kitchensync/SWAP/<encoded-basename>/new` before replacing the final destination path.
-- `016.23` -- When the destination already has a file at the target path, KitchenSync moves that existing file to `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old` before moving SWAP `new` into the final path.
-- `016.24` -- KitchenSync moves SWAP `new` into the final destination path after any existing destination file has been moved to SWAP `old`.
-- `016.25` -- After moving SWAP `new` into the final destination path, KitchenSync sets the destination file modification time to the winning modification time from the sync decision.
-- `016.26` -- When SWAP `old` exists after SWAP `new` has been moved into the final destination path, KitchenSync archives SWAP `old` to `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`.
-- `016.27` -- A copy to a destination path that had no existing file creates no BAK entry for that destination path.
-- `016.28` -- After a successful transfer, KitchenSync removes the empty SWAP directories for that transfer.
-- `016.29` -- When moving an existing destination file to SWAP `old` fails, the original destination remains in place.
-- `016.30` -- When moving an existing destination file to SWAP `old` fails, KitchenSync skips that copy for the rest of the run.
-- `016.31` -- When a transfer fails before the existing destination has been moved to SWAP `old`, KitchenSync deletes that transfer's SWAP `new` file before releasing the copy slot.
-- `016.32` -- When a run stops after the existing destination has been moved to SWAP `old` and before replacement completes, SWAP `old` remains as peer-visible incomplete-replacement state.
-- `016.33` -- Active transfers stream file content without buffering the entire file in memory before destination writing begins.
-- `016.34` -- The total buffer memory used by an active transfer is independent of the copied file size.
-- `016.35` -- A local-to-local file copy does not write replacement content directly to the final destination path.
+- `016.16` -- Failed tries for one queued file copy do not consume tries for any other queued file copy.
+- `016.17` -- Without `--retries-copy`, KitchenSync allows at most 3 total tries for each queued file copy, including the first try.
+- `016.18` -- `--retries-copy N` allows at most `N` total tries for each queued file copy, including the first try.
+- `016.19` -- After a copy try fails before reaching its `--retries-copy` total-try limit, KitchenSync moves that queued copy behind other queued copy work.
+- `016.20` -- After a copy try fails before reaching its `--retries-copy` total-try limit, other queued copy work continues in the same run.
+- `016.21` -- After a queued copy reaches its `--retries-copy` total-try limit, KitchenSync does not requeue that copy again in the same run.
+- `016.22` -- Copy try limits apply the same way to local copies, SFTP copies, and mixed-scheme copies.
+- `016.23` -- Each transfer writes replacement content to `<target-parent>/.kitchensync/SWAP/<encoded-basename>/new` before replacing the final destination path.
+- `016.24` -- When the destination already has a file at the target path, KitchenSync moves that existing file to `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old` before moving SWAP `new` into the final path.
+- `016.25` -- KitchenSync moves SWAP `new` into the final destination path after any existing destination file has been moved to SWAP `old`.
+- `016.26` -- After moving SWAP `new` into the final destination path, KitchenSync sets the destination file modification time to the winning modification time from the sync decision.
+- `016.27` -- When SWAP `old` exists after SWAP `new` has been moved into the final destination path, KitchenSync archives SWAP `old` to `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`.
+- `016.28` -- A copy to a destination path that had no existing file creates no BAK entry for that destination path.
+- `016.29` -- After a successful transfer, KitchenSync removes the empty SWAP directories for that transfer.
+- `016.30` -- When moving an existing destination file to SWAP `old` fails, the original destination remains in place.
+- `016.31` -- When moving an existing destination file to SWAP `old` fails and staged files can be removed, KitchenSync removes the staged files for that transfer.
+- `016.32` -- When moving an existing destination file to SWAP `old` fails, KitchenSync skips that copy for the rest of the run.
+- `016.33` -- When a transfer fails before the existing destination has been moved to SWAP `old`, KitchenSync deletes that transfer's SWAP `new` entry before releasing the copy slot.
+- `016.34` -- When a transfer fails after the existing destination has been moved to SWAP `old`, KitchenSync leaves the transfer's SWAP state in place.
+- `016.35` -- Active transfers stream file content without buffering the entire file in memory before destination writing begins.
+- `016.36` -- The total buffer memory used by an active transfer is independent of the copied file size.
+- `016.37` -- A local-to-local file copy does not write replacement content directly to the final destination path.
 
 ## Notes
 This file covers queued file copy work. Directory creation and displacement are
