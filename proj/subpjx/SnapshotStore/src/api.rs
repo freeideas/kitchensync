@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 pub const SNAPSHOT_ROOT_PARENT_ID: &str = "JyBskcNRrBK";
 
@@ -193,16 +192,6 @@ pub trait SnapshotStore: Send + Sync {
     /// The sync root itself is invalid because no row is stored for it.
     fn parent_path_id(&self, relative_path: &str) -> Result<String, SnapshotStoreError>;
 
-    /// Formats a supplied UTC time for snapshot columns and timestamped
-    /// KitchenSync paths.
-    ///
-    /// The returned string uses exactly `YYYY-MM-DD_HH-mm-ss_ffffffZ`, at
-    /// microsecond precision in UTC. Returned values for supplied times sort
-    /// lexicographically in the same order as their UTC times. Values outside
-    /// the representable timestamp range are rejected instead of being
-    /// formatted incorrectly.
-    fn format_utc_timestamp(&self, time: SystemTime) -> Result<String, SnapshotStoreError>;
-
     /// Generates one process-local timestamp string.
     ///
     /// Each successful call returns a UTC microsecond string in exactly
@@ -346,14 +335,17 @@ pub trait SnapshotStore: Send + Sync {
         keep_del_days: u32,
     ) -> Result<(), SnapshotStoreError>;
 
-    /// Uploads updated local snapshots back to peers in a normal run.
+    /// Uploads every updated local snapshot for this normal run.
     ///
     /// The caller must invoke this only after all enqueued file copies for the
-    /// run have completed. Before uploading each peer, this operation commits
-    /// or rolls back every transaction it owns for that local `snapshot.db`,
-    /// finalizes every owned statement, cursor, and reader, and closes every
-    /// owned SQLite connection to that file. Upload reads the closed local file
-    /// and sends only `snapshot.db`, never SQLite sidecar files.
+    /// run have completed. This operation uploads every updated local
+    /// temporary snapshot for every available peer in the run, including
+    /// subordinate peers; the caller does not choose a subset. Before
+    /// uploading each peer, this operation commits or rolls back every
+    /// transaction it owns for that local `snapshot.db`, finalizes every owned
+    /// statement, cursor, and reader, and closes every owned SQLite connection
+    /// to that file. Upload reads the closed local file and sends only
+    /// `snapshot.db`, never SQLite sidecar files.
     ///
     /// Each peer upload writes `.kitchensync/SWAP/snapshot.db/new`, closes that
     /// peer-side file, moves an existing live `.kitchensync/snapshot.db` to
@@ -368,6 +360,5 @@ pub trait SnapshotStore: Send + Sync {
     fn upload_snapshots(
         &self,
         run_id: SnapshotRunId,
-        peer_identities: Vec<String>,
     ) -> Result<SnapshotUploadResult, SnapshotStoreError>;
 }
