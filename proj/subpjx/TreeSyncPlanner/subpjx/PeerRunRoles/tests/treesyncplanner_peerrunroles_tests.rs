@@ -36,6 +36,11 @@ fn fatal_startup(result: PeerRunRolesResult) -> PeerRunRolesFatalStartup {
     }
 }
 
+fn facts_without_result_order(mut active_peers: Vec<PeerRunRoleFact>) -> Vec<PeerRunRoleFact> {
+    active_peers.sort_by(|left, right| left.peer_identity.cmp(&right.peer_identity));
+    active_peers
+}
+
 #[test]
 fn classifies_reachable_peers_by_canon_marker_snapshot_history_and_subordinate_marker() {
     let active_peers = success_facts(classify(vec![
@@ -66,12 +71,18 @@ fn classifies_reachable_peers_by_canon_marker_snapshot_history_and_subordinate_m
     ]));
 
     assert_eq!(
-        active_peers,
+        facts_without_result_order(active_peers),
         vec![
             PeerRunRoleFact {
                 peer_identity: "canon-without-history".to_string(),
                 is_canon: true,
                 role: PeerRunRole::Contributing,
+                is_active_target: true,
+            },
+            PeerRunRoleFact {
+                peer_identity: "marked-subordinate-with-history".to_string(),
+                is_canon: false,
+                role: PeerRunRole::Subordinate,
                 is_active_target: true,
             },
             PeerRunRoleFact {
@@ -82,12 +93,6 @@ fn classifies_reachable_peers_by_canon_marker_snapshot_history_and_subordinate_m
             },
             PeerRunRoleFact {
                 peer_identity: "normal-without-history".to_string(),
-                is_canon: false,
-                role: PeerRunRole::Subordinate,
-                is_active_target: true,
-            },
-            PeerRunRoleFact {
-                peer_identity: "marked-subordinate-with-history".to_string(),
                 is_canon: false,
                 role: PeerRunRole::Subordinate,
                 is_active_target: true,
@@ -113,11 +118,23 @@ fn allows_non_canon_run_when_a_reachable_normal_peer_has_snapshot_history() {
         ),
     ]));
 
-    assert_eq!(active_peers.len(), 2);
-    assert_eq!(active_peers[0].role, PeerRunRole::Contributing);
-    assert!(!active_peers[0].is_canon);
-    assert_eq!(active_peers[1].role, PeerRunRole::Subordinate);
-    assert!(active_peers[1].is_active_target);
+    assert_eq!(
+        facts_without_result_order(active_peers),
+        vec![
+            PeerRunRoleFact {
+                peer_identity: "contributing".to_string(),
+                is_canon: false,
+                role: PeerRunRole::Contributing,
+                is_active_target: true,
+            },
+            PeerRunRoleFact {
+                peer_identity: "target-only".to_string(),
+                is_canon: false,
+                role: PeerRunRole::Subordinate,
+                is_active_target: true,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -144,7 +161,7 @@ fn omits_unreachable_non_fatal_peers_from_all_active_role_facts() {
     ]));
 
     assert_eq!(
-        active_peers,
+        facts_without_result_order(active_peers),
         vec![PeerRunRoleFact {
             peer_identity: "reachable-contributor".to_string(),
             is_canon: false,
@@ -155,37 +172,106 @@ fn omits_unreachable_non_fatal_peers_from_all_active_role_facts() {
 }
 
 #[test]
-fn unreachable_state_does_not_persist_to_later_classifications() {
-    let first_run_active_peers = success_facts(classify(vec![
-        peer(
-            "reachable-contributor",
+fn previous_subordinate_classification_does_not_affect_later_classification() {
+    let subject = new();
+
+    let first_run_active_peers = success_facts(subject.classify_startup_roles(PeerRunRolesRequest {
+        peers: vec![
+            peer(
+                "steady-contributor",
+                StartupPeerReachability::Reachable,
+                StartupPeerRoleMarker::Normal,
+                true,
+            ),
+            peer(
+                "later-contributor",
+                StartupPeerReachability::Reachable,
+                StartupPeerRoleMarker::Normal,
+                false,
+            ),
+        ],
+    }));
+
+    assert_eq!(
+        facts_without_result_order(first_run_active_peers),
+        vec![
+            PeerRunRoleFact {
+                peer_identity: "later-contributor".to_string(),
+                is_canon: false,
+                role: PeerRunRole::Subordinate,
+                is_active_target: true,
+            },
+            PeerRunRoleFact {
+                peer_identity: "steady-contributor".to_string(),
+                is_canon: false,
+                role: PeerRunRole::Contributing,
+                is_active_target: true,
+            },
+        ]
+    );
+
+    let later_run_active_peers = success_facts(subject.classify_startup_roles(PeerRunRolesRequest {
+        peers: vec![peer(
+            "later-contributor",
             StartupPeerReachability::Reachable,
             StartupPeerRoleMarker::Normal,
             true,
-        ),
-        peer(
-            "temporarily-unreachable",
-            StartupPeerReachability::Unreachable,
-            StartupPeerRoleMarker::Normal,
-            true,
-        ),
-    ]));
+        )],
+    }));
 
-    assert_eq!(first_run_active_peers.len(), 1);
     assert_eq!(
-        first_run_active_peers[0].peer_identity,
-        "reachable-contributor"
+        facts_without_result_order(later_run_active_peers),
+        vec![PeerRunRoleFact {
+            peer_identity: "later-contributor".to_string(),
+            is_canon: false,
+            role: PeerRunRole::Contributing,
+            is_active_target: true,
+        }]
+    );
+}
+
+#[test]
+fn unreachable_state_does_not_persist_to_later_classifications() {
+    let subject = new();
+
+    let first_run_active_peers = success_facts(subject.classify_startup_roles(PeerRunRolesRequest {
+        peers: vec![
+            peer(
+                "reachable-contributor",
+                StartupPeerReachability::Reachable,
+                StartupPeerRoleMarker::Normal,
+                true,
+            ),
+            peer(
+                "temporarily-unreachable",
+                StartupPeerReachability::Unreachable,
+                StartupPeerRoleMarker::Normal,
+                true,
+            ),
+        ],
+    }));
+
+    assert_eq!(
+        facts_without_result_order(first_run_active_peers),
+        vec![PeerRunRoleFact {
+            peer_identity: "reachable-contributor".to_string(),
+            is_canon: false,
+            role: PeerRunRole::Contributing,
+            is_active_target: true,
+        }]
     );
 
-    let later_run_active_peers = success_facts(classify(vec![peer(
-        "temporarily-unreachable",
-        StartupPeerReachability::Reachable,
-        StartupPeerRoleMarker::Normal,
-        true,
-    )]));
+    let later_run_active_peers = success_facts(subject.classify_startup_roles(PeerRunRolesRequest {
+        peers: vec![peer(
+            "temporarily-unreachable",
+            StartupPeerReachability::Reachable,
+            StartupPeerRoleMarker::Normal,
+            true,
+        )],
+    }));
 
     assert_eq!(
-        later_run_active_peers,
+        facts_without_result_order(later_run_active_peers),
         vec![PeerRunRoleFact {
             peer_identity: "temporarily-unreachable".to_string(),
             is_canon: false,
