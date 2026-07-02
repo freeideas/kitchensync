@@ -28,22 +28,26 @@ directory conflict resolution, and filename case preservation.
 - `014.16` -- When directory deletion wins, sync does not recurse into that directory.
 - `014.17` -- When the newest deletion estimate does not exceed the survival evidence by more than the five-second tolerance, the directory exists on every active peer.
 - `014.18` -- When a directory survives a deletion conflict, sync recurses into that directory.
-- `014.19` -- When a directory survives because of newer file evidence, newer child files remain eligible to propagate by the file decision rules.
-- `014.20` -- When a directory survives because of newer file evidence, older child files remain eligible for removal by the file deletion rules.
+- `014.19` -- When a directory survives because of newer file evidence, child content newer than the deletion estimate propagates by the file decision rules.
+- `014.20` -- When a directory survives because of newer file evidence, child content older than the deletion estimate is removed entry by entry by the file deletion rules.
 - `014.21` -- If collecting survival evidence fails after all allowed listing tries, no peer is modified under that directory subtree during that run.
 - `014.22` -- If no contributing peer has the directory live, at least one contributing peer has a snapshot row for it, and every contributing peer with a snapshot row is absent, the directory is displaced on every active peer that has it.
 - `014.23` -- If no contributing peer has the directory live or in a snapshot row, subordinate peers that have the directory are displaced.
-- `014.24` -- A directory selected for displacement is moved as one directory before any of its children are independently visited.
-- `014.25` -- With a canon peer, a canon file at a file-versus-directory path displaces directories at that path and syncs the file to active peers.
-- `014.26` -- With a canon peer, a canon directory at a file-versus-directory path displaces files at that path and syncs the directory to active peers.
-- `014.27` -- With a canon peer, a missing canon path in a file-versus-directory conflict displaces that path on active peers that have it.
-- `014.28` -- Without a canon peer, a contributing file wins over a contributing directory at the same path.
-- `014.29` -- Without a canon peer, the winning file in a file-versus-directory conflict is selected from contributing file entries only.
-- `014.30` -- A subordinate file at a path does not make that path's file beat a contributing peer's directory.
-- `014.31` -- After a file-versus-directory decision, a subordinate path with the losing type is displaced and replaced as needed.
-- `014.32` -- Synced filenames preserve the exact case reported by the source filesystem.
+- `014.24` -- A directory selected for displacement is moved as one directory before any of its children are visited.
+- `014.25` -- With a canon peer, a canon file at a file-versus-directory path displaces directories at that path.
+- `014.26` -- With a canon peer, a canon file at a file-versus-directory path is synced to active peers.
+- `014.27` -- With a canon peer, a canon directory at a file-versus-directory path displaces files at that path.
+- `014.28` -- With a canon peer, a missing canon path in a file-versus-directory conflict displaces that path on active peers that have it.
+- `014.29` -- Without a canon peer, when at least one contributing peer has a file and at least one contributing peer has a directory at the same path, the file type wins.
+- `014.30` -- Without a canon peer, a losing directory in a file-versus-directory conflict is displaced to BAK on each contributing peer that has it.
+- `014.31` -- Without a canon peer, the winning file in a file-versus-directory conflict is selected by applying the normal file decision rules to contributing file entries only.
+- `014.32` -- Without a canon peer, the winning file in a file-versus-directory conflict is synced to all active peers.
+- `014.33` -- A subordinate file at a path does not make that path's file beat a contributing peer's directory.
+- `014.34` -- After a file-versus-directory decision, a subordinate path with the losing type is displaced to BAK.
+- `014.35` -- After a file-versus-directory decision, a subordinate path is replaced with the winning type when replacement is needed.
+- `014.36` -- Synced filenames preserve the exact case reported by the source filesystem.
 
 ## Notes
 This file covers decisions for directories and mixed file/directory paths.
-Staging paths, BAK moves, and snapshot cascades belong to the staging and
+BAK path allocation details and snapshot cascades belong to the staging and
 snapshot-update categories.
