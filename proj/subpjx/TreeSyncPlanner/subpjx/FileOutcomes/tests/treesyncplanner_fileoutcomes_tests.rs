@@ -323,7 +323,13 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
             },
         ]
     );
-    assert_eq!(decision.copy_intents.len(), 2);
+    assert_eq!(decision.copy_intents.len(), 3);
+    assert!(
+        decision
+            .copy_intents
+            .iter()
+            .any(|intent| intent.destination_peer_id == "small")
+    );
     assert!(
         decision
             .copy_intents
