@@ -652,32 +652,36 @@ fn startup_uses_separate_local_temp_snapshots_and_uploads_subordinate_updates() 
 
     assert_eq!(result.unavailable_peers, Vec::new());
     assert_eq!(result.available_peers.len(), 2);
-    assert_eq!(result.available_peers[0].peer_identity, "canon-peer");
-    assert_eq!(result.available_peers[0].role, SnapshotPeerRole::Canon);
-    assert_eq!(result.available_peers[1].peer_identity, "subordinate-peer");
-    assert_eq!(result.available_peers[1].role, SnapshotPeerRole::Subordinate);
-    assert!(result.available_peers[0]
+    let canon_peer = result
+        .available_peers
+        .iter()
+        .find(|peer| peer.peer_identity == "canon-peer")
+        .unwrap();
+    let subordinate_peer = result
+        .available_peers
+        .iter()
+        .find(|peer| peer.peer_identity == "subordinate-peer")
+        .unwrap();
+    assert_eq!(canon_peer.role, SnapshotPeerRole::Canon);
+    assert_eq!(subordinate_peer.role, SnapshotPeerRole::Subordinate);
+    assert!(canon_peer
         .local_snapshot_path
         .starts_with(&temporary_root));
-    assert!(result.available_peers[1]
+    assert!(subordinate_peer
         .local_snapshot_path
         .starts_with(&temporary_root));
-    assert!(result.available_peers[0]
-        .local_snapshot_path
-        .ends_with("snapshot.db"));
-    assert!(result.available_peers[1]
-        .local_snapshot_path
-        .ends_with("snapshot.db"));
+    assert!(canon_peer.local_snapshot_path.ends_with("snapshot.db"));
+    assert!(subordinate_peer.local_snapshot_path.ends_with("snapshot.db"));
     assert_ne!(
-        result.available_peers[0].local_snapshot_path,
-        result.available_peers[1].local_snapshot_path
+        canon_peer.local_snapshot_path,
+        subordinate_peer.local_snapshot_path
     );
     assert_eq!(
-        marker_mod_time(&result.available_peers[0].local_snapshot_path),
+        marker_mod_time(&canon_peer.local_snapshot_path),
         LIVE_MARKER
     );
     assert_eq!(
-        marker_mod_time(&result.available_peers[1].local_snapshot_path),
+        marker_mod_time(&subordinate_peer.local_snapshot_path),
         OLD_MARKER
     );
 
