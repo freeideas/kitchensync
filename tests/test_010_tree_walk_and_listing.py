@@ -4,27 +4,40 @@
 # ///
 from __future__ import annotations
 
+import os
+import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
 WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-PRIMARY_EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
+KITCHENSYNC = WORKSPACE_ROOT / "released" / "kitchensync.exe"
 
 
-def product_exe() -> Path:
-    if PRIMARY_EXE.exists():
-        return PRIMARY_EXE
-    moved_root = Path(__file__).resolve().parents[1]
-    return moved_root / "released" / "kitchensync.exe"
+class CheckFailure(Exception):
+    pass
 
 
-def rel(path: Path, root: Path) -> str:
-    return path.relative_to(root).as_posix()
+def record(failures: list[str], label: str, func) -> None:
+    try:
+        func()
+    except CheckFailure as exc:
+        failures.append(f"{label}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - collect all end-to-end failures
+        failures.append(f"{label}: unexpected {type(exc).__name__}: {exc}")
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise CheckFailure(message)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -32,11 +45,15 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
-def run_kitchensync(args: list[str]) -> subprocess.CompletedProcess[str]:
-    exe = product_exe()
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def run_sync(args: list[Path | str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    command = [str(KITCHENSYNC), *[str(arg) for arg in args]]
     return subprocess.run(
-        [str(exe), *args],
-        cwd=str(WORKSPACE_ROOT if WORKSPACE_ROOT.exists() else Path(__file__).resolve().parents[1]),
+        command,
+        cwd=str(cwd),
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -47,234 +64,326 @@ def run_kitchensync(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def file_exists(root: Path, path: str) -> bool:
-    return (root / Path(*path.split("/"))).is_file()
-
-
-def dir_exists(root: Path, path: str) -> bool:
-    return (root / Path(*path.split("/"))).is_dir()
-
-
-def bak_contains(root: Path, basename: str) -> bool:
-    metadata = root / ".kitchensync" / "BAK"
-    if not metadata.exists():
-        return False
-    for path in metadata.rglob(basename):
-        if path.name == basename:
-            return True
-    return False
-
-
-def stdout_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
-    return [line.rstrip("\n") for line in result.stdout.splitlines()]
-
-
-def add_failure(failures: list[str], condition: bool, message: str) -> None:
-    if not condition:
-        failures.append(message)
-
-
-def require_success(
-    failures: list[str],
-    result: subprocess.CompletedProcess[str],
-    label: str,
-) -> None:
-    add_failure(
-        failures,
+def assert_success(result: subprocess.CompletedProcess[str], context: str) -> None:
+    require(
         result.returncode == 0,
-        f"{label}: expected exit code 0, got {result.returncode}; stdout={result.stdout!r}",
+        f"{context} exited {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}",
     )
-    add_failure(failures, result.stderr == "", f"{label}: expected empty stderr, got {result.stderr!r}")
+    require(result.stderr == "", f"{context} wrote to stderr: {result.stderr!r}")
+    require(
+        "sync complete" in result.stdout.splitlines(),
+        f"{context} did not print completion line; stdout={result.stdout!r}",
+    )
 
 
-def index_of(lines: list[str], needle: str) -> int | None:
+def progress_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if len(line) > 2 and line[1] == " " and line[0] in {"C", "X"}
+    ]
+
+
+def line_index(lines: list[str], needle: str) -> int:
     try:
         return lines.index(needle)
-    except ValueError:
+    except ValueError as exc:
+        raise CheckFailure(f"missing progress line {needle!r}; got {lines!r}") from exc
+
+
+def snapshot_rows(peer: Path) -> list[tuple[str, int, str | None, str | None]]:
+    db = peer / ".kitchensync" / "snapshot.db"
+    require(db.exists(), f"snapshot database does not exist at {db}")
+    with sqlite3.connect(str(db)) as conn:
+        return list(
+            conn.execute(
+                "SELECT basename, byte_size, last_seen, deleted_time "
+                "FROM snapshot ORDER BY basename, byte_size, last_seen, deleted_time"
+            )
+        )
+
+
+def has_snapshot_basename(peer: Path, basename: str) -> bool:
+    return any(row[0] == basename for row in snapshot_rows(peer))
+
+
+def make_unreadable(path: Path) -> int | None:
+    if os.name == "nt":
         return None
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return None
+    original = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(0)
+    return original
 
 
-def check_combined_tree_walk_and_ordering(tmp: Path, failures: list[str]) -> None:
-    # not reasonably testable: 010.2
-    #
-    # The requirement says all peer listings at a directory level are started
-    # before awaiting any result. The released surface exposes only stdout,
-    # stderr, exit code, and filesystem changes; without a controllable listing
-    # delay or trace event, this concurrent start condition is not observable.
-    #
-    # not reasonably testable: 010.3
-    #
-    # Snapshot-only paths do not necessarily produce stdout or peer filesystem
-    # changes when omitted correctly, so the absence of their traversal is not a
-    # reliable end-to-end observation from the allowed surface.
-    canon = tmp / "canon"
-    normal = tmp / "normal"
-    subordinate = tmp / "subordinate"
-    canon.mkdir(parents=True)
-    normal.mkdir(parents=True)
-    subordinate.mkdir(parents=True)
+def restore_mode(path: Path, mode: int | None) -> None:
+    if mode is not None:
+        path.chmod(mode)
 
-    write_text(canon / "A_dir" / "child.txt", "child from canon\n")
-    write_text(canon / "m_root.txt", "root from canon\n")
-    write_text(canon / "PeerTwoOnly.txt", "canon value\n")
-    write_text(normal / "a_peer.txt", "normal value\n")
-    write_text(subordinate / "sub_only.txt", "subordinate value\n")
 
-    result = run_kitchensync([f"+{canon}", str(normal), f"-{subordinate}"])
-    require_success(failures, result, "combined tree walk")
-    lines = stdout_lines(result)
+def test_combined_tree_walk_and_order(tmp: Path, failures: list[str]) -> None:
+    peer_a = tmp / "walk" / "peer_a"
+    peer_b = tmp / "walk" / "peer_b"
+    peer_sub = tmp / "walk" / "peer_sub"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    peer_sub.mkdir(parents=True)
 
-    expected_canon_files = [
-        "A_dir/child.txt",
-        "m_root.txt",
-        "PeerTwoOnly.txt",
-    ]
-    for peer in (canon, normal, subordinate):
-        for path in expected_canon_files:
-            add_failure(failures, file_exists(peer, path), f"expected {path} on {rel(peer, tmp)}")
+    write_text(peer_a / "seed.txt", "seed\n")
+    first = run_sync([f"+{peer_a}", peer_b, peer_sub], tmp)
+    record(failures, "010 setup first sync", lambda: assert_success(first, "first sync"))
+    if first.returncode != 0:
+        return
 
-    add_failure(
-        failures,
-        not file_exists(normal, "a_peer.txt"),
-        "non-canon-only live file should be displaced when the canon peer lacks it",
-    )
-    add_failure(
-        failures,
-        bak_contains(normal, "a_peer.txt"),
-        "non-canon-only live file should be recoverable from BAK after displacement",
-    )
-    add_failure(
-        failures,
-        not file_exists(subordinate, "sub_only.txt"),
-        "subordinate-only live file should be displaced because subordinate entries are listed but do not decide",
-    )
-    add_failure(
-        failures,
-        bak_contains(subordinate, "sub_only.txt"),
-        "subordinate-only live file should be recoverable from BAK after displacement",
-    )
+    write_text(peer_a / "Alpha.txt", "from a\n")
+    write_text(peer_a / "dir_from_a" / "a_child.txt", "child from a\n")
+    write_text(peer_b / "beta.txt", "from b\n")
+    write_text(peer_b / "DirFromB" / "b_child.txt", "child from b\n")
+    write_text(peer_sub / "sub_only.txt", "remove from subordinate\n")
+    write_text(peer_sub / "zz_subdir" / "old.txt", "remove dir from subordinate\n")
 
-    ordered_actions = [
-        "X a_peer.txt",
-        "C m_root.txt",
-        "C PeerTwoOnly.txt",
-        "X sub_only.txt",
-    ]
-    present_indices: list[int] = []
-    for action in ordered_actions:
-        found = index_of(lines, action)
-        add_failure(failures, found is not None, f"expected stdout action {action!r}; got {lines!r}")
-        if found is not None:
-            present_indices.append(found)
-    add_failure(
-        failures,
-        present_indices == sorted(present_indices),
-        "root entries should be processed in case-insensitive lexicographic order",
-    )
-    # not reasonably testable: 010.6 original-case tie-breaker
-    #
-    # A portable test cannot create two entries whose names differ only by case,
-    # because that is not valid on common case-insensitive filesystems.
+    second = run_sync(["--verbosity", "info", peer_a, peer_b, f"-{peer_sub}"], tmp)
 
-    root_copy = index_of(lines, "C m_root.txt")
-    child_copy = index_of(lines, "C A_dir/child.txt")
-    add_failure(failures, child_copy is not None, f"expected child copy action; got {lines!r}")
-    if root_copy is not None and child_copy is not None:
-        add_failure(
-            failures,
-            root_copy < child_copy,
-            "pre-order traversal should finish all root entries before recursing into A_dir",
+    def check_result() -> None:
+        assert_success(second, "combined-tree sync")
+        lines = progress_lines(second)
+
+        alpha = line_index(lines, "C Alpha.txt")
+        beta = line_index(lines, "C beta.txt")
+        sub_file = line_index(lines, "X sub_only.txt")
+        sub_dir = line_index(lines, "X zz_subdir")
+        a_child = line_index(lines, "C dir_from_a/a_child.txt")
+        b_child = line_index(lines, "C DirFromB/b_child.txt")
+
+        require(alpha < beta, f"root files were not processed in case-insensitive order: {lines!r}")
+        require(beta < sub_file < sub_dir, f"root entries were not processed before recursion: {lines!r}")
+        require(
+            sub_dir < a_child and sub_dir < b_child,
+            f"child directories were recursed before all root entries finished: {lines!r}",
         )
 
+        for peer in (peer_a, peer_b, peer_sub):
+            require(read_text(peer / "Alpha.txt") == "from a\n", f"{peer} is missing Alpha.txt")
+            require(read_text(peer / "beta.txt") == "from b\n", f"{peer} is missing beta.txt")
+            require(
+                read_text(peer / "dir_from_a" / "a_child.txt") == "child from a\n",
+                f"{peer} is missing dir_from_a/a_child.txt",
+            )
+            require(
+                read_text(peer / "DirFromB" / "b_child.txt") == "child from b\n",
+                f"{peer} is missing DirFromB/b_child.txt",
+            )
 
-def check_multiple_contributing_peer_entries(tmp: Path, failures: list[str]) -> None:
-    peer_one = tmp / "peer_one"
-    peer_two = tmp / "peer_two"
-    peer_one.mkdir(parents=True)
-    peer_two.mkdir(parents=True)
+        require(not (peer_sub / "sub_only.txt").exists(), "subordinate-only file was not displaced")
+        require(not (peer_sub / "zz_subdir").exists(), "subordinate-only directory was not displaced")
 
-    write_text(peer_one / "seed.txt", "seed\n")
-    initial = run_kitchensync([f"+{peer_one}", str(peer_two)])
-    require_success(failures, initial, "snapshot setup for contributing peers")
-
-    write_text(peer_one / "left.txt", "left\n")
-    write_text(peer_two / "right.txt", "right\n")
-
-    result = run_kitchensync([str(peer_one), str(peer_two)])
-    require_success(failures, result, "multiple contributing peer entries")
-    lines = stdout_lines(result)
-
-    for peer in (peer_one, peer_two):
-        add_failure(failures, file_exists(peer, "left.txt"), f"{rel(peer, tmp)} should have left.txt")
-        add_failure(failures, file_exists(peer, "right.txt"), f"{rel(peer, tmp)} should have right.txt")
-    add_failure(failures, "C left.txt" in lines, f"expected left.txt copy action; got {lines!r}")
-    add_failure(failures, "C right.txt" in lines, f"expected right.txt copy action; got {lines!r}")
+    record(failures, "010.1-010.9 combined traversal", check_result)
 
 
-def check_directory_displacement_limits_recursion(tmp: Path, failures: list[str]) -> None:
-    canon = tmp / "canon_conflict"
-    normal = tmp / "normal_conflict"
-    subordinate = tmp / "subordinate_conflict"
-    canon.mkdir(parents=True)
-    normal.mkdir(parents=True)
-    subordinate.mkdir(parents=True)
+def test_non_canon_listing_failure(tmp: Path, failures: list[str]) -> None:
+    peer_a = tmp / "non_canon_failure" / "peer_a"
+    peer_b = tmp / "non_canon_failure" / "peer_b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    write_text(peer_a / "shared" / "before.txt", "before\n")
 
-    write_text(canon / "conflict", "canon file wins\n")
-    write_text(normal / "conflict" / "old-child.txt", "old child\n")
-    write_text(subordinate / "conflict" / "sub-child.txt", "sub child\n")
+    first = run_sync([f"+{peer_a}", peer_b], tmp)
+    record(failures, "010 non-canon failure setup", lambda: assert_success(first, "first sync"))
+    if first.returncode != 0:
+        return
 
-    result = run_kitchensync([f"+{canon}", str(normal), f"-{subordinate}"])
-    require_success(failures, result, "directory displacement")
-    lines = stdout_lines(result)
+    write_text(peer_a / "shared" / "new_from_a.txt", "new\n")
+    marker = peer_b / "shared" / "local_marker.txt"
+    write_text(marker, "must remain\n")
+    original_rows = snapshot_rows(peer_b)
+    mode = make_unreadable(peer_b / "shared")
+    if mode is None:
+        failures.append(
+            "010.10-010.15 not reasonably testable: this host cannot make a "
+            "local directory listing fail portably"
+        )
+        return
 
-    for peer in (normal, subordinate):
-        add_failure(failures, file_exists(peer, "conflict"), f"{rel(peer, tmp)} should receive canon file at conflict")
-        add_failure(failures, bak_contains(peer, "conflict"), f"{rel(peer, tmp)} displaced directory should be in BAK")
-        add_failure(
-            failures,
-            not dir_exists(peer, "conflict"),
-            f"{rel(peer, tmp)} should not keep a directory at displaced path",
+    try:
+        result = run_sync(["--verbosity", "error", "--retries-list", "2", peer_a, peer_b], tmp)
+    finally:
+        restore_mode(peer_b / "shared", mode)
+
+    def check_result() -> None:
+        assert_success(result, "non-canon listing failure sync")
+        lower_stdout = result.stdout.lower()
+        require("listing" in lower_stdout, f"listing failure was not logged: {result.stdout!r}")
+        require("shared" in result.stdout, f"failed path was not logged: {result.stdout!r}")
+        require(marker.exists(), "failed peer subtree was modified after listing failure")
+        require(
+            not (peer_b / "shared" / "new_from_a.txt").exists(),
+            "file was copied into a peer subtree after that peer listing failed",
+        )
+        require(
+            not has_snapshot_basename(peer_b, "new_from_a.txt"),
+            "failed peer snapshot gained a row below the failed subtree",
+        )
+        require(
+            snapshot_rows(peer_b) == original_rows,
+            "failed peer snapshot changed even though only its listed subtree was involved",
         )
 
-    add_failure(failures, "X conflict" in lines, f"expected one displacement action for conflict; got {lines!r}")
-    add_failure(
-        failures,
-        "X conflict/old-child.txt" not in lines and "X conflict/sub-child.txt" not in lines,
-        "a displaced directory should move as a whole, without recursing into its children on that peer",
-    )
+    record(failures, "010.10-010.15 non-canon listing failure", check_result)
 
 
-def check_failed_peer_participates_later(tmp: Path, failures: list[str]) -> None:
-    # not reasonably testable: 010.10, 010.11, 010.12, 010.13, 010.14, 010.15,
-    # 010.16, 010.17, 010.18, 010.19, 010.20, 010.21
-    #
-    # The specs expose no portable way to force one reachable local or bundled
-    # SFTP peer to fail only a specific directory listing and then recover on a
-    # later run. Local permission errors are platform-dependent, and the
-    # referenced SFTP server has no listing-failure injection option.
-    _ = tmp
-    _ = failures
+def test_canon_listing_failure_skips_all_peers(tmp: Path, failures: list[str]) -> None:
+    peer_a = tmp / "canon_failure" / "peer_a"
+    peer_b = tmp / "canon_failure" / "peer_b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    write_text(peer_a / "shared" / "before.txt", "before\n")
+
+    first = run_sync([f"+{peer_a}", peer_b], tmp)
+    record(failures, "010 canon failure setup", lambda: assert_success(first, "first sync"))
+    if first.returncode != 0:
+        return
+
+    write_text(peer_b / "shared" / "extra_on_b.txt", "must not be displaced\n")
+    original_a_rows = snapshot_rows(peer_a)
+    original_b_rows = snapshot_rows(peer_b)
+    mode = make_unreadable(peer_a / "shared")
+    if mode is None:
+        failures.append(
+            "010.16-010.17 not reasonably testable: this host cannot make a "
+            "local canon directory listing fail portably"
+        )
+        return
+
+    try:
+        result = run_sync(["--verbosity", "error", "--retries-list", "1", f"+{peer_a}", peer_b], tmp)
+    finally:
+        restore_mode(peer_a / "shared", mode)
+
+    def check_result() -> None:
+        assert_success(result, "canon listing failure sync")
+        lower_stdout = result.stdout.lower()
+        require("listing" in lower_stdout, f"canon listing failure was not logged: {result.stdout!r}")
+        require("shared" in result.stdout, f"canon failed path was not logged: {result.stdout!r}")
+        require(
+            (peer_b / "shared" / "extra_on_b.txt").exists(),
+            "non-canon peer was modified under a canon failed subtree",
+        )
+        require(snapshot_rows(peer_a) == original_a_rows, "canon snapshot changed below failed subtree")
+        require(snapshot_rows(peer_b) == original_b_rows, "other peer snapshot changed below canon failed subtree")
+
+    record(failures, "010.16-010.17 canon listing failure", check_result)
+
+
+def test_all_contributing_listing_failure(tmp: Path, failures: list[str]) -> None:
+    peer_a = tmp / "all_failure" / "peer_a"
+    peer_b = tmp / "all_failure" / "peer_b"
+    peer_sub = tmp / "all_failure" / "peer_sub"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    peer_sub.mkdir(parents=True)
+    write_text(peer_a / "shared" / "before.txt", "before\n")
+
+    first = run_sync([f"+{peer_a}", peer_b, peer_sub], tmp)
+    record(failures, "010 all contributing failure setup", lambda: assert_success(first, "first sync"))
+    if first.returncode != 0:
+        return
+
+    write_text(peer_sub / "shared" / "subordinate_extra.txt", "must remain\n")
+    mode_a = make_unreadable(peer_a / "shared")
+    mode_b = make_unreadable(peer_b / "shared")
+    if mode_a is None or mode_b is None:
+        restore_mode(peer_a / "shared", mode_a)
+        restore_mode(peer_b / "shared", mode_b)
+        failures.append(
+            "010.18-010.19 not reasonably testable: this host cannot make all "
+            "local contributing directory listings fail portably"
+        )
+        return
+
+    try:
+        result = run_sync(["--verbosity", "error", "--retries-list", "1", peer_a, peer_b, f"-{peer_sub}"], tmp)
+    finally:
+        restore_mode(peer_a / "shared", mode_a)
+        restore_mode(peer_b / "shared", mode_b)
+
+    def check_result() -> None:
+        assert_success(result, "all contributing listing failure sync")
+        require(
+            (peer_sub / "shared" / "subordinate_extra.txt").exists(),
+            "subordinate file was displaced when all contributing peers failed listing",
+        )
+
+    record(failures, "010.18-010.19 all contributing listing failure", check_result)
+
+
+def test_later_run_reincludes_failed_peer(tmp: Path, failures: list[str]) -> None:
+    peer_a = tmp / "later_reinclude" / "peer_a"
+    peer_b = tmp / "later_reinclude" / "peer_b"
+    peer_a.mkdir(parents=True)
+    peer_b.mkdir(parents=True)
+    write_text(peer_a / "shared" / "before.txt", "before\n")
+
+    first = run_sync([f"+{peer_a}", peer_b], tmp)
+    record(failures, "010 later run setup", lambda: assert_success(first, "first sync"))
+    if first.returncode != 0:
+        return
+
+    write_text(peer_a / "shared" / "after_failure.txt", "later\n")
+    mode = make_unreadable(peer_b / "shared")
+    if mode is None:
+        failures.append(
+            "010.20 not reasonably testable: this host cannot make a local "
+            "directory listing fail and then succeed portably"
+        )
+        return
+
+    try:
+        failed_run = run_sync(["--verbosity", "error", "--retries-list", "1", peer_a, peer_b], tmp)
+    finally:
+        restore_mode(peer_b / "shared", mode)
+
+    later_run = run_sync(["--verbosity", "error", peer_a, peer_b], tmp)
+
+    def check_result() -> None:
+        assert_success(failed_run, "listing failure run")
+        require(
+            not (peer_b / "shared" / "after_failure.txt").exists(),
+            "failed run copied into the failed subtree",
+        )
+        assert_success(later_run, "later successful run")
+        require(
+            read_text(peer_b / "shared" / "after_failure.txt") == "later\n",
+            "peer excluded by a previous listing failure did not participate on a later run",
+        )
+
+    record(failures, "010.20 later run after listing failure", check_result)
 
 
 def main() -> int:
     failures: list[str] = []
-    try:
-        with tempfile.TemporaryDirectory(prefix="kitchensync-010-") as temp_name:
-            tmp = Path(temp_name)
-            check_combined_tree_walk_and_ordering(tmp / "walk", failures)
-            check_multiple_contributing_peer_entries(tmp / "multi-contributor", failures)
-            check_directory_displacement_limits_recursion(tmp / "displace", failures)
-            check_failed_peer_participates_later(tmp / "listing-failure", failures)
-    except subprocess.TimeoutExpired as exc:
-        failures.append(f"KitchenSync process timed out: {exc}")
-    except Exception as exc:  # noqa: BLE001 - report all unexpected end-to-end failures cleanly
-        failures.append(f"unexpected test harness error: {exc}")
+    require(KITCHENSYNC.exists(), f"released executable does not exist: {KITCHENSYNC}")
+
+    with tempfile.TemporaryDirectory(prefix="kitchensync-010-") as temp_name:
+        tmp = Path(temp_name)
+        test_combined_tree_walk_and_order(tmp, failures)
+        test_non_canon_listing_failure(tmp, failures)
+        test_canon_listing_failure_skips_all_peers(tmp, failures)
+        test_all_contributing_listing_failure(tmp, failures)
+        test_later_run_reincludes_failed_peer(tmp, failures)
+
+    # not reasonably testable: 010.2 requires observing operation start ordering
+    # inside concurrent directory listing operations, not just final process output.
+    # not reasonably testable: 010.10 retry counts are not externally countable for
+    # a local permission-denied listing without instrumenting the transport.
+    # not reasonably testable: 010.21 requires forcing survival-evidence listing
+    # failure inside directory conflict resolution without a specified test fixture.
 
     if failures:
+        print("FAILURES:")
         for failure in failures:
-            print(f"FAIL: {failure}")
+            print(f"- {failure}")
         return 1
-    print("PASS: 010_tree-walk-and-listing")
     return 0
 
 
