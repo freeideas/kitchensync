@@ -2,6 +2,8 @@
 /aitc/
 /aitc.old/
 /aitc.db
+# aisf is its own nested repo
+/aisf/
 # The whole /state/ tree is machine-local EXCEPT settled.db -- the one durable,
 # portable file (freshness baselines + verified pass-state), carried across
 # push/pull so a fresh machine knows the work is settled and skips it. Its WAL
