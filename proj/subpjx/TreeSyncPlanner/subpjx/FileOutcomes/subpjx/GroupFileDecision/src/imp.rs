@@ -155,13 +155,10 @@ fn decide_with_canon(
         Vec::new()
     };
 
+    let deletion_estimate = deletion_estimate(&request.peers[canon_index].classification);
     absent_output(
         request,
-        FileGroupOutcome::Deletion {
-            deletion_estimate: deletion_estimate(
-                &request.peers[canon_index].classification,
-            ),
-        },
+        FileGroupOutcome::Deletion { deletion_estimate },
         true,
         deletion_voters,
     )
