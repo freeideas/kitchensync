@@ -106,7 +106,7 @@ pub enum OutputEvent {
     CopyProgress { relpath: String },
     DisplacementProgress { relpath: String },
     CopySlots { active: u32, max: u32 },
-    Completion { message: String },
+    Completion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +123,6 @@ pub struct SyncErrorDiagnostic {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncErrorKind {
-    ArgumentError,
     NoSnapshotsAndNoCanon,
     UnreachablePeer,
     DirectoryListingFailure,
@@ -145,7 +144,7 @@ pub struct FailedFileTransferDiagnostic {
     pub relpath: String,
     pub destination_peer_url: String,
     pub phase: FileTransferPhase,
-    pub transport_error: Option<TransportErrorCategory>,
+    pub transport_error_category: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,13 +158,6 @@ pub enum FileTransferPhase {
     Cleanup,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportErrorCategory {
-    NotFound,
-    PermissionDenied,
-    IoError,
-}
-
 pub trait CommandAndOutput: Send + Sync {
     /// Parses product arguments after the executable name into either a
     /// complete run request or an immediate command outcome.
@@ -176,13 +168,19 @@ pub trait CommandAndOutput: Send + Sync {
     /// followed by that same help text on stdout, exit code 1, empty stderr, and
     /// no run request. Repeated calls with the same inputs return the same
     /// outcome and do not emit output. Successful parsing preserves peer
-    /// operand order, fallback URL order, and repeated exclude order; accepts
-    /// at least two peers and at most one canon peer; records URL-level timeout
-    /// overrides; applies the documented defaults; stores only positive integer
-    /// settings; and stores normalized peer identities suitable for later
-    /// comparison and lookup. It never connects to peers, creates directories,
-    /// authenticates, lists files, makes sync decisions, writes stdout, or
-    /// writes stderr.
+    /// operand order, fallback URL order, and repeated exclude order; applies
+    /// the documented defaults; records URL-level timeout overrides only for
+    /// `timeout-conn` and `timeout-idle`; and stores normalized peer identities
+    /// suitable for later comparison and lookup.
+    ///
+    /// A non-help invocation is rejected when it has fewer than two peer
+    /// operands, more than one canon peer, an unrecognized flag, a missing
+    /// valued option, a non-positive integer where a positive integer is
+    /// required, an invalid verbosity value, an invalid exclude path,
+    /// `max-copies` as a URL query parameter, any URL query parameter other
+    /// than `timeout-conn` or `timeout-idle`, or a non-positive URL timeout
+    /// value. It never connects to peers, creates directories, authenticates,
+    /// lists files, makes sync decisions, writes stdout, or writes stderr.
     fn parse_command(
         &self,
         args: Vec<String>,
@@ -233,7 +231,8 @@ pub trait CommandAndOutput: Send + Sync {
     /// `No contributing peer reachable - cannot make sync decisions`. Failed
     /// file-transfer diagnostics include the relative path, destination peer
     /// URL, one of the specified phase labels, and the transport error category
-    /// when present. This operation is not idempotent: repeated calls write
-    /// repeated output.
+    /// when present. The completion event writes exactly `sync complete` and is
+    /// emitted at every verbosity level. This operation is not idempotent:
+    /// repeated calls write repeated output.
     fn write_output(&self, verbosity: Verbosity, event: OutputEvent);
 }
