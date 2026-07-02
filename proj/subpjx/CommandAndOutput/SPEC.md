@@ -7,13 +7,9 @@ native executable invocation into a validated run request, normalizes peer
 identities for comparison and lookup, and provides the single stdout-only output
 path used by argument handling, sync execution, and shutdown.
 
-The shipped product is a native command-line executable named
-`released/kitchensync.exe`. The executable is invoked directly from
-`./released/`; `./released/` contains exactly that one shipped file. The
-executable accepts options followed by at least two peer operands, and may
-accept additional peer operands. This child specifies the command behavior and
-observable output that executable must expose. Release assembly itself remains
-outside this child.
+The root product exposes this behavior through the `kitchensync` command. This
+child specifies the argument meaning and observable output for that command.
+Release assembly and the contents of `./released/` remain outside this child.
 
 ## Responsibilities
 
@@ -31,8 +27,10 @@ Non-help invocation parsing treats the command shape as:
 kitchensync [options] <peer> <peer> [<peer>...]
 ```
 
-The accepted run request contains at least two peer operands, and it preserves
-all additional accepted peer operands in command-line order.
+Options form the leading segment of the invocation. Peer operands follow the
+options, must number at least two, and may include any number of additional
+peers after the first two. The accepted run request preserves all accepted peer
+operands in command-line order.
 
 The parser accepts only the specified global options:
 
@@ -137,14 +135,16 @@ The output sink provides these message forms:
   receive it. A displaced file or directory emits one `X` line no matter how
   many peers displace it.
 - Trace copy-slot lines exactly as `copy-slots active=<n>/<max>`.
-- A final completion message for a successful sync execution.
+- A final completion message for a successful sync execution: exactly
+  `sync complete`.
 
 Verbosity is cumulative in this order: `error`, `info`, `debug`, `trace`.
 `C` and `X` progress lines are info-level output and are suppressed by
 `--verbosity error`. No debug-specific messages are defined, so debug output is
 observably the same as info output. Trace output includes copy-slot acquire and
 release events, and those events report global active file-copy slots rather
-than network connection counts.
+than network connection counts. The `sync complete` completion line is emitted
+exactly once on a successful sync and is emitted at every verbosity level.
 
 ## Boundaries
 
@@ -163,9 +163,9 @@ action for a relative path, one `X <relpath>` info line is available. It must
 not emit `C` or `X` progress lines for directory creation, directory listing,
 snapshot work, or BAK, TMP, or SWAP cleanup.
 
-CommandAndOutput does not own release packaging mechanics. Its command contract
-is that the root product exposes this behavior through the single shipped native
-CLI file `released/kitchensync.exe`.
+CommandAndOutput does not own release packaging mechanics or decide which file
+is shipped. Its command contract is that the root product exposes this behavior
+through the `kitchensync` CLI.
 
 The invariant for all operations is stdout-only output: argument parsing, sync
 execution, and shutdown leave stderr empty. The output stream contains plain
