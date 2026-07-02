@@ -808,6 +808,35 @@ fn command_options_are_consumed_before_peer_operands() {
 }
 
 #[test]
+fn option_like_arguments_after_the_first_peer_remain_peer_operands() {
+    let run = run(&["/left", "--dry-run", "--max-copies", "2"]);
+
+    assert_eq!(run.settings.dry_run, false);
+    assert_eq!(run.settings.max_copies, 10);
+    assert_eq!(run.peers.len(), 4);
+    assert_eq!(run.peers[0].role, PeerRole::Normal);
+    assert_eq!(run.peers[1].role, PeerRole::Subordinate);
+    assert_eq!(run.peers[2].role, PeerRole::Subordinate);
+    assert_eq!(run.peers[3].role, PeerRole::Normal);
+    assert_eq!(run.peers[0].fallback_targets[0].normalized_identity, "file:///left");
+    assert!(
+        run.peers[1].fallback_targets[0]
+            .normalized_identity
+            .ends_with("/work/-dry-run")
+    );
+    assert!(
+        run.peers[2].fallback_targets[0]
+            .normalized_identity
+            .ends_with("/work/-max-copies")
+    );
+    assert!(
+        run.peers[3].fallback_targets[0]
+            .normalized_identity
+            .ends_with("/work/2")
+    );
+}
+
+#[test]
 fn normalizes_peer_identities_from_public_peer_locations() {
     let command = subject();
 
