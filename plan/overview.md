@@ -20,4 +20,7 @@ backed by a runnable experiment under `plan/experiments/`.
 - Local filesystem modification times are probed in `local-file-metadata.md`.
   It verifies `filetime` can set and read file and directory mtimes with
   microsecond precision on this machine.
-
+- Local filesystem operations are probed in `local-fs-ops.md`. It verifies the
+  Rust standard-library calls for creating parent directories, listing regular
+  entries, streaming file I/O, rename-to-missing behavior, whole-directory
+  displacement, and delete operations.

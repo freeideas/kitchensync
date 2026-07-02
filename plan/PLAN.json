@@ -28,7 +28,11 @@
       "file": "local-file-metadata.md",
       "packages": [{ "name": "filetime", "version": "0.2.25" }],
       "experiments": ["experiments/local-file-metadata"]
+    },
+    {
+      "file": "local-fs-ops.md",
+      "packages": [],
+      "experiments": ["experiments/local-fs-ops"]
     }
   ]
 }
-
