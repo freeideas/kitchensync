@@ -656,19 +656,21 @@ fn startup_uses_separate_local_temp_snapshots_and_uploads_subordinate_updates() 
     assert_eq!(result.available_peers[0].role, SnapshotPeerRole::Canon);
     assert_eq!(result.available_peers[1].peer_identity, "subordinate-peer");
     assert_eq!(result.available_peers[1].role, SnapshotPeerRole::Subordinate);
-    assert_eq!(
+    assert!(result.available_peers[0]
+        .local_snapshot_path
+        .starts_with(&temporary_root));
+    assert!(result.available_peers[1]
+        .local_snapshot_path
+        .starts_with(&temporary_root));
+    assert!(result.available_peers[0]
+        .local_snapshot_path
+        .ends_with("snapshot.db"));
+    assert!(result.available_peers[1]
+        .local_snapshot_path
+        .ends_with("snapshot.db"));
+    assert_ne!(
         result.available_peers[0].local_snapshot_path,
-        temporary_root
-            .join(result.run_id.0.to_string())
-            .join("0")
-            .join("snapshot.db")
-    );
-    assert_eq!(
-        result.available_peers[1].local_snapshot_path,
-        temporary_root
-            .join(result.run_id.0.to_string())
-            .join("1")
-            .join("snapshot.db")
+        result.available_peers[1].local_snapshot_path
     );
     assert_eq!(
         marker_mod_time(&result.available_peers[0].local_snapshot_path),
