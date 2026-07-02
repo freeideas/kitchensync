@@ -107,10 +107,11 @@ copies, and mixed-scheme copies.
 
 ## Progress Output
 
-During sync execution, KitchenSync emits one plain line per action to stdout, in
-the order the actions happen. There is no live status screen, progress bar,
-percentage, scanned-directory indicator, or terminal control sequence. Output is
-identical whether or not stdout is a terminal.
+At `info`, `debug`, and `trace` verbosity, KitchenSync emits one plain line per
+action to stdout during sync execution, in the order the actions happen. At
+`error` verbosity, these progress lines are suppressed. There is no live status
+screen, progress bar, percentage, scanned-directory indicator, or terminal
+control sequence. Output is identical whether or not stdout is a terminal.
 
 Each line is an action letter, a single space, then the slash-separated relative
 path from the sync root:
@@ -126,8 +127,8 @@ X path/to/file.ext
   peers. One line per path. Files and directories use the same letter.
 
 No line is emitted for directory creation, listing, snapshot work, or BAK/TMP
-cleanup. These lines are `info`-level. Errors and the final completion message
-are separate output and remain visible.
+cleanup. These lines are `info`-level. Errors and the final `sync complete`
+message are separate output and remain visible.
 
 ## Trace Logging
 

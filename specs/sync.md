@@ -157,7 +157,7 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
    next run. In `--dry-run`, skip this step; updated local temp snapshots are
    not uploaded back to peers.
 5. Disconnect all peers
-6. Log completion, exit 0
+6. Print exactly `sync complete` as one stdout line, then exit 0.
 
 ## Operation Queue
 
@@ -171,7 +171,8 @@ Each queued copy carries its own try count. `--retries-copy` is the maximum numb
 KitchenSync still connects to peers, downloads snapshots to local temp files,
 lists directories, reads source files for queued copies, updates the local temp
 snapshot databases, exercises the copy queue, applies try-limit behavior, and
-emits the same `C`/`X` progress lines.
+emits the same `C`/`X` progress lines when progress output is enabled by
+verbosity.
 
 Dry-run copy work acquires copy slots and reads source files, but destination
 write, swap, archive, delete, and mod_time operations are planned only and are
@@ -190,9 +191,10 @@ or upload anything through a `file://` or `sftp://` peer URL. This means:
 - updated local temp snapshots are not uploaded back to peers;
 - BAK/TMP cleanup and SWAP recovery on peers are skipped.
 
-Dry-run output includes the phrase `dry run` at least once on stdout. The local
-temp databases may be written because they are local working state, not peer
-state.
+Dry-run output includes the phrase `dry run` at least once on stdout. Dry-run
+progress output follows the same verbosity rules as normal progress output. The
+local temp databases may be written because they are local working state, not
+peer state.
 
 ### Rename Compatibility
 
@@ -254,11 +256,20 @@ Each displacement is a `(peer, path)` pair executed inline during the combined-t
 
 All output produced by KitchenSync goes to stdout. stderr must remain empty across argument parsing, sync execution, and shutdown. A user running `2>/dev/null` must never miss diagnostic information; a user running `2>&1` must never see duplicate lines.
 
-Progress is the per-action `C`/`X` line output described in `concurrency.md`,
-emitted to stdout in the order the actions happen. The same lines are produced
-whether or not stdout is a terminal.
+Progress is the per-action `C`/`X` line output described in `concurrency.md`.
+When progress lines are enabled by verbosity, they are emitted to stdout in the
+order the actions happen. The same lines are produced whether or not stdout is a
+terminal.
 
 Verbosity levels (`--verbosity`, ordered least-to-most verbose: `error` < `info` < `debug` < `trace`) are cumulative - each level emits everything the lower levels emit plus its own additions. The spec currently defines messages at three of the four levels: `error` (the error conditions enumerated in section Errors below, nonfatal diagnostics for skipped peers and recoverable operation failures, and listing errors described in multi-tree-sync.md section Algorithm), `info` (the `C`/`X` progress lines, see concurrency.md section Progress Output), and `trace` (copy-slot acquire/release events, see concurrency.md section Trace Logging). No debug-specific messages are defined; `--verbosity debug` is observationally identical to `--verbosity info` until debug-only messages are specified.
+
+On a successful run, KitchenSync prints exactly one completion line:
+
+```text
+sync complete
+```
+
+The completion line is emitted at every verbosity level.
 
 Failed file-transfer diagnostics must identify the relative path, the
 destination peer URL, the failed phase, and the transport error category when

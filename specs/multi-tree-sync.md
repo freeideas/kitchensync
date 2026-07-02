@@ -140,8 +140,8 @@ entries are listed for sync decisions.
 
 For target `<basename>`:
 
-- `old` exists and target exists: replacement completed; move `old` to BAK and
-  remove the empty SWAP directory.
+- `old` exists and target exists: replacement completed; delete `new` if
+  present, move `old` to BAK, and remove the empty SWAP directory.
 - `old` exists, `new` exists, and target is missing: rename `new` to target,
   move `old` to BAK, and remove the empty SWAP directory.
 - `old` exists, `new` is missing, and target is missing: rename `old` back to
