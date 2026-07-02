@@ -1,5 +1,5 @@
 use peerconnections_sftpurlconnection::{
-    new, SftpUrlConnection, SftpUrlConnectionCredentialAttemptStatus,
+    new, SftpUrlConnectionCredentialAttemptStatus,
     SftpUrlConnectionCredentialSource, SftpUrlConnectionEndpoint, SftpUrlConnectionFailureReason,
     SftpUrlConnectionHostKeyFailure, SftpUrlConnectionKnownHosts,
     SftpUrlConnectionRemoteRootFailureKind,
@@ -254,7 +254,7 @@ fn normal_run_creates_missing_remote_root_and_parents_before_accepting_url() {
         .establish_sftp_url(request(
             server.port,
             "/alpha/beta/gamma",
-            home.path,
+            home.path.clone(),
             SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
             Some("secret"),
             None,
@@ -262,6 +262,51 @@ fn normal_run_creates_missing_remote_root_and_parents_before_accepting_url() {
             SftpUrlConnectionRunMode::DryRun,
         ))
         .expect("dry-run should accept the remote root created by normal mode");
+}
+
+#[test]
+fn dry_run_fails_missing_remote_root_without_creating_it() {
+    let server = password_server("secret");
+    let home = TempHome::new("dry-run-missing-root");
+    let subject = new();
+
+    let first_failure = subject
+        .establish_sftp_url(request(
+            server.port,
+            "/dry-run/missing",
+            home.path.clone(),
+            SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
+            Some("secret"),
+            None,
+            9,
+            SftpUrlConnectionRunMode::DryRun,
+        ))
+        .expect_err("dry-run should fail a missing remote root");
+
+    assert!(matches!(
+        first_failure.reason,
+        SftpUrlConnectionFailureReason::RemoteRootPreparationFailed(failure)
+            if failure.kind == SftpUrlConnectionRemoteRootFailureKind::MissingInDryRun
+    ));
+
+    let second_failure = subject
+        .establish_sftp_url(request(
+            server.port,
+            "/dry-run/missing",
+            home.path.clone(),
+            SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
+            Some("secret"),
+            None,
+            9,
+            SftpUrlConnectionRunMode::DryRun,
+        ))
+        .expect_err("dry-run should not create the missing remote root");
+
+    assert!(matches!(
+        second_failure.reason,
+        SftpUrlConnectionFailureReason::RemoteRootPreparationFailed(failure)
+            if failure.kind == SftpUrlConnectionRemoteRootFailureKind::MissingInDryRun
+    ));
 }
 
 #[test]
@@ -273,7 +318,7 @@ fn normal_run_treats_remote_root_creation_failure_as_url_failure() {
         .establish_sftp_url(request(
             server.port,
             "cannot-create\0remote-root",
-            home.path,
+            home.path.clone(),
             SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
             Some("secret"),
             None,
@@ -298,7 +343,7 @@ fn untrusted_host_key_rejects_the_sftp_url() {
         .establish_sftp_url(request(
             server.port,
             "/host-key",
-            home.path,
+            home.path.clone(),
             SftpUrlConnectionKnownHosts::Contents(String::new()),
             Some("secret"),
             None,
@@ -324,7 +369,7 @@ fn authentication_attempts_follow_the_required_fallback_order() {
         .establish_sftp_url(request(
             server.port,
             "/auth-order",
-            home.path,
+            home.path.clone(),
             SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
             Some("wrong"),
             None,
@@ -374,7 +419,7 @@ fn authentication_attempts_follow_the_required_fallback_order() {
 }
 
 #[test]
-fn ed25519_identity_succeeds_after_inline_password_rejection_and_absent_agent() {
+fn ed25519_identity_succeeds_without_inline_password_or_agent() {
     let home = TempHome::new("ed25519-fallback");
     home.copy_ed25519_identity_from_plan();
     let public_key = workspace_root()
@@ -393,14 +438,14 @@ fn ed25519_identity_succeeds_after_inline_password_rejection_and_absent_agent() 
         .establish_sftp_url(request(
             server.port,
             "/key-auth",
-            home.path,
+            home.path.clone(),
             SftpUrlConnectionKnownHosts::Contents(server.known_hosts_contents()),
-            Some("wrong"),
+            None,
             None,
             9,
             SftpUrlConnectionRunMode::Normal,
         ))
-        .expect("Ed25519 identity should be used after earlier sources fail");
+        .expect("Ed25519 identity should be used when earlier sources are absent");
 
     assert_eq!(
         established.connection.authenticated_with,

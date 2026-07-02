@@ -59,6 +59,95 @@ fn timeout_and_idle_settings_do_not_change_file_url_establishment() {
 }
 
 #[test]
+fn dry_run_accepts_existing_peer_root_directory() {
+    let subject = new();
+    let test_dir = fresh_test_dir("dry_run_accepts_existing_peer_root_directory");
+    let peer_root = test_dir.join("peer-root");
+    fs::create_dir_all(&peer_root).expect("test setup should create the peer root");
+
+    let handle = subject
+        .establish_file_url(request(
+            peer_root.clone(),
+            FileUrlConnectionRunMode::DryRun,
+            17,
+            29,
+        ))
+        .expect("dry-run should accept an existing peer root directory");
+
+    assert_eq!(handle.local_peer_root_path, peer_root);
+    assert!(peer_root.is_dir());
+
+    remove_test_dir(&test_dir);
+}
+
+#[test]
+fn dry_run_reports_missing_peer_root_without_creating_directories() {
+    let subject = new();
+    let test_dir =
+        fresh_test_dir("dry_run_reports_missing_peer_root_without_creating_directories");
+    let missing_parent = test_dir.join("missing-parent");
+    let peer_root = missing_parent.join("peer-root");
+
+    let failure = subject
+        .establish_file_url(request(
+            peer_root.clone(),
+            FileUrlConnectionRunMode::DryRun,
+            31,
+            37,
+        ))
+        .expect_err("dry-run should fail when the peer root does not already exist");
+
+    assert_eq!(failure.local_peer_root_path, peer_root);
+    assert_eq!(
+        failure.reason,
+        FileUrlConnectionFailureReason::MissingDirectoryInDryRun
+    );
+    assert!(
+        !failure.detail.is_empty(),
+        "URL failure should preserve implementation detail for reporting"
+    );
+    assert!(
+        !missing_parent.exists(),
+        "dry-run must not create a missing peer root parent"
+    );
+    assert!(
+        !failure.local_peer_root_path.exists(),
+        "dry-run must not create a missing peer root"
+    );
+
+    remove_test_dir(&test_dir);
+}
+
+#[test]
+fn dry_run_reports_existing_non_directory_peer_root() {
+    let subject = new();
+    let test_dir = fresh_test_dir("dry_run_reports_existing_non_directory_peer_root");
+    let peer_root = test_dir.join("peer-root");
+    fs::write(&peer_root, b"not a directory").expect("test setup should create a file");
+
+    let failure = subject
+        .establish_file_url(request(
+            peer_root.clone(),
+            FileUrlConnectionRunMode::DryRun,
+            41,
+            43,
+        ))
+        .expect_err("dry-run should fail when the peer root is not a directory");
+
+    assert_eq!(failure.local_peer_root_path, peer_root);
+    assert_eq!(
+        failure.reason,
+        FileUrlConnectionFailureReason::PathIsNotDirectory
+    );
+    assert!(
+        !failure.detail.is_empty(),
+        "URL failure should preserve implementation detail for reporting"
+    );
+
+    remove_test_dir(&test_dir);
+}
+
+#[test]
 fn normal_run_reports_failed_url_when_parent_blocks_directory_creation() {
     let subject = new();
     let test_dir =

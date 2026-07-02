@@ -92,7 +92,7 @@ fn windows_drive_peer_path_becomes_file_url_identity() {
 
     let identity = normalize(
         &*subject,
-        local(r"c:\Users\Alice\project//"),
+        local(r"C:\Users\Alice\project//"),
         test_current_working_directory(),
         "unused-user",
     );

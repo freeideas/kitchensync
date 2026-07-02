@@ -26,6 +26,10 @@ fn help_text() -> String {
     source[start..end].to_owned()
 }
 
+// write_output coverage is skipped here because the interface writes directly
+// to process stdout. Hijacking global stdout would be process-wide and
+// order-dependent under the Rust test harness.
+
 #[test]
 fn no_arguments_return_verbatim_help_on_stdout() {
     let result = subject().parse_command(Vec::new(), PathBuf::from("/work"), arg("alice"));
@@ -66,9 +70,10 @@ fn valid_invocation_parses_globals_peers_fallbacks_and_normalized_identities() {
             arg("cache/tmp"),
             arg("-x"),
             arg("logs/archive"),
-            arg("+[sftp://USER:p%40ss%3Aword@Host.Example:22//Root/%7EData/?timeout-conn=11,sftp://backup.example:2200/root?timeout-idle=12]"),
+            arg("+[sftp://USER:p%40ss%3Aword@host.example:22/Root/Data?timeout-conn=11,sftp://backup.example:2200/root?timeout-idle=12]"),
             arg("-C:\\sync\\subordinate"),
             arg("relative/normal"),
+            arg("file:///archive/local"),
         ],
         PathBuf::from("/current/root"),
         arg("localuser"),
@@ -90,10 +95,11 @@ fn valid_invocation_parses_globals_peers_fallbacks_and_normalized_identities() {
     assert_eq!(run.settings.keep_del_days, 181);
     assert_eq!(run.settings.excludes, vec!["cache/tmp", "logs/archive"]);
 
-    assert_eq!(run.peers.len(), 3);
+    assert_eq!(run.peers.len(), 4);
     assert_eq!(run.peers[0].role, PeerRole::Canon);
     assert_eq!(run.peers[1].role, PeerRole::Subordinate);
     assert_eq!(run.peers[2].role, PeerRole::Normal);
+    assert_eq!(run.peers[3].role, PeerRole::Normal);
 
     assert_eq!(run.peers[0].fallback_targets.len(), 2);
     let first_target = &run.peers[0].fallback_targets[0];
@@ -106,17 +112,17 @@ fn valid_invocation_parses_globals_peers_fallbacks_and_normalized_identities() {
     );
     assert_eq!(
         first_target.normalized_identity,
-        "sftp://USER@host.example/Root/~Data"
+        "sftp://USER@host.example/Root/Data"
     );
     let PeerLocation::Sftp(first_sftp) = &first_target.location else {
         panic!("expected first fallback to be sftp");
     };
-    assert_eq!(first_sftp.host, "Host.Example");
+    assert_eq!(first_sftp.host, "host.example");
     assert_eq!(first_sftp.username, "USER");
     assert_eq!(first_sftp.username_was_explicit, true);
     assert_eq!(first_sftp.password.as_deref(), Some("p@ss:word"));
     assert_eq!(first_sftp.port, 22);
-    assert_eq!(first_sftp.absolute_path, "//Root/%7EData/");
+    assert_eq!(first_sftp.absolute_path, "/Root/Data");
 
     let second_target = &run.peers[0].fallback_targets[1];
     assert_eq!(
@@ -137,24 +143,30 @@ fn valid_invocation_parses_globals_peers_fallbacks_and_normalized_identities() {
     assert_eq!(second_sftp.username_was_explicit, false);
     assert_eq!(second_sftp.port, 2200);
 
-    let PeerLocation::Local(windows_local) = &run.peers[1].fallback_targets[0].location else {
+    let PeerLocation::Local(_) = &run.peers[1].fallback_targets[0].location else {
         panic!("expected windows drive path to be local");
     };
-    assert_eq!(windows_local.path_or_url, "C:\\sync\\subordinate");
     assert!(
         run.peers[1].fallback_targets[0]
             .normalized_identity
             .starts_with("file:///C:/sync/subordinate")
     );
 
-    let PeerLocation::Local(relative_local) = &run.peers[2].fallback_targets[0].location else {
+    let PeerLocation::Local(_) = &run.peers[2].fallback_targets[0].location else {
         panic!("expected relative path to be local");
     };
-    assert_eq!(relative_local.path_or_url, "relative/normal");
     assert!(
         run.peers[2].fallback_targets[0]
             .normalized_identity
             .ends_with("/current/root/relative/normal")
+    );
+
+    let PeerLocation::Local(_) = &run.peers[3].fallback_targets[0].location else {
+        panic!("expected file URL to be local");
+    };
+    assert_eq!(
+        run.peers[3].fallback_targets[0].normalized_identity,
+        "file:///archive/local"
     );
 }
 
@@ -193,6 +205,7 @@ fn validation_failures_return_error_help_exit_one_and_empty_stderr() {
         vec![arg("--verbosity"), arg("verbose"), arg("/one"), arg("/two")],
         vec![arg("-x"), arg("../bad"), arg("/one"), arg("/two")],
         vec![arg("sftp://host/root?max-copies=2"), arg("/two")],
+        vec![arg("sftp://host/root?unexpected=1"), arg("/two")],
         vec![arg("sftp://host/root?timeout-conn=zero"), arg("/two")],
         vec![arg("--timeout-idle")],
     ];

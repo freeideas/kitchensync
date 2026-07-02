@@ -80,6 +80,10 @@ fn parses_peer_roles_and_rejects_more_than_one_canon_peer() {
     assert_eq!(peers[1].role, PeerArgumentPeerRole::Subordinate);
     assert_eq!(peers[2].role, PeerArgumentPeerRole::Subordinate);
     assert_eq!(peers[3].role, PeerArgumentPeerRole::Normal);
+    assert_local_target(only_target(&peers[0]), "canon");
+    assert_local_target(only_target(&peers[1]), "subordinate-a");
+    assert_local_target(only_target(&peers[2]), "subordinate-b");
+    assert_local_target(only_target(&peers[3]), "normal");
 
     assert_validation_failure(
         &["+first", "+second"],
@@ -222,6 +226,14 @@ fn rejects_unsupported_url_query_parameters() {
     assert_validation_failure(
         &["sftp://host/a?other=2", "local"],
         PeerArgumentValidationReason::UnsupportedQueryParameter,
+    );
+}
+
+#[test]
+fn rejects_unsupported_peer_url_forms() {
+    assert_validation_failure(
+        &["https://host/path", "local"],
+        PeerArgumentValidationReason::UnsupportedPeerUrlForm,
     );
 }
 

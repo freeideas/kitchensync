@@ -16,6 +16,10 @@ fn parse(args: Vec<String>) -> GlobalArgumentParseResult {
     subject().parse_global_arguments(args, help_text())
 }
 
+fn parse_with_help(args: Vec<String>, help_text: &str) -> GlobalArgumentParseResult {
+    subject().parse_global_arguments(args, help_text.to_owned())
+}
+
 fn help_text() -> String {
     let source = include_str!("../../../../../../specs/help.md");
     let start = source.find("```\n").expect("help fence starts") + 4;
@@ -46,14 +50,29 @@ fn assert_validation_failure(args: Vec<String>) {
 
 #[test]
 fn no_arguments_return_verbatim_help_stdout_exit_zero_and_empty_stderr() {
-    let result = parse(Vec::new());
+    let supplied_help = "caller supplied help text\n";
+    let result = parse_with_help(Vec::new(), supplied_help);
     let GlobalArgumentParseResult::Help(output) = result else {
         panic!("expected help result");
     };
 
-    assert_eq!(output.stdout, help_text());
+    assert_eq!(output.stdout, supplied_help);
     assert_eq!(output.stderr, "");
     assert_eq!(output.exit_code, 0);
+}
+
+#[test]
+fn validation_failures_append_verbatim_supplied_help_stdout_exit_one_and_empty_stderr() {
+    let supplied_help = "caller supplied validation help text\n";
+    let result = parse_with_help(vec![arg("--unknown")], supplied_help);
+    let GlobalArgumentParseResult::ValidationFailure(output) = result else {
+        panic!("expected validation failure");
+    };
+
+    assert!(output.stdout.ends_with(supplied_help));
+    assert_ne!(output.stdout, supplied_help);
+    assert_eq!(output.stderr, "");
+    assert_eq!(output.exit_code, 1);
 }
 
 #[test]
@@ -141,6 +160,14 @@ fn global_options_are_only_consumed_before_peer_operands() {
             arg("after/peer"),
         ]
     );
+}
+
+#[test]
+fn global_parser_does_not_validate_peer_operand_count() {
+    let (settings, peer_operands) = run_request(vec![arg("--dry-run")]);
+
+    assert_eq!(settings.dry_run, true);
+    assert_eq!(peer_operands, Vec::<String>::new());
 }
 
 #[test]

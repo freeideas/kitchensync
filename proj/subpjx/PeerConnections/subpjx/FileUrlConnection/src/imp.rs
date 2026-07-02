@@ -30,7 +30,12 @@ fn establish_normal(
             FileUrlConnectionFailureReason::PathIsNotDirectory,
             "path exists but is not a directory",
         )),
-        Err(error) if error.kind() == ErrorKind::NotFound => create_missing_directory(request),
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                || error.kind() == ErrorKind::NotADirectory =>
+        {
+            create_missing_directory(request)
+        }
         Err(error) => {
             let detail = format!("directory status unavailable: {}", error);
             Err(failure(

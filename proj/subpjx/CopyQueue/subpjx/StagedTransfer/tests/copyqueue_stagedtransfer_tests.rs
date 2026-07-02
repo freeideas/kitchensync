@@ -269,19 +269,180 @@ fn recovery_failure_stops_before_any_replacement_write() {
 }
 
 #[test]
+fn source_read_failure_reports_read_source_and_leaves_no_swap_new() {
+    let subject = new();
+    let ops = MemoryPeerOps::new();
+    let recovery = RecordingRecovery::new(&ops);
+    let timestamps = FixedTimestamps::new(&ops, vec!["unused"]);
+    let request = request("missing-source.txt", "target.txt", 6, 0);
+
+    let outcome =
+        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+
+    match outcome {
+        StagedTransferTryOutcome::Failure(failure) => {
+            assert_eq!(
+                failure.phase,
+                copyqueue_stagedtransfer::StagedTransferFailurePhase::ReadSource
+            );
+            assert_eq!(failure.swap_old_state, StagedTransferSwapOldState::NotCreated);
+        }
+        other => panic!("expected read-source failure, got {other:?}"),
+    }
+    assert_eq!(ops.bytes(&request.destination_peer, "target.txt"), None);
+    assert_eq!(
+        ops.bytes(&request.destination_peer, ".kitchensync/SWAP/target.txt/new"),
+        None
+    );
+}
+
+#[test]
+fn swap_new_write_failure_reports_write_swap_new_before_replacement() {
+    let subject = new();
+    let ops = MemoryPeerOps::new();
+    let recovery = RecordingRecovery::new(&ops);
+    let timestamps = FixedTimestamps::new(&ops, vec!["unused"]);
+    let request = request("source.txt", "target.txt", 7, 0);
+
+    ops.put(&request.source_peer, "source.txt", b"replacement");
+    ops.fail_create_new(".kitchensync/SWAP/target.txt/new");
+
+    let outcome =
+        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+
+    match outcome {
+        StagedTransferTryOutcome::Failure(failure) => {
+            assert_eq!(
+                failure.phase,
+                copyqueue_stagedtransfer::StagedTransferFailurePhase::WriteSwapNew
+            );
+            assert_eq!(failure.swap_old_state, StagedTransferSwapOldState::NotCreated);
+        }
+        other => panic!("expected write-swap-new failure, got {other:?}"),
+    }
+    assert_eq!(ops.bytes(&request.destination_peer, "target.txt"), None);
+}
+
+#[test]
+fn modification_time_failure_reports_set_mod_time_without_undoing_replacement() {
+    let subject = new();
+    let ops = MemoryPeerOps::new();
+    let recovery = RecordingRecovery::new(&ops);
+    let timestamps = FixedTimestamps::new(&ops, vec!["unused"]);
+    let request = request("source.txt", "target.txt", 8, 0);
+
+    ops.put(&request.source_peer, "source.txt", b"replacement");
+    ops.fail_set_modification_time("target.txt");
+
+    let outcome =
+        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+
+    match outcome {
+        StagedTransferTryOutcome::Failure(failure) => {
+            assert_eq!(
+                failure.phase,
+                copyqueue_stagedtransfer::StagedTransferFailurePhase::SetModTime
+            );
+            assert_eq!(failure.swap_old_state, StagedTransferSwapOldState::NotCreated);
+        }
+        other => panic!("expected set-mod-time failure, got {other:?}"),
+    }
+    assert_eq!(
+        ops.bytes(&request.destination_peer, "target.txt"),
+        Some(b"replacement".to_vec())
+    );
+}
+
+#[test]
+fn archive_failure_reports_archive_old_and_leaves_swap_old_for_recovery() {
+    let subject = new();
+    let ops = MemoryPeerOps::new();
+    let recovery = RecordingRecovery::new(&ops);
+    let timestamps = FixedTimestamps::new(&ops, vec!["2026-07-02T10-41-00Z"]);
+    let request = request("source.txt", "target.txt", 9, 0);
+
+    ops.put(&request.source_peer, "source.txt", b"replacement");
+    ops.put(&request.destination_peer, "target.txt", b"original");
+    ops.fail_rename(
+        ".kitchensync/SWAP/target.txt/old",
+        ".kitchensync/BAK/2026-07-02T10-41-00Z/target.txt",
+    );
+
+    let outcome =
+        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+
+    match outcome {
+        StagedTransferTryOutcome::Failure(failure) => {
+            assert_eq!(
+                failure.phase,
+                copyqueue_stagedtransfer::StagedTransferFailurePhase::ArchiveOld
+            );
+            assert_eq!(failure.swap_old_state, StagedTransferSwapOldState::Created);
+        }
+        other => panic!("expected archive-old failure, got {other:?}"),
+    }
+    assert_eq!(
+        ops.bytes(&request.destination_peer, "target.txt"),
+        Some(b"replacement".to_vec())
+    );
+    assert_eq!(
+        ops.bytes(&request.destination_peer, ".kitchensync/SWAP/target.txt/old"),
+        Some(b"original".to_vec())
+    );
+}
+
+#[test]
+fn cleanup_failure_reports_cleanup_after_replacement_and_archive_work_succeeded() {
+    let subject = new();
+    let ops = MemoryPeerOps::new();
+    let recovery = RecordingRecovery::new(&ops);
+    let timestamps = FixedTimestamps::new(&ops, vec!["2026-07-02T10-41-01Z"]);
+    let request = request("source.txt", "target.txt", 10, 0);
+
+    ops.put(&request.source_peer, "source.txt", b"replacement");
+    ops.put(&request.destination_peer, "target.txt", b"original");
+    ops.fail_remove_empty_directory(".kitchensync/SWAP/target.txt");
+
+    let outcome =
+        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+
+    match outcome {
+        StagedTransferTryOutcome::Failure(failure) => {
+            assert_eq!(
+                failure.phase,
+                copyqueue_stagedtransfer::StagedTransferFailurePhase::Cleanup
+            );
+            assert_eq!(failure.swap_old_state, StagedTransferSwapOldState::Created);
+        }
+        other => panic!("expected cleanup failure, got {other:?}"),
+    }
+    assert_eq!(
+        ops.bytes(&request.destination_peer, "target.txt"),
+        Some(b"replacement".to_vec())
+    );
+    assert_eq!(
+        ops.bytes(
+            &request.destination_peer,
+            ".kitchensync/BAK/2026-07-02T10-41-01Z/target.txt"
+        ),
+        Some(b"original".to_vec())
+    );
+}
+
+#[test]
 fn destination_writing_starts_before_the_source_is_fully_read() {
     let subject = new();
     let ops = MemoryPeerOps::new();
     let recovery = RecordingRecovery::new(&ops);
     let timestamps = FixedTimestamps::new(&ops, vec!["unused"]);
-    let request = request("large.bin", "large-copy.bin", 6, 131_072);
-    let small_request = request("small.bin", "small-copy.bin", 7, 1);
+    let large_request = request("large.bin", "large-copy.bin", 11, 131_072);
+    let small_request = request("small.bin", "small-copy.bin", 12, 1);
 
-    ops.put(&request.source_peer, "large.bin", &vec![b'x'; 131_072]);
+    ops.put(&large_request.source_peer, "large.bin", &vec![b'x'; 131_072]);
     ops.put(&small_request.source_peer, "small.bin", b"x");
 
     let outcome =
-        subject.run_transfer_try(request.clone(), &ops, &recovery, &timestamps);
+        subject.run_transfer_try(large_request.clone(), &ops, &recovery, &timestamps);
     let small_outcome =
         subject.run_transfer_try(small_request.clone(), &ops, &recovery, &timestamps);
 
@@ -298,7 +459,7 @@ fn destination_writing_starts_before_the_source_is_fully_read() {
         "destination SWAP new must receive bytes before source EOF"
     );
     assert_eq!(
-        ops.max_read_buffer_len(&request.source_peer, "large.bin"),
+        ops.max_read_buffer_len(&large_request.source_peer, "large.bin"),
         ops.max_read_buffer_len(&small_request.source_peer, "small.bin"),
         "read buffer capacity must be independent of copied file size"
     );
@@ -404,6 +565,9 @@ struct MemoryState {
     directories: Vec<(String, String)>,
     events: Vec<String>,
     failing_renames: Vec<(String, String)>,
+    failing_creates: Vec<String>,
+    failing_modification_times: Vec<String>,
+    failing_remove_directories: Vec<String>,
     read_buffer_lengths: Vec<(String, String, usize)>,
 }
 
@@ -465,6 +629,30 @@ impl MemoryPeerOps {
         ));
     }
 
+    fn fail_create_new(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_creates
+            .push(path.to_string());
+    }
+
+    fn fail_set_modification_time(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_modification_times
+            .push(path.to_string());
+    }
+
+    fn fail_remove_empty_directory(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_remove_directories
+            .push(path.to_string());
+    }
+
     fn events(&self) -> Vec<String> {
         self.state.lock().unwrap().events.clone()
     }
@@ -520,6 +708,9 @@ impl StagedTransferFileOperations for MemoryPeerOps {
     ) -> Result<Box<dyn Write + Send>, StagedTransferOperationError> {
         let mut state = self.state.lock().unwrap();
         state.events.push(format!("create_new:{}:{path}", peer.id));
+        if state.failing_creates.iter().any(|failing| failing == path) {
+            return Err(operation_error("create failed"));
+        }
         let key = (peer.id.clone(), path.to_string());
         if state.files.contains_key(&key) {
             return Err(operation_error("destination already exists"));
@@ -591,6 +782,13 @@ impl StagedTransferFileOperations for MemoryPeerOps {
     ) -> Result<(), StagedTransferOperationError> {
         let mut state = self.state.lock().unwrap();
         state.events.push(format!("rmdir:{}:{path}", peer.id));
+        if state
+            .failing_remove_directories
+            .iter()
+            .any(|failing| failing == path)
+        {
+            return Err(operation_error("cleanup failed"));
+        }
         Ok(())
     }
 
@@ -602,6 +800,13 @@ impl StagedTransferFileOperations for MemoryPeerOps {
     ) -> Result<(), StagedTransferOperationError> {
         let mut state = self.state.lock().unwrap();
         state.events.push(format!("mtime:{}:{path}", peer.id));
+        if state
+            .failing_modification_times
+            .iter()
+            .any(|failing| failing == path)
+        {
+            return Err(operation_error("mtime failed"));
+        }
         state.modification_times.insert(
             (peer.id.clone(), path.to_string()),
             modification_time,
