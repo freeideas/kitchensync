@@ -27,7 +27,6 @@ struct RunRecord {
 struct PeerRecord {
     peer: SnapshotPeerHandle,
     database: Option<DatabaseHandle>,
-    local_snapshot_path: PathBuf,
 }
 
 impl SnapshotStoreImpl {
@@ -107,6 +106,8 @@ impl SnapshotStoreImpl {
         mod_time: String,
         byte_size: i64,
     ) -> Result<snapshotstore_snapshotdatabase::SnapshotRowFacts, SnapshotStoreError> {
+        validate_timestamp(&mod_time)?;
+
         Ok(snapshotstore_snapshotdatabase::SnapshotRowFacts {
             identity: self.row_identity(relative_path)?,
             mod_time,
@@ -233,7 +234,6 @@ impl SnapshotStore for SnapshotStoreImpl {
                         PeerRecord {
                             peer,
                             database: Some(database),
-                            local_snapshot_path,
                         },
                     );
                 }
@@ -305,7 +305,7 @@ impl SnapshotStore for SnapshotStoreImpl {
         entry: SnapshotObservedEntry,
     ) -> Result<String, SnapshotStoreError> {
         let byte_size = match entry.entry_kind {
-            SnapshotEntryKind::File { byte_size } => byte_size as i64,
+            SnapshotEntryKind::File { byte_size } => file_size_to_i64(byte_size)?,
             SnapshotEntryKind::Directory => -1,
         };
         let facts = self.row_facts(&entry.relative_path, entry.mod_time, byte_size)?;
@@ -340,7 +340,7 @@ impl SnapshotStore for SnapshotStoreImpl {
         let facts = self.row_facts(
             &copy.destination_relative_path,
             copy.winning_mod_time,
-            copy.winning_byte_size as i64,
+            file_size_to_i64(copy.winning_byte_size)?,
         )?;
         self.with_peer(run_id, &copy.destination_peer_identity, |database| {
             self.snapshotdatabase
@@ -372,6 +372,8 @@ impl SnapshotStore for SnapshotStoreImpl {
         relative_path: &str,
         mod_time: String,
     ) -> Result<String, SnapshotStoreError> {
+        validate_timestamp(&mod_time)?;
+
         let identity = self.row_identity(relative_path)?;
         let last_seen = self.generate_timestamp()?;
         self.with_peer(run_id, peer_identity, |database| {
@@ -576,6 +578,73 @@ fn identity_error(error: snapshotstore_snapshotidentity::SnapshotIdentityError) 
 
 fn database_error(error: snapshotstore_snapshotdatabase::SnapshotDatabaseError) -> SnapshotStoreError {
     SnapshotStoreError::Database(error.message)
+}
+
+fn file_size_to_i64(byte_size: u64) -> Result<i64, SnapshotStoreError> {
+    i64::try_from(byte_size)
+        .map_err(|_| SnapshotStoreError::Database("file size exceeds SQLite INTEGER range".to_string()))
+}
+
+fn validate_timestamp(timestamp: &str) -> Result<(), SnapshotStoreError> {
+    let bytes = timestamp.as_bytes();
+    let structurally_valid = bytes.len() == 27
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'_'
+        && bytes[13] == b'-'
+        && bytes[16] == b'-'
+        && bytes[19] == b'_'
+        && bytes[26] == b'Z'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
+        && bytes[20..26].iter().all(u8::is_ascii_digit);
+
+    if !structurally_valid {
+        return Err(SnapshotStoreError::InvalidTimestamp(timestamp.to_string()));
+    }
+
+    let year = parse_digits(&bytes[..4]);
+    let month = parse_digits(&bytes[5..7]);
+    let day = parse_digits(&bytes[8..10]);
+    let hour = parse_digits(&bytes[11..13]);
+    let minute = parse_digits(&bytes[14..16]);
+    let second = parse_digits(&bytes[17..19]);
+
+    if year >= 1
+        && (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
+    {
+        Ok(())
+    } else {
+        Err(SnapshotStoreError::InvalidTimestamp(timestamp.to_string()))
+    }
+}
+
+fn parse_digits(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0, |value, byte| value * 10 + u32::from(byte - b'0'))
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 fn startup_diagnostic(
