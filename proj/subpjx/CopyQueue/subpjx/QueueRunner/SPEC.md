@@ -18,7 +18,8 @@ QueueRunner exposes a run operation configured with:
 
 - a maximum active copy count, defaulting to `10` when the caller did not
   supply `--max-copies`;
-- a maximum total try count for each queued copy from `--retries-copy`;
+- a maximum total try count for each queued copy, defaulting to `3` when the
+  caller did not supply `--retries-copy`;
 - a staged-transfer operation that performs one copy try;
 - an event sink for copy start, copy-slot acquire, copy-slot release, transfer
   success, transfer skip, and transfer failure events.
