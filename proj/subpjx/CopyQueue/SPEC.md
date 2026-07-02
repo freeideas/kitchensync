@@ -21,6 +21,9 @@ active copy count, the maximum total tries per queued copy, connected peer
 handles, a dry-run mutation policy, and an event sink for structured copy
 events. If the caller does not supply a maximum active copy count, the queue
 uses `10`. If the caller supplies `--max-copies N`, the queue uses `N`.
+If the caller does not supply a maximum total copy try count, the queue uses
+`3`. If the caller supplies `--retries-copy N`, the queue allows at most `N`
+total tries for each queued copy, including the first try.
 
 CopyQueue exposes an enqueue operation that can be called while traversal is
 still running. Enqueueing a copy makes it eligible for workers immediately when
@@ -63,24 +66,19 @@ one path segment on every supported transport. For target
 - SWAP old:
   `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old`
 
-Before writing replacement content for that target, CopyQueue recovers any
-existing SWAP directory for the encoded basename, or treats recovery failure as
-a failed copy try before SWAP old exists.
-
 Each normal transfer follows this order:
 
 1. Acquire one global copy slot.
-2. Recover or fail the destination SWAP directory for the encoded basename.
-3. Stream source file content into SWAP `new`.
-4. If the destination has an existing file at the final target path, rename
+2. Stream source file content into SWAP `new`.
+3. If the destination has an existing file at the final target path, rename
    that file to SWAP `old`.
-5. Rename SWAP `new` into the final target path.
-6. Set the final destination file modification time to the winning
+4. Rename SWAP `new` into the final target path.
+5. Set the final destination file modification time to the winning
    modification time from the sync decision.
-7. If SWAP `old` exists, archive it to
+6. If SWAP `old` exists, archive it to
    `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`.
-8. Remove the empty SWAP directories for that transfer.
-9. Release the global copy slot.
+7. Remove the empty SWAP directories for that transfer.
+8. Release the global copy slot.
 
 A destination that had no existing file creates no BAK entry for that
 destination path. A local-to-local copy may use a native filesystem copy
@@ -142,10 +140,17 @@ uses the transport child for stat, streaming read, streaming write, rename,
 delete, directory creation, empty-directory deletion, and modification-time
 operations.
 
+CopyQueue does not decide dry-run semantics. It uses the dry-run policy child
+to decide whether queued copy work should acquire slots and read source files,
+and whether destination-side writes, renames, deletes, directory creation, and
+modification-time updates must be skipped before calling transport operations.
+
 CopyQueue does not own traversal-wide SWAP recovery, snapshot SWAP recovery,
-BAK/TMP cleanup, or inline displacement of entries selected for deletion or
-type-conflict removal. It uses the staging recovery child for destination
-SWAP recovery and nearby BAK archive mechanics needed by a queued replacement.
+BAK/TMP cleanup, pre-transfer recovery of an existing destination SWAP
+directory, or inline displacement of entries selected for deletion or
+type-conflict removal. Those peer states must be recovered or failed by the
+staging recovery child before CopyQueue writes a replacement for that encoded
+basename.
 
 CopyQueue does not update snapshot rows. On transfer success or installed-file
 failure states, it returns structured results so the caller can apply the

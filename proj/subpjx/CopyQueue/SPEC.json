@@ -1,16 +1,13 @@
 {
+  "shared": false,
+  "entry": false,
+  "interface": "src/api.rs",
+  "wiring": "per-dependent",
   "deps": [
     ":transportoperations",
     ":snapshotstore",
-    ":stagingrecovery"
-  ],
-  "entry": false,
-  "interface": "src/api.rs",
-  "packages": [
-    {
-      "name": "percent-encoding",
-      "version": "2.3.1"
-    }
+    ":stagingrecovery",
+    ":dryrunpolicy"
   ],
   "reqs": [
     "016.1",
@@ -48,12 +45,17 @@
     "016.33",
     "016.34",
     "016.35",
+    "016.36",
+    "016.37",
     "017.1",
     "017.2",
     "017.3",
-    "017.4",
-    "017.5"
+    "017.4"
   ],
-  "shared": false,
-  "wiring": "per-dependent"
+  "packages": [
+    {
+      "name": "percent-encoding",
+      "version": "2.3.1"
+    }
+  ]
 }
