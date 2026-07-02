@@ -717,8 +717,6 @@ fn sftp_authentication_continues_from_rejected_inline_password_to_ed25519_key() 
     let server = start_sftp_server(&[
         "--user".to_string(),
         "alice".to_string(),
-        "--password".to_string(),
-        "correct-password".to_string(),
         "--authorized-key".to_string(),
         public_key.to_string_lossy().into_owned(),
         "--host-key".to_string(),
