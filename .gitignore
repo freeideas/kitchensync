@@ -1,14 +1,14 @@
-# aitc machine state
+# The old aitc framework checkout also lives here; ignore it like aisf.
 /aitc/
-/aitc.old/
-/aitc.db
-# aisf is its own nested repo
+# The aisf framework is its own nested repo; the workspace repo ignores it
+# entirely so the two never entangle.
 /aisf/
-# The whole /state/ tree is machine-local EXCEPT settled.db -- the one durable,
-# portable file (freshness baselines + verified pass-state), carried across
-# push/pull so a fresh machine knows the work is settled and skips it. Its WAL
-# sidecars (settled.db-wal/-shm) stay ignored under the broad /state/* rule;
-# push-project.py checkpoints the WAL into the main file before staging.
+# The whole /state/ tree is machine-local EXCEPT settled.db -- the one
+# durable, portable file (freshness baselines, verified pass-state, and the
+# scenario ledger), carried across push/pull so a fresh machine knows the
+# settled work is settled and skips it. Its WAL sidecars (settled.db-wal/-shm)
+# stay ignored under the broad /state/* rule; the pre-commit hook installed by
+# init-git.py checkpoints the WAL into the main file before staging.
 # Use /state/* (ignore the directory's contents), not /state/ (ignore the
 # directory itself): git cannot re-include a file under an excluded directory,
 # so /state/ + !/state/settled.db would silently drop settled.db.
@@ -16,7 +16,6 @@
 !/state/settled.db
 /tools/
 /reports/
-/babysit-reports/
 /babysit-loop.out
 /tmp/
 /STOP.flag
@@ -74,14 +73,11 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Java / JVM (Gradle)
+# Java / JVM
 *.class
 *.jar
 *.war
 *.ear
-build/
-.gradle/
-.kotlin/
 
 # IDE and OS files
 .idea/

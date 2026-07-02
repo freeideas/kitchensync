@@ -1,9 +1,0 @@
-[package]
-name = "treesyncplanner_treetraversal_excludedpathfilter"
-version = "0.0.0"
-edition = "2021"
-
-[lib]
-path = "src/lib.rs"
-
-[dependencies]
