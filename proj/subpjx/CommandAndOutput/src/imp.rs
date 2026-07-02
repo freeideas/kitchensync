@@ -164,8 +164,7 @@ impl CommandAndOutput for CommandAndOutputImpl {
                     .report_copy_slots(verbosity, active, max)
             }
             OutputEvent::Completion => {
-                self.stdoutreporter
-                    .report_completion(verbosity, "sync complete".to_owned())
+                self.stdoutreporter.report_completion(verbosity)
             }
         }
     }
