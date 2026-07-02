@@ -144,8 +144,9 @@ be able to proceed without waiting for cleanup to finish in the current run.
 
 After all enqueued file copies have completed in a normal run, SnapshotStore
 uploads each updated local temporary snapshot back to its peer through snapshot
-SWAP staging. Before upload, it commits or rolls back every transaction,
-finalizes every statement, cursor, and reader, and closes every SQLite
+SWAP staging, including updated snapshots for subordinate peers. Before upload,
+it commits or rolls back every transaction, finalizes every statement, cursor,
+and reader, and closes every SQLite
 connection to that local `snapshot.db`. The transport upload reads the closed
 local file, not a live SQLite connection, and the peer receives only
 `snapshot.db`, not SQLite sidecar files. The uploaded database must be usable
