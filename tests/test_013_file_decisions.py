@@ -6,39 +6,106 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+WORKSPACE = Path("/home/ace/Desktop/prjx/kitchensync")
+KITCHENSYNC = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
 
-WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-PRIMARY_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
-if not PRIMARY_EXE.exists():
-    PRIMARY_EXE = Path(__file__).resolve().parents[1] / "released" / "kitchensync.exe"
+P1 = 11400714785074694791
+P2 = 14029467366897019727
+P3 = 1609587929392839161
+P4 = 9650029242287828579
+P5 = 2870177450012600261
+MASK = (1 << 64) - 1
+BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-BASE_TIME = 1_700_000_000
+
+def rotl(value: int, bits: int) -> int:
+    value &= MASK
+    return ((value << bits) | (value >> (64 - bits))) & MASK
 
 
-@dataclass
-class CheckState:
-    failures: list[str]
+def xxh64(data: bytes, seed: int = 0) -> int:
+    def round64(acc: int, lane: int) -> int:
+        acc = (acc + lane * P2) & MASK
+        acc = rotl(acc, 31)
+        return (acc * P1) & MASK
 
-    def check(self, condition: bool, message: str) -> None:
-        if not condition:
-            self.failures.append(message)
+    def merge(acc: int, lane_acc: int) -> int:
+        acc ^= round64(0, lane_acc)
+        return (acc * P1 + P4) & MASK
+
+    index = 0
+    length = len(data)
+    if length >= 32:
+        v1 = (seed + P1 + P2) & MASK
+        v2 = (seed + P2) & MASK
+        v3 = seed & MASK
+        v4 = (seed - P1) & MASK
+        limit = length - 32
+        while index <= limit:
+            v1 = round64(v1, int.from_bytes(data[index : index + 8], "little"))
+            index += 8
+            v2 = round64(v2, int.from_bytes(data[index : index + 8], "little"))
+            index += 8
+            v3 = round64(v3, int.from_bytes(data[index : index + 8], "little"))
+            index += 8
+            v4 = round64(v4, int.from_bytes(data[index : index + 8], "little"))
+            index += 8
+        h = (rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18)) & MASK
+        h = merge(h, v1)
+        h = merge(h, v2)
+        h = merge(h, v3)
+        h = merge(h, v4)
+    else:
+        h = (seed + P5) & MASK
+
+    h = (h + length) & MASK
+    while index + 8 <= length:
+        lane = int.from_bytes(data[index : index + 8], "little")
+        h ^= round64(0, lane)
+        h = (rotl(h, 27) * P1 + P4) & MASK
+        index += 8
+    if index + 4 <= length:
+        lane = int.from_bytes(data[index : index + 4], "little")
+        h ^= (lane * P1) & MASK
+        h = (rotl(h, 23) * P2 + P3) & MASK
+        index += 4
+    while index < length:
+        h ^= (data[index] * P5) & MASK
+        h = (rotl(h, 11) * P1) & MASK
+        index += 1
+
+    h ^= h >> 33
+    h = (h * P2) & MASK
+    h ^= h >> 29
+    h = (h * P3) & MASK
+    h ^= h >> 32
+    return h & MASK
+
+
+def base62_11(value: int) -> str:
+    chars: list[str] = []
+    for _ in range(11):
+        value, digit = divmod(value, 62)
+        chars.append(BASE62[digit])
+    return "".join(reversed(chars))
+
+
+def path_id(relpath: str) -> str:
+    return base62_11(xxh64(relpath.encode("utf-8")))
 
 
 def ts(seconds: int) -> str:
-    return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
 
 
 def write_file(path: Path, data: bytes, mtime: int) -> None:
@@ -47,243 +114,340 @@ def write_file(path: Path, data: bytes, mtime: int) -> None:
     os.utime(path, (mtime, mtime))
 
 
-def remove_path(path: Path) -> None:
-    if path.is_dir():
-        shutil.rmtree(path)
-    elif path.exists():
-        path.unlink()
-
-
 def read_bytes(path: Path) -> bytes | None:
     if not path.exists():
         return None
     return path.read_bytes()
 
 
-def run_ks(ctx: CheckState, args: list[str], label: str, expect: int | None = 0) -> subprocess.CompletedProcess[str]:
-    try:
-        proc = subprocess.run(
-            [str(PRIMARY_EXE), *args],
-            cwd=str(WORKSPACE_ROOT if WORKSPACE_ROOT.exists() else Path(__file__).resolve().parents[1]),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            shell=False,
+def create_snapshot(peer: Path, rows: list[dict[str, object]]) -> None:
+    meta = peer / ".kitchensync"
+    meta.mkdir(parents=True, exist_ok=True)
+    db_path = meta / "snapshot.db"
+    if db_path.exists():
+        db_path.unlink()
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """
+            CREATE TABLE snapshot (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                basename TEXT NOT NULL,
+                mod_time TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                last_seen TEXT,
+                deleted_time TEXT
+            )
+            """
         )
-    except Exception as exc:  # pragma: no cover - reported as test failure
-        ctx.failures.append(f"{label}: process failed to run: {exc}")
-        return subprocess.CompletedProcess([str(PRIMARY_EXE), *args], 127, "", str(exc))
-    if expect is not None:
-        ctx.check(proc.returncode == expect, f"{label}: expected exit {expect}, got {proc.returncode}; stdout={proc.stdout!r}")
-    ctx.check(proc.stderr == "", f"{label}: stderr should be empty, got {proc.stderr!r}")
-    return proc
+        db.execute("CREATE INDEX idx_snapshot_parent_id ON snapshot(parent_id)")
+        db.execute("CREATE INDEX idx_snapshot_last_seen ON snapshot(last_seen)")
+        db.execute("CREATE INDEX idx_snapshot_deleted_time ON snapshot(deleted_time)")
+        for row in rows:
+            relpath = str(row["path"]).replace("\\", "/").strip("/")
+            parent = relpath.rsplit("/", 1)[0] if "/" in relpath else "/"
+            basename = relpath.rsplit("/", 1)[-1]
+            db.execute(
+                """
+                INSERT INTO snapshot
+                    (id, parent_id, basename, mod_time, byte_size, last_seen, deleted_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    path_id(relpath),
+                    path_id(parent),
+                    basename,
+                    ts(int(row["mod_time"])),
+                    int(row["byte_size"]),
+                    None if row.get("last_seen") is None else ts(int(row["last_seen"])),
+                    None
+                    if row.get("deleted_time") is None
+                    else ts(int(row["deleted_time"])),
+                ),
+            )
+        db.commit()
 
 
-def snapshot_db(peer: Path) -> Path:
-    return peer / ".kitchensync" / "snapshot.db"
+def make_peer(base: Path, name: str, rows: list[dict[str, object]] | None = None) -> Path:
+    peer = base / name
+    peer.mkdir(parents=True, exist_ok=True)
+    if rows is not None:
+        create_snapshot(peer, rows)
+    return peer
 
 
-def update_snapshot(peer: Path, basename: str, **columns: object) -> None:
-    db = snapshot_db(peer)
-    assignments = ", ".join(f"{name} = ?" for name in columns)
-    values = list(columns.values())
-    with sqlite3.connect(str(db)) as conn:
-        cur = conn.execute(f"UPDATE snapshot SET {assignments} WHERE basename = ?", [*values, basename])
-        if cur.rowcount != 1:
-            raise AssertionError(f"expected one snapshot row for {basename!r} in {db}, updated {cur.rowcount}")
+def history_row() -> dict[str, object]:
+    return {
+        "path": "__history__.txt",
+        "mod_time": 1_700_000_000,
+        "byte_size": 1,
+        "last_seen": 1_700_000_100,
+        "deleted_time": None,
+    }
 
 
-def seed(ctx: CheckState, root: Path, names: list[str], files: dict[str, bytes]) -> list[Path]:
-    peers = [root / name for name in names]
-    for peer in peers:
-        peer.mkdir(parents=True, exist_ok=True)
-    write_file(peers[0] / "anchor.txt", b"anchor", BASE_TIME)
-    for name, data in files.items():
-        write_file(peers[0] / name, data, BASE_TIME)
-    run_ks(ctx, ["+" + str(peers[0]), *[str(peer) for peer in peers[1:]]], f"seed {names}", 0)
-    return peers
+def file_row(
+    relpath: str,
+    mod_time: int,
+    byte_size: int,
+    last_seen: int | None = 1_700_000_100,
+    deleted_time: int | None = None,
+) -> dict[str, object]:
+    return {
+        "path": relpath,
+        "mod_time": mod_time,
+        "byte_size": byte_size,
+        "last_seen": last_seen,
+        "deleted_time": deleted_time,
+    }
 
 
-def assert_bak_has(ctx: CheckState, peer: Path, basename: str, label: str) -> None:
+def run_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(KITCHENSYNC), *args],
+        cwd=str(WORKSPACE),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+
+def peer_arg(peer: Path, prefix: str = "") -> str:
+    return prefix + str(peer)
+
+
+def has_bak_entry(peer: Path, basename: str) -> bool:
     bak = peer / ".kitchensync" / "BAK"
-    found = bak.exists() and any(path.name == basename for path in bak.rglob(basename))
-    ctx.check(found, f"{label}: expected displaced {basename!r} under {bak}")
+    return bak.exists() and any(path.name == basename for path in bak.rglob(basename))
 
 
-def startup_errors(ctx: CheckState, root: Path) -> None:
-    first_a = root / "first-a"
-    first_b = root / "first-b"
-    first_a.mkdir()
-    first_b.mkdir()
-    proc = run_ks(ctx, [str(first_a), str(first_b)], "first sync without canon", 1)
-    ctx.check(
-        "First sync? Mark the authoritative peer with a leading +" in proc.stdout,
-        "013.13: first sync without canon should print the required guidance",
-    )
+def check(condition: bool, failures: list[str], message: str) -> None:
+    if not condition:
+        failures.append(message)
 
-    reachable = root / "reachable"
-    reachable.mkdir()
-    missing_canon = root / "missing-canon"
-    run_ks(ctx, ["--dry-run", "+" + str(missing_canon), str(reachable)], "unreachable canon", 1)
 
-    sub_a, sub_b = seed(ctx, root / "no-contrib", ["sub-a", "sub-b"], {})
-    proc = run_ks(ctx, ["-" + str(sub_a), "-" + str(sub_b)], "no contributing peer", 1)
-    ctx.check(
-        "No contributing peer reachable - cannot make sync decisions" in proc.stdout,
-        "013.15: all-subordinate run should print the no-contributing-peer error",
+def expect_success(result: subprocess.CompletedProcess[str], failures: list[str], label: str) -> None:
+    check(result.returncode == 0, failures, f"{label}: expected exit 0, got {result.returncode}")
+    check(result.stderr == "", failures, f"{label}: stderr should be empty, got {result.stderr!r}")
+    check(
+        "sync complete" in result.stdout.splitlines(),
+        failures,
+        f"{label}: stdout should include sync complete, got {result.stdout!r}",
     )
 
 
-def canon_rules(ctx: CheckState, root: Path) -> None:
-    canon, other = seed(ctx, root, ["canon", "other"], {"canon-wins.txt": b"canon", "canon-deletes.txt": b"keep"})
-
-    write_file(other / "canon-wins.txt", b"other-newer-and-larger", BASE_TIME + 100)
-    run_ks(ctx, ["+" + str(canon), str(other)], "canon file wins", 0)
-    ctx.check(read_bytes(other / "canon-wins.txt") == b"canon", "013.9/013.11: canon file should overwrite a newer peer file")
-
-    remove_path(canon / "canon-deletes.txt")
-    write_file(other / "canon-deletes.txt", b"other survives only if canon is ignored", BASE_TIME + 200)
-    run_ks(ctx, ["+" + str(canon), str(other)], "canon deletion wins", 0)
-    ctx.check(not (other / "canon-deletes.txt").exists(), "013.10/013.11: canon absence should delete the peer file")
-    assert_bak_has(ctx, other, "canon-deletes.txt", "013.10")
-
-
-def unchanged_and_subordinate_targets(ctx: CheckState, root: Path) -> None:
-    p1, p2 = seed(ctx, root, ["p1", "p2"], {"same.txt": b"same"})
-    p3 = root / "new-peer"
-    p3.mkdir()
-    proc = run_ks(ctx, [str(p1), str(p2), str(p3)], "matching unchanged files copy to new peer", 0)
-    ctx.check(read_bytes(p3 / "same.txt") == b"same", "013.19/013.21: matching unchanged file should be copied to a peer that lacks it")
-    ctx.check("C same.txt" in proc.stdout, "013.21: missing active peer should cause a copy progress line")
-    ctx.check(read_bytes(p1 / "same.txt") == b"same" and read_bytes(p2 / "same.txt") == b"same", "013.20: matching contributing peers should not be changed")
+def expect_failure(
+    result: subprocess.CompletedProcess[str],
+    failures: list[str],
+    label: str,
+    required_stdout: str | None = None,
+) -> None:
+    check(result.returncode == 1, failures, f"{label}: expected exit 1, got {result.returncode}")
+    check(result.stderr == "", failures, f"{label}: stderr should be empty, got {result.stderr!r}")
+    if required_stdout is not None:
+        check(
+            required_stdout in result.stdout,
+            failures,
+            f"{label}: stdout should contain {required_stdout!r}, got {result.stdout!r}",
+        )
 
 
-def modified_new_and_tie_rules(ctx: CheckState, root: Path) -> None:
-    p1, p2, p3 = seed(ctx, root, ["p1", "p2", "p3"], {"size.txt": b"old", "time.txt": b"old", "large.txt": b"aaaa", "tie.txt": b"1111", "near.txt": b"1111", "behind.txt": b"old"})
+def scenario_startup_errors(base: Path, failures: list[str]) -> None:
+    first_a = make_peer(base, "first_a")
+    first_b = make_peer(base, "first_b")
+    result = run_sync([peer_arg(first_a), peer_arg(first_b)])
+    expect_failure(
+        result,
+        failures,
+        "013.13/013.14 first run without canon",
+        "First sync? Mark the authoritative peer with a leading +",
+    )
 
-    write_file(p1 / "size.txt", b"larger", BASE_TIME)
-    run_ks(ctx, [str(p1), str(p2), str(p3)], "modified by byte size", 0)
-    ctx.check(read_bytes(p2 / "size.txt") == b"larger" and read_bytes(p3 / "size.txt") == b"larger", "013.2: different byte size should be treated as modified and propagated")
+    reachable = make_peer(base, "reachable")
+    missing_canon = base / "missing_canon"
+    result = run_sync(["--dry-run", peer_arg(missing_canon, "+"), peer_arg(reachable)])
+    expect_failure(result, failures, "013.12 unreachable canon")
 
-    write_file(p2 / "time.txt", b"newer-time", BASE_TIME + 100)
-    run_ks(ctx, [str(p1), str(p2), str(p3)], "modified by mtime", 0)
-    ctx.check(read_bytes(p1 / "time.txt") == b"newer-time" and read_bytes(p3 / "time.txt") == b"newer-time", "013.3/013.22/013.43: newest modified file more than 5 seconds newer should win")
+    missing = base / "missing"
+    result = run_sync(["--dry-run", peer_arg(missing), peer_arg(reachable)])
+    expect_failure(result, failures, "013.15 fewer than two reachable peers")
 
-    write_file(p1 / "brand-new.txt", b"new file", BASE_TIME + 120)
-    run_ks(ctx, [str(p1), str(p2), str(p3)], "new file propagation", 0)
-    ctx.check(read_bytes(p2 / "brand-new.txt") == b"new file" and read_bytes(p3 / "brand-new.txt") == b"new file", "013.5/013.23/013.24: newest new file should be copied to peers with no row")
-
-    write_file(p1 / "large.txt", b"small", BASE_TIME + 130)
-    write_file(p2 / "large.txt", b"much-larger", BASE_TIME + 130)
-    run_ks(ctx, [str(p1), str(p2), str(p3)], "larger tied file wins", 0)
-    ctx.check(read_bytes(p1 / "large.txt") == b"much-larger", "013.33: larger byte size should win when modification times are tied")
-
-    write_file(p1 / "tie.txt", b"AAAA", BASE_TIME + 140)
-    write_file(p2 / "tie.txt", b"BBBB", BASE_TIME + 140)
-    remove_path(p3 / "tie.txt")
-    update_snapshot(p3, "tie.txt", last_seen=None, deleted_time=None)
-    run_ks(ctx, [str(p1), str(p2), str(p3)], "exact tie keeps peer data", 0)
-    ctx.check(read_bytes(p1 / "tie.txt") == b"AAAA" and read_bytes(p2 / "tie.txt") == b"BBBB", "013.35/013.36: equal size and tied mtime should not copy between tied peers")
-    ctx.check(read_bytes(p3 / "tie.txt") in {b"AAAA", b"BBBB"}, "013.37: a peer needing an exactly tied file should receive it from one tied source")
-
-    write_file(p1 / "near.txt", b"AAAA", BASE_TIME + 160)
-    write_file(p2 / "near.txt", b"BBBB", BASE_TIME + 157)
-    run_ks(ctx, [str(p1), str(p2)], "within five seconds avoids copy", 0)
-    ctx.check(read_bytes(p2 / "near.txt") == b"BBBB", "013.41/013.44: same size within 5 seconds of the max mtime should be treated as already matching")
-
-    write_file(p1 / "behind.txt", b"new", BASE_TIME + 200)
-    write_file(p2 / "behind.txt", b"older-but-larger", BASE_TIME + 194)
-    run_ks(ctx, [str(p1), str(p2)], "older than tolerance loses", 0)
-    ctx.check(read_bytes(p2 / "behind.txt") == b"new", "013.45: a file more than 5 seconds behind the max mtime should lose despite larger size")
+    sub_a = make_peer(base, "sub_a", [history_row()])
+    sub_b = make_peer(base, "sub_b", [history_row()])
+    result = run_sync([peer_arg(sub_a, "-"), peer_arg(sub_b, "-")])
+    expect_failure(
+        result,
+        failures,
+        "013.16/013.17 no contributing peer",
+        "No contributing peer reachable - cannot make sync decisions",
+    )
 
 
-def deleted_and_absent_rules(ctx: CheckState, root: Path) -> None:
-    p1, p2 = seed(ctx, root, ["p1", "p2"], {"deleted.txt": b"live", "near-delete.txt": b"live", "unconfirmed-delete.txt": b"live", "null-last-seen.txt": b"live", "recent-last-seen.txt": b"live"})
+def scenario_canon_wins(base: Path, failures: list[str]) -> None:
+    canon = make_peer(base, "canon")
+    other = make_peer(base, "canon_other")
+    target = make_peer(base, "canon_target")
+    write_file(canon / "canon.txt", b"canon", 1_700_001_000)
+    write_file(other / "canon.txt", b"other-newer", 1_700_002_000)
+    result = run_sync([peer_arg(canon, "+"), peer_arg(other), peer_arg(target)])
+    expect_success(result, failures, "013.9/013.11 canon file wins")
+    check(read_bytes(other / "canon.txt") == b"canon", failures, "013.9: canon file should replace other peer")
+    check(read_bytes(target / "canon.txt") == b"canon", failures, "013.9: canon file should copy to missing peer")
 
-    remove_path(p1 / "deleted.txt")
-    update_snapshot(p1, "deleted.txt", deleted_time=ts(BASE_TIME + 20))
-    run_ks(ctx, [str(p1), str(p2)], "deleted estimate wins", 0)
-    ctx.check(not (p2 / "deleted.txt").exists(), "013.6/013.25/013.26/013.27: deletion estimate newer by more than 5 seconds should delete existing files")
-    assert_bak_has(ctx, p2, "deleted.txt", "013.27")
-
-    remove_path(p1 / "near-delete.txt")
-    update_snapshot(p1, "near-delete.txt", deleted_time=ts(BASE_TIME + 3))
-    run_ks(ctx, [str(p1), str(p2)], "existing wins near deletion", 0)
-    ctx.check(read_bytes(p1 / "near-delete.txt") == b"live", "013.28/013.34: existing file should win when deletion is not more than 5 seconds newer")
-
-    remove_path(p1 / "unconfirmed-delete.txt")
-    update_snapshot(p1, "unconfirmed-delete.txt", last_seen=ts(BASE_TIME + 30), deleted_time=None)
-    run_ks(ctx, [str(p1), str(p2)], "absent unconfirmed last_seen deletion", 0)
-    ctx.check(not (p2 / "unconfirmed-delete.txt").exists(), "013.7/013.29: absent-unconfirmed with last_seen more than 5 seconds newer should vote deletion")
-
-    remove_path(p1 / "null-last-seen.txt")
-    update_snapshot(p1, "null-last-seen.txt", last_seen=None, deleted_time=None)
-    run_ks(ctx, [str(p1), str(p2)], "absent unconfirmed null last_seen", 0)
-    ctx.check(read_bytes(p1 / "null-last-seen.txt") == b"live", "013.30/013.32: NULL last_seen should not vote deletion and should receive the file")
-
-    remove_path(p1 / "recent-last-seen.txt")
-    update_snapshot(p1, "recent-last-seen.txt", last_seen=ts(BASE_TIME + 3), deleted_time=None)
-    run_ks(ctx, [str(p1), str(p2)], "absent unconfirmed within tolerance", 0)
-    ctx.check(read_bytes(p1 / "recent-last-seen.txt") == b"live", "013.31/013.32: last_seen within 5 seconds should not vote deletion and should receive the file")
+    canon_empty = make_peer(base, "canon_empty")
+    loser = make_peer(base, "canon_delete_loser")
+    write_file(loser / "gone.txt", b"remove me", 1_700_003_000)
+    result = run_sync([peer_arg(canon_empty, "+"), peer_arg(loser)])
+    expect_success(result, failures, "013.10 canon absence deletes")
+    check(not (loser / "gone.txt").exists(), failures, "013.10: canon absence should remove file from other peer")
+    check(has_bak_entry(loser, "gone.txt"), failures, "013.10: deleted file should be displaced to BAK")
 
 
-def no_row_and_subordinate_cleanup(ctx: CheckState, root: Path) -> None:
-    p1, p2 = seed(ctx, root, ["p1", "p2"], {})
-    sub = root / "sub"
-    sub.mkdir()
-    write_file(sub / "sub-only.txt", b"subordinate data", BASE_TIME + 50)
-    run_ks(ctx, [str(p1), str(p2), "-" + str(sub)], "subordinate-only no-row file", 0)
-    ctx.check(not (sub / "sub-only.txt").exists(), "013.8/013.17/013.38/013.40: subordinate-only file with no contributing vote should be displaced")
-    ctx.check(not (p1 / "sub-only.txt").exists() and not (p2 / "sub-only.txt").exists(), "013.39: no copy should be selected when all contributing peers are absent with no row")
-    assert_bak_has(ctx, sub, "sub-only.txt", "013.40")
+def scenario_unchanged_ties_and_targets(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "unchanged_p1", [file_row("same.txt", 1_700_010_000, 3)])
+    p2 = make_peer(base, "unchanged_p2", [file_row("same.txt", 1_700_010_004, 3)])
+    p3 = make_peer(base, "unchanged_target")
+    write_file(p1 / "same.txt", b"aaa", 1_700_010_000)
+    write_file(p2 / "same.txt", b"bbb", 1_700_010_004)
+    result = run_sync([peer_arg(p1), peer_arg(p2), peer_arg(p3)])
+    expect_success(result, failures, "013.1/013.20-013.22 unchanged tied files")
+    check(read_bytes(p1 / "same.txt") == b"aaa", failures, "013.39: identical tied source p1 should not be overwritten")
+    check(read_bytes(p2 / "same.txt") == b"bbb", failures, "013.21/013.38/013.39: tied equal-size peers keep their bytes")
+    check(
+        read_bytes(p3 / "same.txt") in {b"aaa", b"bbb"},
+        failures,
+        "013.22/013.40: missing active peer should receive one tied source file",
+    )
 
 
-def tolerance_classification(ctx: CheckState, root: Path) -> None:
-    p1, p2 = seed(ctx, root, ["p1", "p2"], {"within.txt": b"AAAA"})
-    write_file(p1 / "within.txt", b"BBBB", BASE_TIME + 3)
-    run_ks(ctx, [str(p1), str(p2)], "snapshot mtime within tolerance", 0)
-    ctx.check(read_bytes(p1 / "within.txt") == b"BBBB", "013.1/013.42: live mtime within 5 seconds and same size should be treated as matching, so bytes are not used to force a copy")
+def scenario_modified_size_wins(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "size_p1", [file_row("size.txt", 1_700_020_000, 1)])
+    p2 = make_peer(base, "size_p2", [file_row("size.txt", 1_700_020_000, 1)])
+    write_file(p1 / "size.txt", b"larger", 1_700_020_000)
+    write_file(p2 / "size.txt", b"x", 1_700_020_000)
+    result = run_sync([peer_arg(p1), peer_arg(p2)])
+    expect_success(result, failures, "013.2/013.36 modified size wins")
+    check(read_bytes(p2 / "size.txt") == b"larger", failures, "013.2/013.36: larger same-time modified file should win")
 
 
-def live_file_with_tombstone_row(ctx: CheckState, root: Path) -> None:
-    p1, p2 = seed(ctx, root, ["p1", "p2"], {"resurrected.txt": b"old"})
-    update_snapshot(p1, "resurrected.txt", deleted_time=ts(BASE_TIME + 10))
-    write_file(p1 / "resurrected.txt", b"resurrected", BASE_TIME + 40)
-    remove_path(p2 / "resurrected.txt")
-    update_snapshot(p2, "resurrected.txt", deleted_time=ts(BASE_TIME + 5))
-    run_ks(ctx, [str(p1), str(p2)], "live file with tombstone row", 0)
-    ctx.check(read_bytes(p2 / "resurrected.txt") == b"resurrected", "013.4: live file with non-NULL deleted_time should be treated as modified")
+def scenario_modified_mtime_wins(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "mtime_p1", [file_row("mtime.txt", 1_700_030_000, 4)])
+    p2 = make_peer(base, "mtime_p2", [file_row("mtime.txt", 1_700_030_000, 4)])
+    write_file(p1 / "mtime.txt", b"new1", 1_700_030_010)
+    write_file(p2 / "mtime.txt", b"old2", 1_700_030_000)
+    result = run_sync([peer_arg(p1), peer_arg(p2)])
+    expect_success(result, failures, "013.3/013.23/013.35 newer modified file")
+    check(read_bytes(p2 / "mtime.txt") == b"new1", failures, "013.3/013.23/013.35: newer modified file should win")
+    check(read_bytes(p1 / "mtime.txt") == b"new1", failures, "013.44: peer already matching winner should not be copied over")
+
+
+def scenario_new_files_and_no_row_peers(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "new_p1", [history_row()])
+    p2 = make_peer(base, "new_p2", [history_row()])
+    p3 = make_peer(base, "new_p3", [history_row()])
+    write_file(p1 / "new.txt", b"newest", 1_700_040_020)
+    write_file(p2 / "new.txt", b"older", 1_700_040_000)
+    result = run_sync([peer_arg(p1), peer_arg(p2), peer_arg(p3)])
+    expect_success(result, failures, "013.5/013.8/013.24/013.25 new file winner")
+    check(read_bytes(p2 / "new.txt") == b"newest", failures, "013.24: newest new file should replace older new file")
+    check(read_bytes(p3 / "new.txt") == b"newest", failures, "013.25: no-row absent peer should receive new winner")
+
+
+def scenario_deleted_existing_comparisons(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "delete_tie_p1", [file_row("revive.txt", 1_700_050_000, 5, deleted_time=1_700_049_000)])
+    p2 = make_peer(base, "delete_tie_p2", [file_row("revive.txt", 1_700_050_000, 5, deleted_time=1_700_050_004)])
+    write_file(p1 / "revive.txt", b"alive", 1_700_050_000)
+    result = run_sync([peer_arg(p1), peer_arg(p2)])
+    expect_success(result, failures, "013.4/013.6/013.26/013.29/013.37 existing tied with deletion")
+    check(read_bytes(p2 / "revive.txt") == b"alive", failures, "013.29/013.37: existing file tied with deletion should win")
+
+    live = make_peer(base, "delete_newer_live", [file_row("doomed.txt", 1_700_060_000, 6)])
+    deleted_a = make_peer(base, "delete_newer_a", [file_row("doomed.txt", 1_700_060_000, 6, deleted_time=1_700_060_008)])
+    deleted_b = make_peer(base, "delete_newer_b", [file_row("doomed.txt", 1_700_060_000, 6, deleted_time=1_700_060_012)])
+    write_file(live / "doomed.txt", b"doomed", 1_700_060_000)
+    result = run_sync([peer_arg(live), peer_arg(deleted_a), peer_arg(deleted_b)])
+    expect_success(result, failures, "013.27/013.28 newer deletion wins")
+    check(not (live / "doomed.txt").exists(), failures, "013.28: deletion newer than file should remove existing file")
+    check(has_bak_entry(live, "doomed.txt"), failures, "013.28: deletion winner should displace live file to BAK")
+
+
+def scenario_absent_unconfirmed(base: Path, failures: list[str]) -> None:
+    live = make_peer(base, "absent_live", [file_row("maybe.txt", 1_700_070_000, 5)])
+    absent = make_peer(base, "absent_deleted", [file_row("maybe.txt", 1_700_070_000, 5, last_seen=1_700_070_010)])
+    write_file(live / "maybe.txt", b"maybe", 1_700_070_000)
+    result = run_sync([peer_arg(live), peer_arg(absent)])
+    expect_success(result, failures, "013.7/013.30 absent-unconfirmed deletion vote")
+    check(not (live / "maybe.txt").exists(), failures, "013.30: newer absent-unconfirmed last_seen should delete file")
+
+    source = make_peer(base, "absent_source", [file_row("copy.txt", 1_700_080_000, 4)])
+    null_seen = make_peer(base, "absent_null_seen", [file_row("copy.txt", 1_700_080_000, 4, last_seen=None)])
+    near_seen = make_peer(base, "absent_near_seen", [file_row("copy.txt", 1_700_080_000, 4, last_seen=1_700_080_004)])
+    write_file(source / "copy.txt", b"copy", 1_700_080_000)
+    result = run_sync([peer_arg(source), peer_arg(null_seen), peer_arg(near_seen)])
+    expect_success(result, failures, "013.31/013.32/013.33 absent-unconfirmed no vote")
+    check(read_bytes(null_seen / "copy.txt") == b"copy", failures, "013.31/013.33: NULL last_seen peer should receive existing file")
+    check(read_bytes(near_seen / "copy.txt") == b"copy", failures, "013.32/013.33: near last_seen peer should receive existing file")
+
+
+def scenario_subordinate_rules(base: Path, failures: list[str]) -> None:
+    source = make_peer(base, "sub_source", [file_row("sub.txt", 1_700_090_000, 5)])
+    neutral = make_peer(base, "sub_neutral", [history_row()])
+    subordinate = make_peer(base, "sub_target", [history_row()])
+    write_file(source / "sub.txt", b"group", 1_700_090_000)
+    write_file(subordinate / "sub.txt", b"subordinate-newer", 1_700_091_000)
+    result = run_sync([peer_arg(source), peer_arg(neutral), peer_arg(subordinate, "-")])
+    expect_success(result, failures, "013.18/013.19 subordinate ignored but targeted")
+    check(read_bytes(neutral / "sub.txt") == b"group", failures, "013.19: active peer should receive contributing outcome")
+    check(read_bytes(subordinate / "sub.txt") == b"group", failures, "013.18/013.19: subordinate file should not influence decision")
+
+
+def scenario_all_absent_no_row_displaces_subordinate(base: Path, failures: list[str]) -> None:
+    p1 = make_peer(base, "absent_no_row_p1", [history_row()])
+    p2 = make_peer(base, "absent_no_row_p2", [history_row()])
+    subordinate = make_peer(base, "absent_no_row_sub", [history_row()])
+    write_file(subordinate / "orphan.txt", b"orphan", 1_700_100_000)
+    result = run_sync([peer_arg(p1), peer_arg(p2), peer_arg(subordinate, "-")])
+    expect_success(result, failures, "013.41/013.42/013.43 all contributing absent no row")
+    check(not (subordinate / "orphan.txt").exists(), failures, "013.43: subordinate-only file should be displaced")
+    check(has_bak_entry(subordinate, "orphan.txt"), failures, "013.43: displaced subordinate-only file should be in BAK")
 
 
 def main() -> int:
-    ctx = CheckState([])
+    failures: list[str] = []
     scenarios = [
-        startup_errors,
-        canon_rules,
-        unchanged_and_subordinate_targets,
-        modified_new_and_tie_rules,
-        deleted_and_absent_rules,
-        no_row_and_subordinate_cleanup,
-        tolerance_classification,
-        live_file_with_tombstone_row,
+        scenario_startup_errors,
+        scenario_canon_wins,
+        scenario_unchanged_ties_and_targets,
+        scenario_modified_size_wins,
+        scenario_modified_mtime_wins,
+        scenario_new_files_and_no_row_peers,
+        scenario_deleted_existing_comparisons,
+        scenario_absent_unconfirmed,
+        scenario_subordinate_rules,
+        scenario_all_absent_no_row_displaces_subordinate,
     ]
-    with tempfile.TemporaryDirectory(prefix="kitchensync-013-") as tmp:
+
+    with tempfile.TemporaryDirectory(prefix="ks_013_") as tmp:
         base = Path(tmp)
         for scenario in scenarios:
             try:
-                scenario(ctx, base / scenario.__name__)
+                scenario(base, failures)
+            except subprocess.TimeoutExpired as exc:
+                failures.append(f"{scenario.__name__}: process timed out after {exc.timeout} seconds")
             except Exception as exc:
-                ctx.failures.append(f"{scenario.__name__}: unexpected exception: {exc}")
+                failures.append(f"{scenario.__name__}: unexpected exception {type(exc).__name__}: {exc}")
 
-    if ctx.failures:
-        print("test_013_file_decisions.py failures:")
-        for failure in ctx.failures:
+    if failures:
+        print("test_013_file_decisions failed:")
+        for failure in failures:
             print(f"- {failure}")
         return 1
-    print("test_013_file_decisions.py passed")
+
+    print("test_013_file_decisions passed")
     return 0
 
 
