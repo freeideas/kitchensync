@@ -8,8 +8,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
 
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -17,8 +17,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 WORKSPACE_ROOT = Path("/home/ace/Desktop/prjx/kitchensync")
-KITCHENSYNC_EXE = WORKSPACE_ROOT / "released" / "kitchensync.exe"
-TIMEOUT_SECONDS = 20
+KITCHENSYNC = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
 
 EXPECTED_HELP = """Usage: kitchensync [options] <peer> <peer> [<peer>...]
 
@@ -76,244 +75,252 @@ Displaced files are recoverable from nearby:
 """
 
 
-class Result:
-    def __init__(self, args: list[str], completed: subprocess.CompletedProcess[str] | None, error: str | None):
-        self.args = args
-        self.completed = completed
-        self.error = error
-
-    @property
-    def returncode(self) -> int | None:
-        if self.completed is None:
-            return None
-        return self.completed.returncode
-
-    @property
-    def stdout(self) -> str:
-        if self.completed is None:
-            return ""
-        return self.completed.stdout
-
-    @property
-    def stderr(self) -> str:
-        if self.completed is None:
-            return ""
-        return self.completed.stderr
+@dataclass(frozen=True)
+class RunResult:
+    args: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
 
 
-def run_kitchensync(args: list[str]) -> Result:
-    command = [str(KITCHENSYNC_EXE), *args]
+def run_kitchensync(args: list[str], timeout_seconds: float = 8.0) -> RunResult:
+    completed = subprocess.run(
+        [str(KITCHENSYNC), *args],
+        cwd=str(WORKSPACE_ROOT),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_seconds,
+        shell=False,
+        check=False,
+    )
+    return RunResult(
+        args=args,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def make_peers(parent: Path, name: str) -> tuple[Path, Path]:
+    left = parent / name / "left"
+    right = parent / name / "right"
+    left.mkdir(parents=True, exist_ok=True)
+    right.mkdir(parents=True, exist_ok=True)
+    (left / "sample.txt").write_text("sample\n", encoding="utf-8", newline="\n")
+    return left, right
+
+
+def format_args(args: list[str]) -> str:
+    return " ".join(args) if args else "<no arguments>"
+
+
+def expect_help_success(failures: list[str]) -> None:
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(WORKSPACE_ROOT),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=TIMEOUT_SECONDS,
-            check=False,
+        result = run_kitchensync([])
+    except Exception as exc:
+        failures.append(f"002.1/002.2/002.3 no-argument help raised {exc!r}")
+        return
+
+    if result.stdout != EXPECTED_HELP:
+        failures.append(
+            "002.1 no-argument invocation did not print the exact help text "
+            f"to stdout; got {result.stdout!r}"
         )
-    except subprocess.TimeoutExpired as exc:
-        return Result(args, None, f"timed out after {exc.timeout} seconds")
-    except OSError as exc:
-        return Result(args, None, f"could not launch process: {exc}")
-    return Result(args, completed, None)
+    if result.returncode != 0:
+        failures.append(
+            f"002.2 no-argument invocation exited {result.returncode}, expected 0"
+        )
+    if result.stderr != "":
+        failures.append(
+            f"002.3 no-argument invocation wrote to stderr: {result.stderr!r}"
+        )
 
 
-def record(condition: bool, failures: list[str], message: str) -> None:
-    if not condition:
-        failures.append(message)
-
-
-def display_args(args: list[str]) -> str:
-    if not args:
-        return "<no arguments>"
-    return " ".join(args)
-
-
-def path_arg(path: Path, prefix: str = "") -> str:
-    return prefix + str(path)
-
-
-def file_url(path: Path, prefix: str = "", query: str = "") -> str:
-    uri = path.resolve().as_uri()
-    return prefix + uri + query
-
-
-def assert_no_process_error(result: Result, failures: list[str], req_id: str) -> bool:
-    if result.error is None:
-        return True
-    failures.append(f"{req_id}: {display_args(result.args)} {result.error}")
-    return False
-
-
-def assert_help_invocation(failures: list[str]) -> None:
-    result = run_kitchensync([])
-    if not assert_no_process_error(result, failures, "002.1"):
+def expect_validation_failure(
+    failures: list[str],
+    req_ids: str,
+    args: list[str],
+    timeout_seconds: float = 8.0,
+) -> None:
+    try:
+        result = run_kitchensync(args, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        failures.append(f"{req_ids} validation failure case raised {exc!r}")
         return
-    record(
-        result.stdout == EXPECTED_HELP,
-        failures,
-        "002.1: no-argument invocation did not print the exact help text to stdout",
-    )
-    record(result.returncode == 0, failures, f"002.2: expected exit 0, got {result.returncode}")
-    record(result.stderr == "", failures, f"002.3: expected empty stderr, got {result.stderr!r}")
+
+    prefix = f"{req_ids} for `{format_args(args)}`"
+    if result.returncode != 1:
+        failures.append(f"{prefix} exited {result.returncode}, expected 1")
+    if result.stderr != "":
+        failures.append(f"{prefix} wrote to stderr: {result.stderr!r}")
+    if not result.stdout.endswith(EXPECTED_HELP):
+        failures.append(f"{prefix} stdout did not end with the help text")
+    error_text = result.stdout[: -len(EXPECTED_HELP)] if result.stdout.endswith(EXPECTED_HELP) else result.stdout
+    if error_text.strip() == "":
+        failures.append(f"{prefix} did not print an error message before help")
 
 
-def assert_validation_failure(args: list[str], req_ids: str, failures: list[str]) -> None:
-    result = run_kitchensync(args)
-    if not assert_no_process_error(result, failures, req_ids):
+def expect_accepted(
+    failures: list[str],
+    req_ids: str,
+    args: list[str],
+    timeout_seconds: float = 12.0,
+) -> None:
+    try:
+        result = run_kitchensync(args, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        failures.append(f"{req_ids} accepted invocation raised {exc!r}")
         return
-    record(
-        result.returncode == 1,
-        failures,
-        f"{req_ids}: expected validation failure exit 1 for {display_args(args)}, got {result.returncode}",
-    )
-    record(
-        result.stderr == "",
-        failures,
-        f"{req_ids}: expected empty stderr for {display_args(args)}, got {result.stderr!r}",
-    )
-    record(
-        result.stdout.endswith(EXPECTED_HELP),
-        failures,
-        f"{req_ids}: validation failure did not print the help text after the error for {display_args(args)}",
-    )
-    record(
-        result.stdout != EXPECTED_HELP,
-        failures,
-        f"{req_ids}: validation failure did not include an error message before help for {display_args(args)}",
-    )
+
+    prefix = f"{req_ids} for `{format_args(args)}`"
+    if result.returncode != 0:
+        failures.append(
+            f"{prefix} exited {result.returncode}, expected accepted dry-run exit 0; "
+            f"stdout was {result.stdout!r}"
+        )
+    if result.stderr != "":
+        failures.append(f"{prefix} wrote to stderr: {result.stderr!r}")
+    if result.stdout.endswith(EXPECTED_HELP):
+        failures.append(f"{prefix} printed validation help even though it should be accepted")
 
 
-def assert_validation_accepts(args: list[str], req_ids: str, failures: list[str]) -> None:
-    result = run_kitchensync(args)
-    if not assert_no_process_error(result, failures, req_ids):
-        return
-    record(
-        result.returncode == 0,
-        failures,
-        f"{req_ids}: expected accepted invocation to exit 0 for {display_args(args)}, got {result.returncode}; stdout={result.stdout!r}",
-    )
-    record(
-        result.stderr == "",
-        failures,
-        f"{req_ids}: expected empty stderr for accepted invocation {display_args(args)}, got {result.stderr!r}",
-    )
-    record(
-        not result.stdout.endswith(EXPECTED_HELP),
-        failures,
-        f"{req_ids}: accepted invocation printed validation help for {display_args(args)}",
-    )
+def accepted_cases(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks-002-accepted-") as tmp:
+        root = Path(tmp)
+
+        left, right = make_peers(root, "all-numeric-and-excludes")
+        expect_accepted(
+            failures,
+            "002.7/002.8/002.9/002.10/002.11/002.12/002.13/002.14/002.15/002.27/002.29",
+            [
+                "--dry-run",
+                "--max-copies",
+                "1",
+                "--retries-copy",
+                "1",
+                "--retries-list",
+                "1",
+                "--timeout-conn",
+                "1",
+                "--timeout-idle",
+                "1",
+                "--keep-tmp-days",
+                "1",
+                "--keep-bak-days",
+                "1",
+                "--keep-del-days",
+                "1",
+                "--verbosity",
+                "trace",
+                "-x",
+                "excluded-file.txt",
+                "-x",
+                "dir/excluded-file.txt",
+                f"+{left}",
+                str(right),
+            ],
+        )
+
+        for level, req_id in [
+            ("error", "002.24"),
+            ("info", "002.25"),
+            ("debug", "002.26"),
+        ]:
+            left, right = make_peers(root, f"verbosity-{level}")
+            expect_accepted(
+                failures,
+                req_id,
+                ["--dry-run", "--verbosity", level, f"+{left}", str(right)],
+            )
+
+        left, right = make_peers(root, "url-timeout-conn")
+        expect_accepted(
+            failures,
+            "002.36",
+            ["--dry-run", f"+{left.as_uri()}?timeout-conn=1", right.as_uri()],
+        )
+
+        left, right = make_peers(root, "url-timeout-idle")
+        expect_accepted(
+            failures,
+            "002.37",
+            ["--dry-run", f"+{left.as_uri()}?timeout-idle=1", right.as_uri()],
+        )
+
+        left, right = make_peers(root, "url-both-timeouts")
+        expect_accepted(
+            failures,
+            "002.38",
+            [
+                "--dry-run",
+                f"+{left.as_uri()}?timeout-conn=1&timeout-idle=1",
+                right.as_uri(),
+            ],
+        )
 
 
-def accepted_base_args(left: Path, right: Path) -> list[str]:
-    return ["--dry-run", path_arg(left, "+"), path_arg(right)]
+def invalid_cases(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="ks-002-invalid-") as tmp:
+        root = Path(tmp)
+        left, right = make_peers(root, "peers")
+        canon = f"+{left}"
+        other = str(right)
 
+        cases = [
+            ("002.4/002.43/002.44/002.45", ["--dry-run", canon]),
+            ("002.5/002.43/002.44/002.45", ["--dry-run", canon, f"+{right}"]),
+            ("002.6/002.43/002.44/002.45", ["--not-a-real-flag", canon, other]),
+            ("002.16/002.43/002.44/002.45", ["--max-copies", "0", canon, other]),
+            ("002.17/002.43/002.44/002.45", ["--retries-copy", "0", canon, other]),
+            ("002.18/002.43/002.44/002.45", ["--retries-list", "0", canon, other]),
+            ("002.19/002.43/002.44/002.45", ["--timeout-conn", "0", canon, other]),
+            ("002.20/002.43/002.44/002.45", ["--timeout-idle", "0", canon, other]),
+            ("002.21/002.43/002.44/002.45", ["--keep-tmp-days", "0", canon, other]),
+            ("002.22/002.43/002.44/002.45", ["--keep-bak-days", "0", canon, other]),
+            ("002.23/002.43/002.44/002.45", ["--keep-del-days", "0", canon, other]),
+            ("002.28/002.43/002.44/002.45", ["--verbosity", "loud", canon, other]),
+            ("002.30/002.43/002.44/002.45", ["--dry-run", "-x", "/absolute", canon, other]),
+            ("002.31/002.43/002.44/002.45", ["--dry-run", "-x", "trailing/", canon, other]),
+            ("002.32/002.43/002.44/002.45", ["--dry-run", "-x", "bad\\path", canon, other]),
+            ("002.33/002.43/002.44/002.45", ["--dry-run", "-x", "bad//path", canon, other]),
+            ("002.34/002.43/002.44/002.45", ["--dry-run", "-x", "bad/./path", canon, other]),
+            ("002.35/002.43/002.44/002.45", ["--dry-run", "-x", "bad/../path", canon, other]),
+            (
+                "002.39/002.43/002.44/002.45",
+                ["--dry-run", f"+{left.as_uri()}?max-copies=1", right.as_uri()],
+            ),
+            (
+                "002.40/002.43/002.44/002.45",
+                ["--dry-run", f"+{left.as_uri()}?timeout-conn=0", right.as_uri()],
+            ),
+            (
+                "002.41/002.43/002.44/002.45",
+                ["--dry-run", f"+{left.as_uri()}?timeout-idle=0", right.as_uri()],
+            ),
+            ("002.42/002.43/002.44/002.45", ["--dry-run", canon, other, "--max-copies"]),
+        ]
 
-def assert_common_validation_failures(left: Path, right: Path, failures: list[str]) -> None:
-    assert_validation_failure([path_arg(left)], "002.4,002.46,002.47,002.48", failures)
-    assert_validation_failure([path_arg(left, "+"), path_arg(right, "+")], "002.5,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--unknown-option", path_arg(left, "+"), path_arg(right)], "002.6,002.46,002.47,002.48", failures)
-
-
-def assert_global_option_values(left: Path, right: Path, failures: list[str]) -> None:
-    positive_integer_options = [
-        ("--max-copies", "002.8", "002.16"),
-        ("--retries-copy", "002.9", "002.17"),
-        ("--retries-list", "002.10", "002.18"),
-        ("--timeout-conn", "002.11", "002.19"),
-        ("--timeout-idle", "002.12", "002.20"),
-        ("--keep-tmp-days", "002.13", "002.21"),
-        ("--keep-bak-days", "002.14", "002.22"),
-        ("--keep-del-days", "002.15", "002.23"),
-    ]
-    assert_validation_accepts(["--dry-run", *accepted_base_args(left, right)[1:]], "002.7", failures)
-    for option, accept_req, reject_req in positive_integer_options:
-        assert_validation_accepts([option, "1", *accepted_base_args(left, right)], accept_req, failures)
-        assert_validation_failure([option, "0", *accepted_base_args(left, right)], f"{reject_req},002.46,002.47,002.48", failures)
-        assert_validation_failure([option, "abc", *accepted_base_args(left, right)], f"{reject_req},002.46,002.47,002.48", failures)
-        assert_validation_failure([option, *accepted_base_args(left, right)], "002.45,002.46,002.47,002.48", failures)
-
-
-def assert_verbosity_values(left: Path, right: Path, failures: list[str]) -> None:
-    for level, req_id in [
-        ("error", "002.24"),
-        ("info", "002.25"),
-        ("debug", "002.26"),
-        ("trace", "002.27"),
-    ]:
-        assert_validation_accepts(["--verbosity", level, *accepted_base_args(left, right)], req_id, failures)
-    assert_validation_failure(["--verbosity", "verbose", *accepted_base_args(left, right)], "002.28,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--verbosity", *accepted_base_args(left, right)], "002.45,002.46,002.47,002.48", failures)
-
-
-def assert_exclude_values(left: Path, right: Path, failures: list[str]) -> None:
-    assert_validation_accepts(
-        ["-x", "cache", "-x", "nested/path.txt", *accepted_base_args(left, right)],
-        "002.29",
-        failures,
-    )
-    invalid_excludes = [
-        ("/absolute", "002.30"),
-        ("trailing/", "002.31"),
-        ("bad\\path", "002.32"),
-        ("bad//path", "002.33"),
-        ("./path", "002.34"),
-        ("path/./leaf", "002.34"),
-        ("../path", "002.35"),
-        ("path/../leaf", "002.35"),
-    ]
-    for exclude, req_id in invalid_excludes:
-        assert_validation_failure(["-x", exclude, *accepted_base_args(left, right)], f"{req_id},002.46,002.47,002.48", failures)
-    assert_validation_failure(["-x", *accepted_base_args(left, right)], "002.45,002.46,002.47,002.48", failures)
-    # not reasonably testable: 002.36 - Python subprocess APIs reject embedded NUL
-    # characters before launching the executable, so the product cannot observe one.
-
-
-def assert_url_query_values(left: Path, right: Path, failures: list[str]) -> None:
-    left_timeout_conn = file_url(left, "+", "?timeout-conn=1")
-    left_timeout_idle = file_url(left, "+", "?timeout-idle=1")
-    left_both = file_url(left, "+", "?timeout-conn=1&timeout-idle=1")
-    right_url = file_url(right)
-    assert_validation_accepts(["--dry-run", left_timeout_conn, right_url], "002.37,002.41", failures)
-    assert_validation_accepts(["--dry-run", left_timeout_idle, right_url], "002.38,002.42", failures)
-    assert_validation_accepts(["--dry-run", left_both, right_url], "002.37,002.38,002.41,002.42", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?max-copies=1"), right_url], "002.39,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?unknown=1"), right_url], "002.40,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?timeout-conn=0"), right_url], "002.43,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?timeout-conn=no"), right_url], "002.43,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?timeout-idle=0"), right_url], "002.44,002.46,002.47,002.48", failures)
-    assert_validation_failure(["--dry-run", file_url(left, "+", "?timeout-idle=no"), right_url], "002.44,002.46,002.47,002.48", failures)
-
-
-def make_peer(root: Path, name: str) -> Path:
-    peer = root / quote(name, safe="")
-    peer.mkdir(parents=True, exist_ok=True)
-    return peer
+        for req_ids, args in cases:
+            expect_validation_failure(failures, req_ids, args)
 
 
 def main() -> int:
     failures: list[str] = []
-    assert_help_invocation(failures)
-    with tempfile.TemporaryDirectory(prefix="kitchensync-args-") as temp_name:
-        temp_root = Path(temp_name)
-        left = make_peer(temp_root, "left peer")
-        right = make_peer(temp_root, "right peer")
-        assert_common_validation_failures(left, right, failures)
-        assert_global_option_values(left, right, failures)
-        assert_verbosity_values(left, right, failures)
-        assert_exclude_values(left, right, failures)
-        assert_url_query_values(left, right, failures)
+
+    expect_help_success(failures)
+    accepted_cases(failures)
+    invalid_cases(failures)
 
     if failures:
-        print(f"{len(failures)} failure(s):")
+        print("FAIL")
         for failure in failures:
             print(f"- {failure}")
         return 1
-    print("test_002_help_and_argument_validation passed")
+
+    print("PASS")
     return 0
 
 
