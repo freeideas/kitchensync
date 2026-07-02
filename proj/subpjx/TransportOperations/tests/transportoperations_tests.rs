@@ -368,6 +368,99 @@ fn file_peer_mutates_entries_and_rejects_rename_over_existing_destination() {
 }
 
 #[test]
+fn file_peer_scopes_relative_paths_to_the_connected_root() {
+    let root = TestRoot::new("root-scope");
+    fs::write(root.path().join("inside.txt"), b"inside").expect("write inside file");
+    let outside_path = root
+        .path()
+        .parent()
+        .expect("test root has a parent")
+        .join(format!("outside-{}-root-scope.txt", std::process::id()));
+    let _ = fs::remove_file(&outside_path);
+    fs::write(&outside_path, b"outside").expect("write outside file");
+
+    let transport = subject();
+    let peer = file_peer(root.path());
+
+    assert_eq!(
+        6,
+        transport
+            .stat(&peer, "inside.txt")
+            .expect("relative path is resolved inside connected root")
+            .byte_size
+    );
+
+    let escaped_path = format!(
+        "../{}",
+        outside_path
+            .file_name()
+            .expect("outside path has a file name")
+            .to_string_lossy()
+    );
+    assert_eq!(
+        TransportErrorCategory::NotFound,
+        transport
+            .stat(&peer, &escaped_path)
+            .expect_err("stat cannot escape the connected root")
+            .category
+    );
+    assert_eq!(
+        TransportErrorCategory::NotFound,
+        transport
+            .open_write(&peer, &escaped_path)
+            .expect_err("write cannot escape the connected root")
+            .category
+    );
+    assert_eq!(
+        b"outside",
+        fs::read(&outside_path)
+            .expect("outside file is unchanged")
+            .as_slice()
+    );
+
+    let _ = fs::remove_file(&outside_path);
+}
+
+#[test]
+fn file_peer_rename_preserves_a_directory_subtree_at_a_missing_destination() {
+    let root = TestRoot::new("rename-directory");
+    fs::create_dir_all(root.path().join("source").join("child")).expect("create source tree");
+    fs::write(root.path().join("source").join("child").join("file.txt"), b"kept")
+        .expect("write nested file");
+
+    let transport = subject();
+    let peer = file_peer(root.path());
+
+    transport
+        .rename(&peer, "source", "moved")
+        .expect("rename directory to missing destination");
+
+    assert_eq!(
+        TransportErrorCategory::NotFound,
+        transport
+            .stat(&peer, "source")
+            .expect_err("source directory moved away")
+            .category
+    );
+    let nested = transport
+        .stat(&peer, "moved/child/file.txt")
+        .expect("nested file remains after directory rename");
+    assert_eq!(TransportEntryType::File, nested.entry_type);
+    assert_eq!(4, nested.byte_size);
+
+    let reader = transport
+        .open_read(&peer, "moved/child/file.txt")
+        .expect("open nested file after directory rename");
+    assert_eq!(
+        TransportReadResult::Bytes(b"kept".to_vec()),
+        transport
+            .read(&reader, 10)
+            .expect("read nested file after directory rename")
+    );
+    transport.close_read(reader).expect("close nested file reader");
+}
+
+#[test]
 fn sftp_peer_uses_connected_sftp_handle_for_transport_operations() {
     let server = EphemeralSftpServer::start();
     let transport = subject();
