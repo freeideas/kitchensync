@@ -52,7 +52,7 @@ impl SnapshotDatabaseImpl {
     }
 
     fn row_error(error: rusqlite::Error) -> SnapshotDatabaseError {
-        let kind = match error {
+        let kind = match &error {
             rusqlite::Error::InvalidParameterName(_) => SnapshotDatabaseErrorKind::InvalidRowIdentity,
             _ => SnapshotDatabaseErrorKind::RowMutation,
         };
@@ -67,9 +67,9 @@ impl SnapshotDatabaseImpl {
         Self::error(SnapshotDatabaseErrorKind::RowLookup, error.to_string())
     }
 
-    fn missing_open_database(path: &Path) -> SnapshotDatabaseError {
+    fn missing_open_database(path: &Path, kind: SnapshotDatabaseErrorKind) -> SnapshotDatabaseError {
         Self::error(
-            SnapshotDatabaseErrorKind::SqliteOpen,
+            kind,
             format!("snapshot database is not open: {}", path.display()),
         )
     }
@@ -143,7 +143,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowLookup)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowLookup)
+            })?;
 
         let mut statement = open_database
             .connection
@@ -163,7 +165,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowLookup)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowLookup)
+            })?;
 
         let mut statement = open_database
             .connection
@@ -187,7 +191,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .confirm_present(&mut open_database.connection, &to_rows_facts(facts), last_seen)
             .map_err(Self::row_error)
@@ -196,7 +202,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .confirm_absent(&mut open_database.connection, &to_rows_identity(identity))
             .map_err(Self::row_error)
@@ -205,7 +213,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .record_intended_file_copy(&mut open_database.connection, &to_rows_facts(facts))
             .map_err(Self::row_error)
@@ -214,7 +224,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .complete_file_copy(&mut open_database.connection, &to_rows_identity(identity), last_seen)
             .map_err(Self::row_error)
@@ -223,7 +235,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .complete_directory_creation(
                 &mut open_database.connection,
@@ -237,7 +251,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .complete_displacement(&mut open_database.connection, &to_rows_identity(identity))
             .map_err(Self::row_error)
@@ -246,7 +262,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::RowMutation)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::RowMutation)
+            })?;
         self.snapshotrows
             .complete_directory_displacement_cascade(
                 &mut open_database.connection,
@@ -258,7 +276,9 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let mut open_databases = self.lock_open_databases(SnapshotDatabaseErrorKind::Cleanup)?;
         let open_database = open_databases
             .get_mut(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(&database.local_path, SnapshotDatabaseErrorKind::Cleanup)
+            })?;
         self.snapshotcleanup
             .cleanup_snapshot(&mut open_database.connection, cutoff)
             .map_err(Self::cleanup_error)
@@ -267,7 +287,12 @@ impl SnapshotDatabase for SnapshotDatabaseImpl {
         let open_database = self
             .lock_open_databases(SnapshotDatabaseErrorKind::ConnectionClose)?
             .remove(&database.local_path)
-            .ok_or_else(|| Self::missing_open_database(&database.local_path))?;
+            .ok_or_else(|| {
+                Self::missing_open_database(
+                    &database.local_path,
+                    SnapshotDatabaseErrorKind::ConnectionClose,
+                )
+            })?;
         self.snapshotfile
             .prepare_for_upload(open_database)
             .map(|prepared| prepared.local_snapshot_db_path)
