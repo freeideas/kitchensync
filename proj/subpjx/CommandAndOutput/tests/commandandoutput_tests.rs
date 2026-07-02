@@ -213,6 +213,88 @@ fn write_output_subprocess_helper() {
                 ),
             );
         }
+        "all_error_diagnostics" => {
+            for (kind, details) in [
+                (
+                    SyncErrorKind::NoSnapshotsAndNoCanon,
+                    "detail-no-snapshots-and-no-canon",
+                ),
+                (SyncErrorKind::UnreachablePeer, "detail-unreachable-peer"),
+                (
+                    SyncErrorKind::DirectoryListingFailure,
+                    "detail-directory-listing-failure",
+                ),
+                (
+                    SyncErrorKind::CanonPeerUnreachable,
+                    "detail-canon-peer-unreachable",
+                ),
+                (
+                    SyncErrorKind::FewerThanTwoReachablePeers,
+                    "detail-fewer-than-two-reachable-peers",
+                ),
+                (
+                    SyncErrorKind::NoContributingPeerReachable,
+                    "detail-no-contributing-peer-reachable",
+                ),
+                (
+                    SyncErrorKind::TransferFailureBeforeSwapOld,
+                    "detail-transfer-failure-before-swap-old",
+                ),
+                (
+                    SyncErrorKind::TransferFailureAfterSwapOld,
+                    "detail-transfer-failure-after-swap-old",
+                ),
+                (SyncErrorKind::ArchiveOldFailure, "detail-archive-old-failure"),
+                (
+                    SyncErrorKind::DisplacementFailure,
+                    "detail-displacement-failure",
+                ),
+                (
+                    SyncErrorKind::TmpOrSwapStagingFailure,
+                    "detail-tmp-or-swap-staging-failure",
+                ),
+                (SyncErrorKind::SetModTimeFailure, "detail-set-mod-time-failure"),
+                (
+                    SyncErrorKind::SnapshotUploadFailureBeforeSwapOld,
+                    "detail-snapshot-upload-failure-before-swap-old",
+                ),
+                (
+                    SyncErrorKind::SnapshotUploadFailureAfterSwapOld,
+                    "detail-snapshot-upload-failure-after-swap-old",
+                ),
+            ] {
+                command.write_output(
+                    Verbosity::Error,
+                    OutputEvent::ErrorDiagnostic(SyncErrorDiagnostic {
+                        kind,
+                        details: arg(details),
+                    }),
+                );
+            }
+        }
+        "all_transfer_phases" => {
+            for phase in [
+                FileTransferPhase::ReadSource,
+                FileTransferPhase::WriteSwapNew,
+                FileTransferPhase::MoveExistingToSwapOld,
+                FileTransferPhase::RenameFinal,
+                FileTransferPhase::SetModTime,
+                FileTransferPhase::ArchiveOld,
+                FileTransferPhase::Cleanup,
+            ] {
+                command.write_output(
+                    Verbosity::Error,
+                    OutputEvent::FailedFileTransfer(
+                        commandandoutput::FailedFileTransferDiagnostic {
+                            relpath: arg("dir/subdir/file.txt"),
+                            destination_peer_url: arg("sftp://host.example/root"),
+                            phase,
+                            transport_error_category: Some(arg("io-timeout")),
+                        },
+                    ),
+                );
+            }
+        }
         _ => panic!("unknown capture case {case_name}"),
     }
     println!("__COMMANDANDOUTPUT_CAPTURE_END__");
@@ -267,6 +349,53 @@ fn write_output_emits_argument_validation_failure_as_error_then_help() {
     let output = captured_write_output("argument_validation_failure");
 
     assert_eq!(output, format!("bad arguments\n{}", help_text()));
+}
+
+#[test]
+fn write_output_emits_each_sync_error_condition_as_a_diagnostic() {
+    let output = captured_write_output("all_error_diagnostics");
+
+    for detail in [
+        "detail-no-snapshots-and-no-canon",
+        "detail-unreachable-peer",
+        "detail-directory-listing-failure",
+        "detail-canon-peer-unreachable",
+        "detail-fewer-than-two-reachable-peers",
+        "detail-no-contributing-peer-reachable",
+        "detail-transfer-failure-before-swap-old",
+        "detail-transfer-failure-after-swap-old",
+        "detail-archive-old-failure",
+        "detail-displacement-failure",
+        "detail-tmp-or-swap-staging-failure",
+        "detail-set-mod-time-failure",
+        "detail-snapshot-upload-failure-before-swap-old",
+        "detail-snapshot-upload-failure-after-swap-old",
+    ] {
+        assert!(output.contains(detail), "missing diagnostic detail {detail}");
+    }
+}
+
+#[test]
+fn failed_file_transfer_diagnostics_cover_each_required_phase_label() {
+    let output = captured_write_output("all_transfer_phases");
+    let lines: Vec<&str> = output.lines().collect();
+    let expected_phases = [
+        "read_source",
+        "write_swap_new",
+        "move_existing_to_swap_old",
+        "rename_final",
+        "set_mod_time",
+        "archive_old",
+        "cleanup",
+    ];
+
+    assert_eq!(lines.len(), expected_phases.len());
+    for (line, phase) in lines.iter().zip(expected_phases) {
+        assert!(line.contains("dir/subdir/file.txt"));
+        assert!(line.contains("sftp://host.example/root"));
+        assert!(line.contains(phase));
+        assert!(line.contains("io-timeout"));
+    }
 }
 
 #[test]
@@ -510,6 +639,28 @@ fn each_positive_integer_global_option_rejects_non_positive_or_non_integer_value
 
     for (option, value) in cases {
         let output = validation_failure(&[option, value, "/left", "/right"]);
+
+        assert!(output.stdout.ends_with(&help_text()));
+        assert_eq!(output.stderr, "");
+        assert_eq!(output.exit_code, 1);
+    }
+}
+
+#[test]
+fn each_valued_global_option_rejects_a_missing_value() {
+    for option in [
+        "--max-copies",
+        "--retries-copy",
+        "--retries-list",
+        "--timeout-conn",
+        "--timeout-idle",
+        "--keep-tmp-days",
+        "--keep-bak-days",
+        "--keep-del-days",
+        "--verbosity",
+        "-x",
+    ] {
+        let output = validation_failure(&[option]);
 
         assert!(output.stdout.ends_with(&help_text()));
         assert_eq!(output.stderr, "");
