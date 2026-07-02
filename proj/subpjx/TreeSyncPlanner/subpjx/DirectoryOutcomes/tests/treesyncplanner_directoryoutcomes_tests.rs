@@ -55,6 +55,20 @@ fn contributing(
     )
 }
 
+fn inactive_contributing(
+    peer_identity: &str,
+    has_live_directory: bool,
+    snapshot: Option<DirectorySnapshotFact>,
+) -> DirectoryPeerInput {
+    peer(
+        peer_identity,
+        DirectoryPeerRole::Contributing,
+        false,
+        has_live_directory,
+        snapshot,
+    )
+}
+
 fn subordinate(peer_identity: &str, has_live_directory: bool) -> DirectoryPeerInput {
     peer(
         peer_identity,
@@ -143,6 +157,32 @@ fn assert_peer_id_set(actual: Vec<String>, expected: &[&str]) {
 
 fn assert_optional_peer_id_set(actual: Option<Vec<String>>, expected: &[&str]) {
     assert_peer_id_set(actual.expect("expected recursion peers"), expected);
+}
+
+#[test]
+fn missing_peer_that_is_not_an_active_target_is_not_created() {
+    let result = subject().decide_directory(request(
+        vec![
+            contributing("live", true, None),
+            contributing("active_missing", false, None),
+            inactive_contributing("inactive_missing", false, None),
+        ],
+        None,
+        DirectorySurvivalEvidence::NotNeeded,
+    ));
+
+    let decision = decision(result);
+    assert_eq!(decision.group_outcome, DirectoryGroupOutcome::Exists);
+    assert_eq!(
+        peer_outcome(&decision, "active_missing"),
+        DirectoryPeerDirectoryOutcome::CreateDirectory
+    );
+    assert_eq!(
+        peer_outcome(&decision, "inactive_missing"),
+        DirectoryPeerDirectoryOutcome::DirectoryAbsent
+    );
+    assert_peer_id_set(creation_peers(&decision), &["active_missing"]);
+    assert_optional_peer_id_set(recursion_peers(&decision), &["live", "active_missing"]);
 }
 
 #[test]
@@ -339,6 +379,30 @@ fn live_directory_conflict_uses_newest_deletion_estimate() {
     );
     assert!(decision.creation_intents.is_empty());
     assert!(decision.recursion.is_none());
+}
+
+#[test]
+fn surviving_live_directory_conflict_creates_absent_voting_peers() {
+    let result = subject().decide_directory(request(
+        vec![
+            contributing("live", true, None),
+            contributing("absent", false, Some(snapshot(Some(at(1_000)), Some(at(900))))),
+        ],
+        None,
+        DirectorySurvivalEvidence::NewestLiveFile {
+            modification_time: at(1_000),
+        },
+    ));
+
+    let decision = decision(result);
+    assert_eq!(decision.group_outcome, DirectoryGroupOutcome::Exists);
+    assert_eq!(
+        peer_outcome(&decision, "absent"),
+        DirectoryPeerDirectoryOutcome::CreateDirectory
+    );
+    assert_peer_id_set(creation_peers(&decision), &["absent"]);
+    assert_optional_peer_id_set(recursion_peers(&decision), &["live", "absent"]);
+    assert!(decision.displacement_intents.is_empty());
 }
 
 #[test]
