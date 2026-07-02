@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use treesyncplanner_fileoutcomes::{
     ClassifiedLiveFile, FileAbsenceIntent, FileGroupOutcome, FileOutcomePeer,
-    FileOutcomePeerRole, FileOutcomeRequest, FileOutcomeSource, FileOutcomes, FileSnapshotRow,
-    LiveFileFact, PeerFileClassificationRequest, PeerFileDecisionStatus, PeerFilePresenceFact,
-    PeerFileState, SyncTimestamp,
+    FileOutcomePeerRole, FileOutcomeRequest, FileOutcomeSource, FileOutcomes, FileOutcomesError,
+    FileSnapshotRow, LiveFileFact, PeerFileClassificationRequest, PeerFileDecisionStatus,
+    PeerFilePresenceFact, PeerFileState, SyncTimestamp,
 };
 
 fn subject() -> Arc<dyn FileOutcomes> {
@@ -186,6 +186,31 @@ fn classifies_live_and_absent_peer_file_states_with_five_second_tolerance() {
 }
 
 #[test]
+fn classification_rejects_missing_snapshot_metadata_needed_for_live_comparison() {
+    let file_outcomes = subject();
+
+    let error = file_outcomes
+        .classify_peer_file(PeerFileClassificationRequest {
+            peer_id: "missing-metadata".to_string(),
+            relative_path: "CaseName.txt".to_string(),
+            presence: PeerFilePresenceFact::LiveFile(LiveFileFact {
+                byte_size: 12,
+                modified_time: ts(100),
+                source_relative_path: "CaseName.txt".to_string(),
+            }),
+            snapshot_row: Some(FileSnapshotRow {
+                byte_size: Some(12),
+                modified_time: None,
+                deleted_time: None,
+            }),
+            last_seen: None,
+        })
+        .expect_err("missing snapshot metadata should be invalid");
+
+    assert!(matches!(error, FileOutcomesError::InvalidInput(_)));
+}
+
+#[test]
 fn canon_peer_file_or_absence_selects_outcome_without_non_canon_votes_changing_it() {
     let file_outcomes = subject();
 
@@ -292,8 +317,8 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
         vec![
             peer("old", FileOutcomePeerRole::Contributing, live(999, 94, "CaseName.txt")),
             peer("small", FileOutcomePeerRole::Contributing, live(10, 100, "CaseName.txt")),
-            peer("large-a", FileOutcomePeerRole::Contributing, live(20, 104, "CaseName.txt")),
-            peer("large-b", FileOutcomePeerRole::Contributing, new_live(20, 105, "CaseName.txt")),
+            peer("large-a", FileOutcomePeerRole::Contributing, live(20, 104, "caseName.TXT")),
+            peer("large-b", FileOutcomePeerRole::Contributing, new_live(20, 105, "CASENAME.txt")),
             peer("near-match", FileOutcomePeerRole::Subordinate, live(20, 101, "CaseName.txt")),
             peer("missing", FileOutcomePeerRole::Subordinate, PeerFileState::AbsentNoRowNoVote),
         ],
@@ -309,13 +334,13 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
     assert_eq!(decision.source_peers.len(), 2);
     assert!(decision.source_peers.contains(&FileOutcomeSource {
         peer_id: "large-a".to_string(),
-        source_relative_path: "CaseName.txt".to_string(),
+        source_relative_path: "caseName.TXT".to_string(),
         byte_size: 20,
         modified_time: ts(104),
     }));
     assert!(decision.source_peers.contains(&FileOutcomeSource {
         peer_id: "large-b".to_string(),
-        source_relative_path: "CaseName.txt".to_string(),
+        source_relative_path: "CASENAME.txt".to_string(),
         byte_size: 20,
         modified_time: ts(105),
     }));
@@ -341,12 +366,12 @@ fn live_file_winner_uses_tolerance_then_size_and_copies_from_an_identical_source
     assert!(decision.copy_intents.iter().all(|intent| {
         intent.source_peer_id == "large-a" || intent.source_peer_id == "large-b"
     }));
-    assert!(
-        decision
-            .copy_intents
-            .iter()
-            .all(|intent| intent.source_relative_path == "CaseName.txt")
-    );
+    assert!(decision.copy_intents.iter().all(|intent| {
+        (intent.source_peer_id.as_str() == "large-a"
+            && intent.source_relative_path.as_str() == "caseName.TXT")
+            || (intent.source_peer_id.as_str() == "large-b"
+                && intent.source_relative_path.as_str() == "CASENAME.txt")
+    }));
     assert_has_status(&decision, "small", PeerFileDecisionStatus::VotedForExistingFile);
     assert_has_status(&decision, "large-a", PeerFileDecisionStatus::IdenticalSource);
     assert_has_status(&decision, "large-b", PeerFileDecisionStatus::IdenticalSource);

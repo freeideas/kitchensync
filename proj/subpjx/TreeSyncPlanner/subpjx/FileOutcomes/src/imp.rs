@@ -1,4 +1,5 @@
 use crate::api::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 struct FileOutcomesImpl {
@@ -32,12 +33,13 @@ impl FileOutcomes for FileOutcomesImpl {
         &self,
         request: FileOutcomeRequest,
     ) -> Result<FileOutcomeDecision, FileOutcomesError> {
+        let source_relative_paths = source_relative_paths_by_peer(&request)?;
         let output = self
             .groupfiledecision
             .decide_group_file(to_group_request(request))
             .map_err(from_group_error)?;
 
-        Ok(from_group_output(output))
+        Ok(from_group_output(output, &source_relative_paths))
     }
 }
 
@@ -125,30 +127,45 @@ fn from_peer_live_file(
 fn to_group_request(
     request: FileOutcomeRequest,
 ) -> treesyncplanner_fileoutcomes_groupfiledecision::GroupFileDecisionRequest {
+    let relative_path = request.relative_path;
     treesyncplanner_fileoutcomes_groupfiledecision::GroupFileDecisionRequest {
-        relative_path: request.relative_path,
-        peers: request.peers.into_iter().map(to_group_peer).collect(),
+        peers: request
+            .peers
+            .into_iter()
+            .map(|peer| to_group_peer(peer, &relative_path))
+            .collect(),
+        relative_path,
     }
 }
 
 fn to_group_peer(
     peer: FileOutcomePeer,
+    relative_path: &str,
 ) -> treesyncplanner_fileoutcomes_groupfiledecision::GroupFileDecisionPeer {
     treesyncplanner_fileoutcomes_groupfiledecision::GroupFileDecisionPeer {
         peer_id: peer.peer_id,
         role: to_group_role(peer.role),
-        classification: to_group_state(peer.classification),
+        classification: to_group_state(peer.classification, relative_path),
     }
 }
 
 fn from_group_output(
     output: treesyncplanner_fileoutcomes_groupfiledecision::GroupFileDecisionOutput,
+    source_relative_paths: &HashMap<String, String>,
 ) -> FileOutcomeDecision {
     FileOutcomeDecision {
         relative_path: output.relative_path,
         group_outcome: from_group_outcome(output.group_outcome),
-        source_peers: output.source_peers.into_iter().map(from_group_source).collect(),
-        copy_intents: output.copy_intents.into_iter().map(from_group_copy_intent).collect(),
+        source_peers: output
+            .source_peers
+            .into_iter()
+            .map(|source| from_group_source(source, source_relative_paths))
+            .collect(),
+        copy_intents: output
+            .copy_intents
+            .into_iter()
+            .map(|intent| from_group_copy_intent(intent, source_relative_paths))
+            .collect(),
         absence_intents: output
             .absence_intents
             .into_iter()
@@ -157,28 +174,59 @@ fn from_group_output(
         peer_decisions: output
             .peer_decisions
             .into_iter()
-            .map(from_group_peer_decision)
+            .map(|fact| from_group_peer_decision(fact, source_relative_paths))
             .collect(),
+    }
+}
+
+fn source_relative_paths_by_peer(
+    request: &FileOutcomeRequest,
+) -> Result<HashMap<String, String>, FileOutcomesError> {
+    let mut source_relative_paths = HashMap::new();
+
+    for peer in &request.peers {
+        if let Some(file) = live_file_from_state(&peer.classification) {
+            if file.source_relative_path.is_empty() {
+                return Err(FileOutcomesError::InvalidInput(
+                    "live file source_relative_path must not be empty".to_string(),
+                ));
+            }
+            source_relative_paths.insert(peer.peer_id.clone(), file.source_relative_path.clone());
+        }
+    }
+
+    Ok(source_relative_paths)
+}
+
+fn live_file_from_state(state: &PeerFileState) -> Option<&ClassifiedLiveFile> {
+    match state {
+        PeerFileState::UnchangedLiveFile(file)
+        | PeerFileState::ModifiedLiveFile(file)
+        | PeerFileState::NewLiveFile(file) => Some(file),
+        PeerFileState::DeletedFile { .. }
+        | PeerFileState::AbsentUnconfirmed { .. }
+        | PeerFileState::AbsentNoRowNoVote => None,
     }
 }
 
 fn to_group_state(
     state: PeerFileState,
+    relative_path: &str,
 ) -> treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState {
     match state {
         PeerFileState::UnchangedLiveFile(file) => {
             treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::UnchangedLiveFile(
-                to_group_live_file(file),
+                to_group_live_file(file, relative_path),
             )
         }
         PeerFileState::ModifiedLiveFile(file) => {
             treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::ModifiedLiveFile(
-                to_group_live_file(file),
+                to_group_live_file(file, relative_path),
             )
         }
         PeerFileState::NewLiveFile(file) => {
             treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::NewLiveFile(
-                to_group_live_file(file),
+                to_group_live_file(file, relative_path),
             )
         }
         PeerFileState::DeletedFile {
@@ -199,16 +247,30 @@ fn to_group_state(
 
 fn from_group_state(
     state: treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState,
+    peer_id: &str,
+    source_relative_paths: &HashMap<String, String>,
 ) -> PeerFileState {
     match state {
         treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::UnchangedLiveFile(file) => {
-            PeerFileState::UnchangedLiveFile(from_group_live_file(file))
+            PeerFileState::UnchangedLiveFile(from_group_live_file(
+                file,
+                peer_id,
+                source_relative_paths,
+            ))
         }
         treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::ModifiedLiveFile(file) => {
-            PeerFileState::ModifiedLiveFile(from_group_live_file(file))
+            PeerFileState::ModifiedLiveFile(from_group_live_file(
+                file,
+                peer_id,
+                source_relative_paths,
+            ))
         }
         treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::NewLiveFile(file) => {
-            PeerFileState::NewLiveFile(from_group_live_file(file))
+            PeerFileState::NewLiveFile(from_group_live_file(
+                file,
+                peer_id,
+                source_relative_paths,
+            ))
         }
         treesyncplanner_fileoutcomes_groupfiledecision::PeerFileState::DeletedFile {
             deletion_estimate,
@@ -228,21 +290,27 @@ fn from_group_state(
 
 fn to_group_live_file(
     file: ClassifiedLiveFile,
+    relative_path: &str,
 ) -> treesyncplanner_fileoutcomes_groupfiledecision::ClassifiedLiveFile {
     treesyncplanner_fileoutcomes_groupfiledecision::ClassifiedLiveFile {
         byte_size: file.byte_size,
         modified_time: to_group_timestamp(file.modified_time),
-        source_relative_path: file.source_relative_path,
+        source_relative_path: relative_path.to_string(),
     }
 }
 
 fn from_group_live_file(
     file: treesyncplanner_fileoutcomes_groupfiledecision::ClassifiedLiveFile,
+    peer_id: &str,
+    source_relative_paths: &HashMap<String, String>,
 ) -> ClassifiedLiveFile {
     ClassifiedLiveFile {
         byte_size: file.byte_size,
         modified_time: from_group_timestamp(file.modified_time),
-        source_relative_path: file.source_relative_path,
+        source_relative_path: source_relative_paths
+            .get(peer_id)
+            .cloned()
+            .unwrap_or(file.source_relative_path),
     }
 }
 
@@ -270,10 +338,16 @@ fn from_group_outcome(
 
 fn from_group_source(
     source: treesyncplanner_fileoutcomes_groupfiledecision::FileOutcomeSource,
+    source_relative_paths: &HashMap<String, String>,
 ) -> FileOutcomeSource {
+    let source_relative_path = source_relative_paths
+        .get(&source.peer_id)
+        .cloned()
+        .unwrap_or(source.source_relative_path);
+
     FileOutcomeSource {
         peer_id: source.peer_id,
-        source_relative_path: source.source_relative_path,
+        source_relative_path,
         byte_size: source.byte_size,
         modified_time: from_group_timestamp(source.modified_time),
     }
@@ -281,10 +355,16 @@ fn from_group_source(
 
 fn from_group_copy_intent(
     intent: treesyncplanner_fileoutcomes_groupfiledecision::FileCopyIntent,
+    source_relative_paths: &HashMap<String, String>,
 ) -> FileCopyIntent {
+    let source_relative_path = source_relative_paths
+        .get(&intent.source_peer_id)
+        .cloned()
+        .unwrap_or(intent.source_relative_path);
+
     FileCopyIntent {
         source_peer_id: intent.source_peer_id,
-        source_relative_path: intent.source_relative_path,
+        source_relative_path,
         destination_peer_id: intent.destination_peer_id,
         destination_relative_path: intent.destination_relative_path,
         winning_byte_size: intent.winning_byte_size,
@@ -315,11 +395,13 @@ fn from_group_absence_intent(
 
 fn from_group_peer_decision(
     fact: treesyncplanner_fileoutcomes_groupfiledecision::PeerFileDecisionFact,
+    source_relative_paths: &HashMap<String, String>,
 ) -> PeerFileDecisionFact {
+    let peer_id = fact.peer_id;
     PeerFileDecisionFact {
-        peer_id: fact.peer_id,
+        classification: from_group_state(fact.classification, &peer_id, source_relative_paths),
+        peer_id,
         role: from_group_role(fact.role),
-        classification: from_group_state(fact.classification),
         statuses: fact.statuses.into_iter().map(from_group_status).collect(),
     }
 }
