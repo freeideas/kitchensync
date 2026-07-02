@@ -289,6 +289,123 @@ fn exhausted_try_limit_stops_requeueing_the_failed_copy() {
 }
 
 #[test]
+fn three_total_tries_include_the_first_try() {
+    let subject = queue_runner();
+    let events = recorded_events();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+
+    subject.start_run(QueueRunnerRunConfig {
+        max_active_copies: Some(1),
+        max_total_tries_per_copy: 3,
+        transfer_operation: {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |copy, try_number| {
+                attempts
+                    .lock()
+                    .expect("attempts mutex poisoned")
+                    .push((copy.copy_id.value, try_number));
+                QueueRunnerTransferResult::Failure(failure())
+            })
+        },
+        event_sink: event_sink(&events),
+    });
+
+    subject.enqueue_copy(copy_work(
+        31,
+        QueueRunnerPeerScheme::File,
+        QueueRunnerPeerScheme::File,
+        "peer-three-try-limit",
+    ));
+
+    let result = subject.close_and_drain();
+
+    assert_eq!(
+        vec![(31, 1), (31, 2), (31, 3)],
+        attempts.lock().expect("attempts mutex poisoned").clone()
+    );
+    assert_copy_result(&result, 31, 3, QueueRunnerCopyOutcome::FailedAfterTryLimit);
+    assert_event_counts(&events, 3, 3, 3, 0, 0, 3);
+    assert_eq!(
+        vec![(31, 1), (31, 2), (31, 3)],
+        sorted(transfer_failure_attempts(&events))
+    );
+    assert_balanced_slot_events(&events);
+}
+
+#[test]
+fn copy_try_limit_rules_are_the_same_for_every_supported_scheme_mix() {
+    let subject = queue_runner();
+    let events = recorded_events();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+
+    subject.start_run(QueueRunnerRunConfig {
+        max_active_copies: Some(1),
+        max_total_tries_per_copy: 2,
+        transfer_operation: {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |copy, try_number| {
+                attempts
+                    .lock()
+                    .expect("attempts mutex poisoned")
+                    .push((copy.copy_id.value, try_number));
+                QueueRunnerTransferResult::Failure(failure())
+            })
+        },
+        event_sink: event_sink(&events),
+    });
+
+    let scheme_mixes = [
+        (QueueRunnerPeerScheme::File, QueueRunnerPeerScheme::File),
+        (QueueRunnerPeerScheme::File, QueueRunnerPeerScheme::Sftp),
+        (QueueRunnerPeerScheme::Sftp, QueueRunnerPeerScheme::File),
+        (QueueRunnerPeerScheme::Sftp, QueueRunnerPeerScheme::Sftp),
+    ];
+
+    for (index, (source_scheme, destination_scheme)) in scheme_mixes.iter().enumerate() {
+        subject.enqueue_copy(copy_work(
+            index as u64 + 41,
+            *source_scheme,
+            *destination_scheme,
+            "peer-scheme-limit",
+        ));
+    }
+
+    let result = subject.close_and_drain();
+
+    assert_eq!(
+        vec![
+            (41, 1),
+            (42, 1),
+            (43, 1),
+            (44, 1),
+            (41, 2),
+            (42, 2),
+            (43, 2),
+            (44, 2),
+        ],
+        attempts.lock().expect("attempts mutex poisoned").clone()
+    );
+    for copy_id in 41..=44 {
+        assert_copy_result(&result, copy_id, 2, QueueRunnerCopyOutcome::FailedAfterTryLimit);
+    }
+    assert_event_counts(&events, 8, 8, 8, 0, 0, 8);
+    assert_eq!(
+        vec![
+            (41, 1),
+            (41, 2),
+            (42, 1),
+            (42, 2),
+            (43, 1),
+            (43, 2),
+            (44, 1),
+            (44, 2),
+        ],
+        sorted(transfer_failure_attempts(&events))
+    );
+    assert_balanced_slot_events(&events);
+}
+
+#[test]
 fn skip_result_records_skipped_copy_and_does_not_requeue_it() {
     let subject = queue_runner();
     let events = recorded_events();
