@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::api::*;
 
@@ -106,7 +106,7 @@ impl DirectoryOutcomes for DirectoryOutcomesImpl {
                 );
             }
 
-            let mut newest_deletion_estimate = None;
+            let mut newest_deletion_estimate: Option<SystemTime> = None;
             for peer in absent_voting {
                 let Some(snapshot) = &peer.snapshot else {
                     return invalid(
