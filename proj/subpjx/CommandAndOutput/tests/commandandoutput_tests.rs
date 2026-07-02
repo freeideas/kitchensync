@@ -1,11 +1,13 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use commandandoutput::{
     CommandAndOutput, CommandParseResult, FileTransferPhase, LocalPeerTarget, OutputEvent,
-    PeerLocation, PeerRole, SftpPeerTarget, TransportErrorCategory, UrlConnectionSettings,
-    Verbosity,
+    PeerLocation, PeerRole, SftpPeerTarget, SyncErrorDiagnostic, SyncErrorKind,
+    TransportErrorCategory, UrlConnectionSettings, Verbosity,
 };
 
 fn subject() -> Arc<dyn CommandAndOutput> {
@@ -53,18 +55,45 @@ fn validation_failure(values: &[&str]) -> commandandoutput::CommandProcessOutput
 }
 
 fn captured_write_output(case_name: &str) -> String {
-    let output = Command::new(std::env::current_exe().expect("current test executable"))
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .arg("--ignored")
         .arg("--exact")
         .arg("write_output_subprocess_helper")
         .arg("--nocapture")
         .env("COMMANDANDOUTPUT_CAPTURE_CASE", case_name)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("capture helper runs");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().expect("capture helper status").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("capture helper output");
+            panic!(
+                "capture helper timed out\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().expect("capture helper output");
 
     assert!(
         output.status.success(),
         "capture helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stderr,
+        Vec::<u8>::new(),
+        "write_output wrote stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -178,12 +207,30 @@ fn write_output_subprocess_helper() {
             command.write_output(Verbosity::Error, OutputEvent::NoContributingPeerReachable);
             command.write_output(
                 Verbosity::Error,
+                OutputEvent::ErrorDiagnostic(SyncErrorDiagnostic {
+                    kind: SyncErrorKind::DirectoryListingFailure,
+                    details: arg("listing failed for sftp://host.example/root"),
+                }),
+            );
+            command.write_output(
+                Verbosity::Error,
                 OutputEvent::FailedFileTransfer(commandandoutput::FailedFileTransferDiagnostic {
                     relpath: arg("dir/file.txt"),
                     destination_peer_url: arg("sftp://host.example/root"),
                     phase: FileTransferPhase::WriteSwapNew,
                     transport_error: Some(TransportErrorCategory::PermissionDenied),
                 }),
+            );
+        }
+        "argument_validation_failure" => {
+            command.write_output(
+                Verbosity::Error,
+                OutputEvent::ArgumentValidationFailure(
+                    commandandoutput::ArgumentValidationFailureOutput {
+                        error_message: arg("bad arguments"),
+                        help_text: help_text(),
+                    },
+                ),
             );
         }
         _ => panic!("unknown capture case {case_name}"),
@@ -226,10 +273,20 @@ fn write_output_emits_required_diagnostic_lines() {
 
     assert!(output.contains("First sync? Mark the authoritative peer with a leading +"));
     assert!(output.contains("No contributing peer reachable - cannot make sync decisions"));
-    assert!(output.contains("relpath=dir/file.txt"));
-    assert!(output.contains("destination=sftp://host.example/root"));
-    assert!(output.contains("phase=write_swap_new"));
-    assert!(output.contains("category=permission_denied"));
+    assert!(output.contains("listing failed for sftp://host.example/root"));
+    assert!(output.contains("dir/file.txt"));
+    assert!(output.contains("sftp://host.example/root"));
+    assert!(output.contains("write_swap_new"));
+    let lower_output = output.to_lowercase();
+    assert!(lower_output.contains("permission"));
+    assert!(lower_output.contains("denied"));
+}
+
+#[test]
+fn write_output_emits_argument_validation_failure_as_error_then_help() {
+    let output = captured_write_output("argument_validation_failure");
+
+    assert_eq!(output, format!("bad arguments\n{}", help_text()));
 }
 
 #[test]
