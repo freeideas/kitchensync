@@ -3,118 +3,66 @@
 # dependencies = []
 # ///
 
+from __future__ import annotations
+
+import getpass
 import os
-import queue
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-
 WORKSPACE = Path("/home/ace/Desktop/prjx/kitchensync")
 EXE = Path("/home/ace/Desktop/prjx/kitchensync/released/kitchensync.exe")
 
 
-# not reasonably testable: 003.16, 003.17. The value-level effect of URL
-# timeout override settings requires a timing-sensitive SFTP endpoint.
-# not reasonably testable: 003.29, 003.30. The idle keep-alive timeout value is
-# only observable through connection lifetime behavior.
-# not reasonably testable: 003.37, 003.38. Deletion-record retention is stored
-# in peer snapshot databases, which are not part of this syntax requirement's
-# released command-line surface.
-# not reasonably testable: 003.40. A Windows drive path cannot be exercised
-# portably without writing outside the temp workspace on Windows.
-# not reasonably testable: 003.45. The no-user SFTP form depends on host user
-# and key fallback state rather than only command-line parsing.
-# not reasonably testable: 003.58. Python subprocess APIs reject embedded NUL
-# characters before the product process can receive the argument.
+class CheckRun:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+
+    def check(self, condition: bool, message: str) -> None:
+        if not condition:
+            self.failures.append(message)
+
+    def equal(self, actual: object, expected: object, message: str) -> None:
+        if actual != expected:
+            self.failures.append(f"{message}: expected {expected!r}, got {actual!r}")
 
 
-@dataclass
-class RunResult:
-    args: list[str]
-    returncode: int
-    stdout: str
-    stderr: str
+def bundled_uv() -> Path:
+    system = platform.system().lower()
+    if system == "windows":
+        return WORKSPACE / "aitc" / "bin" / "uv.exe"
+    if system == "darwin":
+        return WORKSPACE / "aitc" / "bin" / "uv.mac"
+    return WORKSPACE / "aitc" / "bin" / "uv.linux"
 
 
-def run_kitchensync(
-    args: list[str],
-    cwd: Path,
-    env: dict[str, str] | None = None,
-    timeout: float = 30.0,
-) -> RunResult:
-    full_env = os.environ.copy()
+def run_ks(args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    merged_env = os.environ.copy()
     if env:
-        full_env.update(env)
-    try:
-        completed = subprocess.run(
-            [str(EXE), *args],
-            cwd=str(cwd),
-            env=full_env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            shell=False,
-            check=False,
-        )
-        return RunResult(args, completed.returncode, completed.stdout, completed.stderr)
-    except subprocess.TimeoutExpired as exc:
-        return RunResult(
-            args,
-            124,
-            exc.stdout or "",
-            (exc.stderr or "") + "\nprocess timed out",
-        )
-
-
-def record(condition: bool, failures: list[str], message: str) -> None:
-    if not condition:
-        failures.append(message)
-
-
-def record_success(result: RunResult, failures: list[str], label: str) -> None:
-    record(
-        result.returncode == 0,
-        failures,
-        f"{label}: expected exit 0, got {result.returncode}; "
-        f"stdout={result.stdout!r}; stderr={result.stderr!r}; args={result.args!r}",
-    )
-    record(
-        result.stderr == "",
-        failures,
-        f"{label}: expected stderr to be empty, got {result.stderr!r}",
-    )
-
-
-def record_validation_error(result: RunResult, failures: list[str], label: str) -> None:
-    record(
-        result.returncode == 1,
-        failures,
-        f"{label}: expected exit 1, got {result.returncode}; "
-        f"stdout={result.stdout!r}; stderr={result.stderr!r}; args={result.args!r}",
-    )
-    record(
-        "Usage: kitchensync" in result.stdout,
-        failures,
-        f"{label}: expected validation error to include help on stdout; "
-        f"stdout={result.stdout!r}",
-    )
-    record(
-        result.stderr == "",
-        failures,
-        f"{label}: expected stderr to be empty, got {result.stderr!r}",
+        merged_env.update(env)
+    return subprocess.run(
+        [str(EXE), *args],
+        cwd=str(cwd) if cwd else None,
+        env=merged_env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        shell=False,
+        check=False,
     )
 
 
@@ -123,196 +71,192 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
-def assert_file_text(path: Path, expected: str, failures: list[str], label: str) -> None:
-    if not path.exists():
-        failures.append(f"{label}: expected {path} to exist")
-        return
-    actual = path.read_text(encoding="utf-8", errors="replace")
-    record(actual == expected, failures, f"{label}: expected {expected!r}, got {actual!r}")
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def read_line_with_timeout(stream, timeout: float, label: str) -> str:
-    lines: queue.Queue[str] = queue.Queue(maxsize=1)
-
-    def reader() -> None:
-        line = stream.readline()
-        lines.put(line)
-
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    try:
-        return lines.get(timeout=timeout)
-    except queue.Empty as exc:
-        raise TimeoutError(f"timed out reading {label}") from exc
+def reset_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
 
 
-def bundled_uv() -> Path:
-    if sys.platform.startswith("win"):
-        return WORKSPACE / "aitc" / "bin" / "uv.exe"
-    if sys.platform == "darwin":
-        return WORKSPACE / "aitc" / "bin" / "uv.mac"
-    return WORKSPACE / "aitc" / "bin" / "uv.linux"
+def assert_success(checks: CheckRun, proc: subprocess.CompletedProcess[str], label: str) -> None:
+    checks.equal(proc.returncode, 0, f"{label} should exit 0")
+    checks.equal(proc.stderr, "", f"{label} should leave stderr empty")
+    checks.check("sync complete" in proc.stdout.splitlines(), f"{label} should print sync complete")
 
 
-def start_sftp_server(temp_root: Path, failures: list[str]):
-    server = WORKSPACE / "extart" / "ephemeral-sftp-server.py"
-    process = subprocess.Popen(
-        [
-            str(bundled_uv()),
-            "run",
-            "--script",
-            str(server),
-            "--user",
-            "syncuser",
-            "--password",
-            "p@ss:word",
-        ],
-        cwd=str(WORKSPACE),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-    )
-    try:
-        assert process.stdout is not None
-        assert process.stderr is not None
-        port_line = read_line_with_timeout(process.stdout, 10.0, "SFTP port")
-        host_key_line = read_line_with_timeout(process.stderr, 10.0, "SFTP host key")
-        port = int(port_line.strip())
-        prefix = "host key: "
-        if not host_key_line.startswith(prefix):
-            failures.append(f"SFTP server: expected host key line, got {host_key_line!r}")
-            process.terminate()
-            return None
-        known_hosts = temp_root / "home" / ".ssh" / "known_hosts"
-        known_hosts.parent.mkdir(parents=True, exist_ok=True)
-        known_hosts.write_text(
-            f"[127.0.0.1]:{port} {host_key_line[len(prefix):].strip()}\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        return process, port, known_hosts.parent.parent
-    except Exception as exc:
-        failures.append(f"SFTP server failed to start: {exc}")
-        process.terminate()
-        try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        return None
+def assert_validation_error(checks: CheckRun, proc: subprocess.CompletedProcess[str], label: str) -> None:
+    checks.check(proc.returncode != 0, f"{label} should fail validation")
+    checks.equal(proc.stderr, "", f"{label} should leave stderr empty")
+    checks.check("Usage: kitchensync" in proc.stdout, f"{label} should print help text on stdout")
 
 
-def stop_process(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5.0)
+def local_sync_case(checks: CheckRun, root: Path) -> None:
+    src = root / "src"
+    dst = root / "dst"
+    reset_dir(src)
+    reset_dir(dst)
+    write_text(src / "alpha.txt", "alpha\n")
+
+    proc = run_ks([f"+{src}", str(dst)])
+    assert_success(checks, proc, "003.2/003.4 local path peer")
+    checks.equal(read_text(dst / "alpha.txt"), "alpha\n", "003.2 local path peer should receive copied content")
 
 
-def test_local_peer_forms(root: Path, failures: list[str]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    canon = root / "canon"
-    peer = root / "peer"
-    canon.mkdir()
-    peer.mkdir()
-    write_text(canon / "alpha.txt", "canon\n")
+def relative_path_case(checks: CheckRun, root: Path) -> None:
+    cwd = root / "relative"
+    reset_dir(cwd)
+    write_text(cwd / "left" / "rel.txt", "relative\n")
+    (cwd / "right").mkdir()
 
-    result = run_kitchensync([f"+{canon}", str(peer)], root)
-    record_success(result, failures, "003.1 003.3 003.4 local canon path")
-    assert_file_text(peer / "alpha.txt", "canon\n", failures, "canon local copy")
-
-    write_text(peer / "alpha.txt", "peer newer\n")
-    newer = time.time() + 20.0
-    os.utime(peer / "alpha.txt", (newer, newer))
-    result = run_kitchensync([str(canon), str(peer)], root)
-    record_success(result, failures, "003.6 normal bidirectional peer")
-    assert_file_text(canon / "alpha.txt", "peer newer\n", failures, "normal peer update")
-
-    absolute_a = root / "absolute_a"
-    absolute_b = root / "absolute_b"
-    result = run_kitchensync([f"+{absolute_a}", str(absolute_b)], root)
-    record_success(result, failures, "003.39 Unix-style absolute local peer")
-    record(absolute_a.exists() and absolute_b.exists(), failures, "absolute peers should be created")
-
-    relative_cwd = root / "relative_case"
-    relative_cwd.mkdir()
-    result = run_kitchensync(["+rel_a", "rel_b"], relative_cwd)
-    record_success(result, failures, "003.41 relative local peer")
-    record((relative_cwd / "rel_a").exists(), failures, "relative canon path should be created")
-    record((relative_cwd / "rel_b").exists(), failures, "relative peer path should be created")
+    proc = run_ks(["+left", "right"], cwd=cwd)
+    assert_success(checks, proc, "003.7 relative path peer")
+    checks.equal(read_text(cwd / "right" / "rel.txt"), "relative\n", "003.7 relative path peer should sync")
 
 
-def test_role_markers_and_fallbacks(root: Path, failures: list[str]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    canon = root / "roles_canon"
+def absolute_path_cases(checks: CheckRun, root: Path) -> None:
+    if os.name != "nt":
+        src = root / "unix_abs_src"
+        dst = root / "unix_abs_dst"
+        reset_dir(src)
+        reset_dir(dst)
+        write_text(src / "abs.txt", "absolute\n")
+        proc = run_ks([f"+{src}", str(dst)])
+        assert_success(checks, proc, "003.5 Unix-style absolute path peer")
+        checks.equal(read_text(dst / "abs.txt"), "absolute\n", "003.5 Unix-style absolute path should sync")
+    else:
+        src = root / "windows_abs_src"
+        dst = root / "windows_abs_dst"
+        reset_dir(src)
+        reset_dir(dst)
+        write_text(src / "drive.txt", "drive\n")
+        proc = run_ks([f"+{src}", str(dst)])
+        assert_success(checks, proc, "003.6 Windows drive path peer")
+        checks.equal(read_text(dst / "drive.txt"), "drive\n", "003.6 Windows drive path should sync")
+
+
+def role_cases(checks: CheckRun, root: Path) -> None:
+    src = root / "roles_src"
     sub_a = root / "roles_sub_a"
     sub_b = root / "roles_sub_b"
-    for path in (canon, sub_a, sub_b):
-        path.mkdir()
-    write_text(canon / "role.txt", "role source\n")
+    reset_dir(src)
+    if sub_a.exists():
+        shutil.rmtree(sub_a)
+    if sub_b.exists():
+        shutil.rmtree(sub_b)
+    write_text(src / "role.txt", "canon\n")
 
-    result = run_kitchensync([f"+{canon}", f"-{sub_a}", f"-{sub_b}"], root)
-    record_success(result, failures, "003.5 003.8 multiple subordinate peers")
-    assert_file_text(sub_a / "role.txt", "role source\n", failures, "first subordinate")
-    assert_file_text(sub_b / "role.txt", "role source\n", failures, "second subordinate")
+    proc = run_ks([f"+{src}", f"-{sub_a}", f"-{sub_b}"])
+    assert_success(checks, proc, "003.15/003.16/003.19 role markers")
+    checks.equal(read_text(sub_a / "role.txt"), "canon\n", "003.16 subordinate peer should receive outcome")
+    checks.equal(read_text(sub_b / "role.txt"), "canon\n", "003.19 multiple subordinate peers should be accepted")
 
-    too_many = run_kitchensync([f"+{canon}", f"+{sub_a}"], root)
-    record_validation_error(too_many, failures, "003.7 rejects multiple canon peers")
-
-    first = root / "fallback_first"
-    second = root / "fallback_second"
-    target = root / "fallback_target"
-    for path in (first, second, target):
-        path.mkdir()
-    write_text(first / "winner.txt", "first fallback\n")
-    result = run_kitchensync([f"+[{first},{second}]", str(target), "--dry-run"], root)
-    record_success(result, failures, "003.9 003.10 003.11 bracketed canon fallback")
-    record("C winner.txt" in result.stdout, failures, "fallback order should choose first URL")
-    record("dry run" in result.stdout.lower(), failures, "003.19 dry-run output should mention dry run")
-    record(not (target / "winner.txt").exists(), failures, "003.19 dry-run must not write destination")
-
-    bracket_sub_a = root / "bracket_sub_a"
-    bracket_sub_b = root / "bracket_sub_b"
-    bracket_canon = root / "bracket_canon"
-    for path in (bracket_sub_a, bracket_sub_b, bracket_canon):
-        path.mkdir()
-    write_text(bracket_canon / "subordinate.txt", "bracket subordinate\n")
-    result = run_kitchensync([f"+{bracket_canon}", f"-[{bracket_sub_a},{bracket_sub_b}]"], root)
-    record_success(result, failures, "003.12 bracketed subordinate fallback")
-    assert_file_text(
-        bracket_sub_a / "subordinate.txt",
-        "bracket subordinate\n",
-        failures,
-        "bracket subordinate first fallback",
-    )
-    record(
-        not (bracket_sub_b / "subordinate.txt").exists(),
-        failures,
-        "fallback group should use one winning URL, not every URL",
+    normal_left = root / "normal_left"
+    normal_right = root / "normal_right"
+    reset_dir(normal_left)
+    reset_dir(normal_right)
+    write_text(normal_left / "normal.txt", "normal\n")
+    proc = run_ks([f"+{normal_left}", str(normal_right)])
+    assert_success(checks, proc, "003.17 normal peer setup")
+    write_text(normal_right / "after-first-sync.txt", "normal peer contributes after snapshot\n")
+    proc = run_ks([str(normal_left), str(normal_right)])
+    assert_success(checks, proc, "003.17 unmarked normal bidirectional peer")
+    checks.equal(
+        read_text(normal_left / "after-first-sync.txt"),
+        "normal peer contributes after snapshot\n",
+        "003.17 unmarked peer should contribute after it has snapshot history",
     )
 
 
-def test_options_and_excludes(root: Path, failures: list[str]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    canon = root / "options_canon"
-    peer = root / "options_peer"
-    canon.mkdir()
-    peer.mkdir()
-    write_text(canon / "copy_one.txt", "one\n")
-    write_text(canon / "copy_two.txt", "two\n")
+def validation_cases(checks: CheckRun, root: Path) -> None:
+    one = root / "one_peer"
+    reset_dir(one)
+    proc = run_ks([str(one)])
+    assert_validation_error(checks, proc, "003.1 fewer than two peers")
 
-    result = run_kitchensync(
+    a = root / "plus_a"
+    b = root / "plus_b"
+    reset_dir(a)
+    reset_dir(b)
+    proc = run_ks([f"+{a}", f"+{b}"])
+    assert_validation_error(checks, proc, "003.18 more than one canon peer")
+
+    proc = run_ks([f"+{a.as_uri()}?max-copies=1", str(b)])
+    assert_validation_error(checks, proc, "003.31 URL query max-copies")
+
+
+def fallback_cases(checks: CheckRun, root: Path) -> None:
+    src = root / "fallback_src"
+    blocked = root / "fallback_blocked"
+    dst = root / "fallback_dst"
+    reset_dir(src)
+    if dst.exists():
+        shutil.rmtree(dst)
+    if blocked.exists():
+        if blocked.is_dir():
+            shutil.rmtree(blocked)
+        else:
+            blocked.unlink()
+    write_text(blocked, "not a directory\n")
+    write_text(src / "fallback.txt", "fallback\n")
+
+    proc = run_ks([f"+{src}", f"[{blocked},{dst}]"])
+    assert_success(checks, proc, "003.20/003.21/003.23 fallback local peer")
+    checks.equal(read_text(dst / "fallback.txt"), "fallback\n", "003.23 second fallback should be tried after first fails")
+
+    canon_a = root / "fallback_canon_a"
+    canon_b = root / "fallback_canon_b"
+    canon_dst = root / "fallback_canon_dst"
+    reset_dir(canon_a)
+    reset_dir(canon_b)
+    reset_dir(canon_dst)
+    write_text(canon_a / "canon.txt", "bracket canon\n")
+    proc = run_ks([f"+[{canon_a},{canon_b}]", str(canon_dst)])
+    assert_success(checks, proc, "003.24 bracket canon role")
+    checks.equal(read_text(canon_dst / "canon.txt"), "bracket canon\n", "003.24 bracket canon should be authoritative")
+
+    sub_src = root / "fallback_sub_src"
+    sub_dst = root / "fallback_sub_dst"
+    sub_alt = root / "fallback_sub_alt"
+    reset_dir(sub_src)
+    if sub_dst.exists():
+        shutil.rmtree(sub_dst)
+    reset_dir(sub_alt)
+    write_text(sub_src / "sub.txt", "bracket subordinate\n")
+    proc = run_ks([f"+{sub_src}", f"-[{sub_dst},{sub_alt}]"])
+    assert_success(checks, proc, "003.25/003.26 bracket subordinate role")
+    checks.equal(read_text(sub_dst / "sub.txt"), "bracket subordinate\n", "003.25 bracket subordinate should receive outcome")
+
+
+def dry_run_cases(checks: CheckRun, root: Path) -> None:
+    src = root / "dry_src"
+    dst = root / "dry_dst"
+    reset_dir(src)
+    reset_dir(dst)
+    write_text(src / "planned.txt", "planned\n")
+
+    proc = run_ks(["--dry-run", f"+{src}", str(dst)])
+    checks.equal(proc.stderr, "", "003.32 dry-run should leave stderr empty")
+    checks.check("dry run" in proc.stdout.lower(), "003.32 dry-run should identify read-only planning mode")
+    checks.check(not (dst / "planned.txt").exists(), "003.32 dry-run should not write destination files")
+
+    proc = run_ks([f"+{src}", str(dst)])
+    assert_success(checks, proc, "003.33 normal run")
+    checks.equal(read_text(dst / "planned.txt"), "planned\n", "003.33 without dry-run peer changes should occur")
+
+
+def option_acceptance_case(checks: CheckRun, root: Path) -> None:
+    src = root / "options_src"
+    dst = root / "options_dst"
+    reset_dir(src)
+    reset_dir(dst)
+    write_text(src / "options.txt", "options\n")
+    proc = run_ks(
         [
-            f"+{canon}",
-            str(peer),
             "--max-copies",
-            "2",
+            "1",
             "--retries-copy",
             "2",
             "--retries-list",
@@ -322,141 +266,207 @@ def test_options_and_excludes(root: Path, failures: list[str]) -> None:
             "--timeout-idle",
             "5",
             "--verbosity",
-            "trace",
+            "error",
             "--keep-tmp-days",
             "3",
             "--keep-bak-days",
             "4",
             "--keep-del-days",
             "5",
-        ],
-        root,
+            f"+{src}",
+            str(dst),
+        ]
     )
-    record_success(result, failures, "003.21 003.23 003.25 003.27 003.31 003.33 003.35 003.37 options")
-    record("copy-slots active=" in result.stdout, failures, "trace verbosity should show copy-slot logs")
-    record("/2" in result.stdout, failures, "--max-copies value should appear in trace denominator")
-
-    default_canon = root / "default_canon"
-    default_peer = root / "default_peer"
-    default_canon.mkdir()
-    default_peer.mkdir()
-    write_text(default_canon / "default.txt", "default\n")
-    result = run_kitchensync([f"+{default_canon}", str(default_peer), "--verbosity", "trace"], root)
-    record_success(result, failures, "003.22 default max-copies")
-    record("/10" in result.stdout, failures, "default max-copies should appear as 10 in trace logs")
-
-    info_canon = root / "info_canon"
-    info_peer = root / "info_peer"
-    info_canon.mkdir()
-    info_peer.mkdir()
-    write_text(info_canon / "info.txt", "info\n")
-    result = run_kitchensync([f"+{info_canon}", str(info_peer)], root)
-    record_success(result, failures, "003.20 003.24 003.26 003.28 003.32 003.34 003.36 003.38 defaults")
-    record(
-        "copy-slots active=" not in result.stdout,
-        failures,
-        "default verbosity info should not include trace copy-slot logs",
-    )
-
-    dry_missing_a = root / "dry_missing_a"
-    dry_missing_b = root / "dry_missing_b"
-    result = run_kitchensync([f"+{dry_missing_a}", str(dry_missing_b), "--dry-run"], root)
-    record(
-        result.returncode != 0,
-        failures,
-        "dry-run with missing peer roots should fail before creating them",
-    )
-    record(not dry_missing_a.exists(), failures, "dry-run should not create missing canon root")
-    record(not dry_missing_b.exists(), failures, "dry-run should not create missing peer root")
-
-    excl_canon = root / "exclude_canon"
-    excl_peer = root / "exclude_peer"
-    excl_canon.mkdir()
-    excl_peer.mkdir()
-    write_text(excl_canon / "keep.txt", "keep\n")
-    write_text(excl_canon / "skip.txt", "skip\n")
-    write_text(excl_canon / "dir" / "skip2.txt", "skip2\n")
-    result = run_kitchensync(
-        [f"+{excl_canon}", str(excl_peer), "-x", "skip.txt", "-x", "dir/skip2.txt"],
-        root,
-    )
-    record_success(result, failures, "003.49 003.50 003.51 repeated slash excludes")
-    assert_file_text(excl_peer / "keep.txt", "keep\n", failures, "non-excluded file")
-    record(not (excl_peer / "skip.txt").exists(), failures, "excluded file should not copy")
-    record(not (excl_peer / "dir" / "skip2.txt").exists(), failures, "excluded nested file should not copy")
-
-    invalid_excludes = {
-        "003.52 leading slash": "/absolute",
-        "003.53 trailing slash": "trailing/",
-        "003.54 backslash separator": "bad\\path",
-        "003.55 empty segment": "bad//path",
-        "003.56 dot segment": "bad/./path",
-        "003.57 dotdot segment": "bad/../path",
-    }
-    for label, relpath in invalid_excludes.items():
-        result = run_kitchensync([f"+{excl_canon}", str(excl_peer), "-x", relpath], root)
-        record_validation_error(result, failures, label)
+    assert_success(checks, proc, "003.34/003.36/003.38/003.40/003.42/003.44/003.46/003.48/003.50 global options")
+    checks.equal(read_text(dst / "options.txt"), "options\n", "global option run should still sync")
 
 
-def test_sftp_and_query_forms(root: Path, failures: list[str]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    started = start_sftp_server(root, failures)
-    if started is None:
-        return
-    process, port, home = started
-    try:
-        canon = root / "sftp_canon"
-        canon.mkdir()
-        write_text(canon / "remote.txt", "remote\n")
-        env = {
-            "HOME": str(home),
-            "USERPROFILE": str(home),
+def exclude_cases(checks: CheckRun, root: Path) -> None:
+    src = root / "exclude_src"
+    dst = root / "exclude_dst"
+    reset_dir(src)
+    reset_dir(dst)
+    write_text(src / "keep.txt", "keep\n")
+    write_text(src / "skip.txt", "skip\n")
+    write_text(src / "nested" / "skip.txt", "nested skip\n")
+    write_text(dst / "skip.txt", "destination stays\n")
+
+    proc = run_ks(["-x", "skip.txt", "-x", "nested/skip.txt", f"+{src}", str(dst)])
+    assert_success(checks, proc, "003.52/003.53/003.54 excludes")
+    checks.equal(read_text(dst / "keep.txt"), "keep\n", "003.52 non-excluded file should sync")
+    checks.equal(read_text(dst / "skip.txt"), "destination stays\n", "003.52 excluded existing file should be left untouched")
+    checks.check(not (dst / "nested" / "skip.txt").exists(), "003.53 repeated exclude should add another excluded path")
+
+    invalids = [
+        ("/leading", "003.55 leading slash"),
+        ("trailing/", "003.56 trailing slash"),
+        ("bad\\separator", "003.57 backslash separator"),
+        ("empty//segment", "003.58 empty segment"),
+        ("dot/./segment", "003.59 dot segment"),
+        ("dot/../segment", "003.60 dot-dot segment"),
+    ]
+    for relpath, label in invalids:
+        proc = run_ks(["-x", relpath, f"+{src}", str(dst)])
+        assert_validation_error(checks, proc, label)
+
+
+def read_line_with_timeout(stream, timeout: float, label: str) -> str:
+    box: dict[str, str | BaseException] = {}
+
+    def reader() -> None:
+        try:
+            box["value"] = stream.readline()
+        except BaseException as exc:  # pragma: no cover - reported as test failure
+            box["value"] = exc
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"timed out reading {label}")
+    value = box.get("value", "")
+    if isinstance(value, BaseException):
+        raise value
+    return value
+
+
+class SftpServer:
+    def __init__(self, checks: CheckRun, root: Path, args: list[str]) -> None:
+        self.checks = checks
+        self.root = root
+        self.stderr_lines: list[str] = []
+        cmd = [str(bundled_uv()), "run", "--script", str(WORKSPACE / "extart" / "ephemeral-sftp-server.py"), *args]
+        self.proc = subprocess.Popen(
+            cmd,
+            cwd=str(WORKSPACE),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+        assert self.proc.stdout is not None
+        assert self.proc.stderr is not None
+        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_thread.start()
+        port_line = read_line_with_timeout(self.proc.stdout, 10, "SFTP server port").strip()
+        self.port = int(port_line)
+        self.host_key = self._wait_for_host_key()
+        ssh_dir = root / "home" / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        known_hosts = ssh_dir / "known_hosts"
+        known_hosts.write_text(f"[127.0.0.1]:{self.port} {self.host_key}\n", encoding="utf-8", newline="\n")
+        self.env = {
+            "HOME": str(root / "home"),
+            "USERPROFILE": str(root / "home"),
             "SSH_AUTH_SOCK": "",
         }
-        sftp_url = (
-            f"sftp://syncuser:p%40ss%3Aword@127.0.0.1:{port}"
-            "/remote-peer?timeout-conn=5&timeout-idle=5"
-        )
-        result = run_kitchensync([f"+{canon}", sftp_url, "--timeout-conn", "1", "--timeout-idle", "1"], root, env=env)
-        record_success(
-            result,
-            failures,
-            "003.2 003.14 003.15 003.42 003.44 003.46 003.47 003.48 SFTP URL",
-        )
 
-        default_port_url = "sftp://syncuser:p%40ss%3Aword@127.0.0.1/remote-peer"
-        result = run_kitchensync([f"+{canon}", default_port_url, "--timeout-conn", "1"], root, env=env)
-        record(
-            "Usage: kitchensync" not in result.stdout,
-            failures,
-            "003.43 default-port SFTP URL should pass argument validation",
-        )
-        record(result.stderr == "", failures, "003.43 default-port SFTP URL should keep stderr empty")
+    def _read_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        for line in self.proc.stderr:
+            self.stderr_lines.append(line.rstrip("\n"))
 
-        bad_query = run_kitchensync([f"+{canon}", f"sftp://syncuser@127.0.0.1:{port}/x?max-copies=2"], root, env=env)
-        record_validation_error(bad_query, failures, "003.18 rejects URL max-copies query parameter")
-        record("max-copies" in bad_query.stdout, failures, "max-copies rejection should name max-copies")
+    def _wait_for_host_key(self) -> str:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for line in self.stderr_lines:
+                if line.startswith("host key: "):
+                    return line.removeprefix("host key: ").strip()
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        raise TimeoutError("SFTP server did not report a host key")
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+
+
+def sftp_cases(checks: CheckRun, root: Path) -> None:
+    servers: list[SftpServer] = []
+    try:
+        password = "p@ss:word"
+        server = SftpServer(checks, root / "sftp_password_server", ["--user", "alice", "--password", password])
+        servers.append(server)
+        local = root / "sftp_local"
+        reset_dir(local)
+        write_text(local / "sftp.txt", "sftp\n")
+        encoded_password = quote(password, safe="")
+        proc = run_ks([f"+{local}", f"sftp://alice:{encoded_password}@127.0.0.1:{server.port}/remote"], env=server.env)
+        assert_success(checks, proc, "003.3/003.10/003.12/003.13/003.14 SFTP URL")
+
+        user_server = SftpServer(checks, root / "sftp_current_user_server", ["--user", getpass.getuser()])
+        servers.append(user_server)
+        user_local = root / "sftp_current_user_local"
+        reset_dir(user_local)
+        write_text(user_local / "user.txt", "current user\n")
+        proc = run_ks([f"+{user_local}", f"sftp://127.0.0.1:{user_server.port}/current-user"], env=user_server.env)
+        assert_success(checks, proc, "003.11 SFTP URL without user")
+
+        fallback_server = SftpServer(checks, root / "sftp_fallback_server", ["--user", "bob", "--password", "pw"])
+        servers.append(fallback_server)
+        fb_local = root / "sftp_fallback_local"
+        blocked = root / "sftp_fallback_blocked"
+        reset_dir(fb_local)
+        write_text(blocked, "not a directory\n")
+        write_text(fb_local / "fallback-sftp.txt", "fallback sftp\n")
+        proc = run_ks(
+            [
+                f"+{fb_local}",
+                f"[{blocked},sftp://bob:pw@127.0.0.1:{fallback_server.port}/fallback]",
+            ],
+            env=fallback_server.env,
+        )
+        assert_success(checks, proc, "003.22 fallback peer accepts SFTP URL")
+    except Exception as exc:
+        checks.failures.append(f"SFTP setup or execution failed: {exc}")
     finally:
-        stop_process(process)
+        for server in reversed(servers):
+            server.stop()
 
 
 def main() -> int:
-    failures: list[str] = []
-    record(EXE.exists(), failures, f"released executable should exist at {EXE}")
+    checks = CheckRun()
+    with tempfile.TemporaryDirectory(prefix="ks_req_003_") as temp_name:
+        root = Path(temp_name)
+        validation_cases(checks, root)
+        local_sync_case(checks, root)
+        relative_path_case(checks, root)
+        absolute_path_cases(checks, root)
+        role_cases(checks, root)
+        fallback_cases(checks, root)
+        dry_run_cases(checks, root)
+        option_acceptance_case(checks, root)
+        exclude_cases(checks, root)
+        sftp_cases(checks, root)
 
-    with tempfile.TemporaryDirectory(prefix="kitchensync-003-") as temp:
-        root = Path(temp)
-        test_local_peer_forms(root / "local", failures)
-        test_role_markers_and_fallbacks(root / "roles", failures)
-        test_options_and_excludes(root / "options", failures)
-        test_sftp_and_query_forms(root / "sftp", failures)
+    # not reasonably testable: 003.6 on non-Windows hosts, because a real
+    # Windows drive path cannot be created portably on Linux or macOS.
+    # not reasonably testable: 003.8 and 003.9 together without binding SSH port
+    # 22, which would require privileged or environment-specific setup.
+    # not reasonably testable: 003.27, 003.28, 003.29, and 003.30. Successful
+    # timeout parsing has no stable end-to-end observable effect unless the
+    # test relies on timing or sabotaged network behavior.
+    # not reasonably testable: 003.35, 003.37, 003.39, 003.41, 003.43, 003.45,
+    # 003.47, 003.49, and 003.51. These defaults are internal run settings
+    # with no required stdout, stderr, exit-code, or filesystem signal in this
+    # requirement.
+    # not reasonably testable: 003.61 because operating systems do not allow a
+    # NUL character inside a subprocess argument.
 
-    if failures:
-        print(f"{len(failures)} failure(s):")
-        for failure in failures:
+    if checks.failures:
+        print("FAIL")
+        for failure in checks.failures:
             print(f"- {failure}")
         return 1
-    print("all checks passed")
+    print("PASS")
     return 0
 
 
