@@ -394,9 +394,11 @@ fn unreachable_canon_peer_is_a_fatal_startup_reason() {
     let home = temp.path().join("home");
     let missing_canon = temp.path().join("missing-canon");
     let normal_root = temp.path().join("normal");
+    let subordinate_root = temp.path().join("subordinate");
 
     fs::create_dir_all(&home).expect("create home directory");
     fs::create_dir_all(&normal_root).expect("create normal root");
+    fs::create_dir_all(&subordinate_root).expect("create subordinate root");
 
     let result = subject().establish_peer_connections(request(
         vec![
@@ -410,6 +412,11 @@ fn unreachable_canon_peer_is_a_fatal_startup_reason() {
                 role: PeerConnectionPeerRole::Normal,
                 urls: vec![local_url("file://normal", &normal_root)],
             },
+            PeerConnectionPeer {
+                identity: "subordinate".to_string(),
+                role: PeerConnectionPeerRole::Subordinate,
+                urls: vec![local_url("file://subordinate", &subordinate_root)],
+            },
         ],
         PeerConnectionRunMode::DryRun,
         &home,
@@ -417,14 +424,13 @@ fn unreachable_canon_peer_is_a_fatal_startup_reason() {
 
     assert_eq!(result.unreachable_peers.len(), 1);
     assert_eq!(result.unreachable_peers[0].peer_identity, "canon");
-    match result.status {
-        PeerConnectionStartupStatus::Fatal(reasons) => {
-            assert_eq!(reasons.len(), 2);
-            assert!(reasons.contains(&PeerConnectionFatalStartupReason::FewerThanTwoReachablePeers));
-            assert!(reasons.contains(&PeerConnectionFatalStartupReason::CanonPeerUnreachable));
-        }
-        PeerConnectionStartupStatus::Ready => panic!("startup should be fatal"),
-    }
+    assert_eq!(result.reachable_peers.len(), 2);
+    assert_eq!(
+        result.status,
+        PeerConnectionStartupStatus::Fatal(vec![
+            PeerConnectionFatalStartupReason::CanonPeerUnreachable
+        ])
+    );
 }
 
 #[test]
@@ -490,6 +496,41 @@ fn sftp_winners_report_effective_timeouts_and_create_remote_roots() {
             timeout_idle_seconds: 41,
         })
     );
+
+    let dry_run_result = subject().establish_peer_connections(request(
+        vec![
+            PeerConnectionPeer {
+                identity: "canon".to_string(),
+                role: PeerConnectionPeerRole::Canon,
+                urls: vec![sftp_url(
+                    "sftp://canon",
+                    server.port,
+                    Some("secret"),
+                    "/created/by/url-settings",
+                    Some(7),
+                    Some(11),
+                )],
+            },
+            PeerConnectionPeer {
+                identity: "normal".to_string(),
+                role: PeerConnectionPeerRole::Normal,
+                urls: vec![sftp_url(
+                    "sftp://normal",
+                    server.port,
+                    Some("secret"),
+                    "/created/by/global-settings",
+                    None,
+                    None,
+                )],
+            },
+        ],
+        PeerConnectionRunMode::DryRun,
+        &home,
+    ));
+
+    assert_eq!(dry_run_result.status, PeerConnectionStartupStatus::Ready);
+    assert_eq!(dry_run_result.reachable_peers.len(), 2);
+    assert!(dry_run_result.unreachable_peers.is_empty());
 }
 
 #[test]
