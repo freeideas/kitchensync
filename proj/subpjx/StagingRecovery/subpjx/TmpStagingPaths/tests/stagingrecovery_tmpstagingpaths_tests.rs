@@ -73,6 +73,28 @@ fn prepares_transfer_tmp_directory_under_timestamp_directory() {
 }
 
 #[test]
+fn returns_existing_transfer_tmp_directory_on_repeated_call() {
+    let root = temp_root("repeat");
+    let paths = subject();
+    let request = TmpStagingPathRequest {
+        peer: file_peer(&root),
+        parent_path: "sync-root/folder".to_owned(),
+        tmp_timestamp: "2026-07-02_12-00-30_000001Z".to_owned(),
+        transfer_uuid: "66666666-7777-4888-8999-000000000000".to_owned(),
+    };
+
+    let first = paths
+        .prepare_tmp_staging_path(request.clone())
+        .expect("create TMP staging path");
+    let second = paths
+        .prepare_tmp_staging_path(request)
+        .expect("return existing TMP staging path");
+
+    assert_eq!(second, first);
+    assert!(root.join(&second.staging_path).is_dir());
+}
+
+#[test]
 fn reports_unusable_tmp_path_without_replacing_existing_paths() {
     let root = temp_root("conflict");
     let conflicting_tmp_path = root.join(
