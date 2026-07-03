@@ -28,5 +28,11 @@
     "003.44"
   ],
   "shared": false,
-  "wiring": "per-dependent"
+  "wiring": "per-dependent",
+  "packages": [
+    {
+      "name": "filetime",
+      "version": "0.2.29"
+    }
+  ]
 }
