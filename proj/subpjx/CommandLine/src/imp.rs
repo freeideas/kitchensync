@@ -100,7 +100,16 @@ impl CommandLine for CommandLineImpl {
         configured_verbosity: CommandLineVerbosity,
         message_verbosity: CommandLineVerbosity,
     ) -> bool {
-        verbosity_rank(message_verbosity) <= verbosity_rank(configured_verbosity)
+        match configured_verbosity {
+            CommandLineVerbosity::Error => message_verbosity == CommandLineVerbosity::Error,
+            CommandLineVerbosity::Info | CommandLineVerbosity::Debug => {
+                matches!(
+                    message_verbosity,
+                    CommandLineVerbosity::Error | CommandLineVerbosity::Info
+                )
+            }
+            CommandLineVerbosity::Trace => true,
+        }
     }
 }
 
@@ -354,12 +363,4 @@ fn validate_sftp_url(value: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn verbosity_rank(verbosity: CommandLineVerbosity) -> u8 {
-    match verbosity {
-        CommandLineVerbosity::Error => 0,
-        CommandLineVerbosity::Info | CommandLineVerbosity::Debug => 1,
-        CommandLineVerbosity::Trace => 3,
-    }
 }
