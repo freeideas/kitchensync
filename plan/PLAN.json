@@ -1,0 +1,29 @@
+{
+  "docs": [
+    {
+      "file": "sqlite-snapshot.md",
+      "packages": [{ "name": "rusqlite", "version": "0.32.1" }],
+      "experiments": ["experiments/sqlite-snapshot"]
+    },
+    {
+      "file": "path-hashing.md",
+      "packages": [{ "name": "twox-hash", "version": "2.1.2" }],
+      "experiments": ["experiments/path-hashing"]
+    },
+    {
+      "file": "timestamps.md",
+      "packages": [{ "name": "chrono", "version": "0.4.38" }],
+      "experiments": ["experiments/timestamps"]
+    },
+    {
+      "file": "sftp-transport.md",
+      "packages": [{ "name": "ssh2", "version": "0.9.5" }],
+      "experiments": ["experiments/sftp-transport"]
+    },
+    {
+      "file": "local-filesystem.md",
+      "packages": [],
+      "experiments": ["experiments/local-filesystem"]
+    }
+  ]
+}

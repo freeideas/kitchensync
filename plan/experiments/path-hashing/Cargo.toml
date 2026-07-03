@@ -1,0 +1,7 @@
+[package]
+name = "path_hashing_probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+twox-hash = "=2.1.2"

@@ -1,0 +1,6 @@
+[package]
+name = "local_filesystem_probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]

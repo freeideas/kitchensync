@@ -1,0 +1,7 @@
+[package]
+name = "sqlite_snapshot_probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = "=0.32.1"
