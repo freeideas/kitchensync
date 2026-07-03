@@ -154,13 +154,22 @@ impl SnapshotDatabaseImpl {
         peer: &peertransportsurface::ConnectedPeerRoot,
         local_path: &Path,
     ) -> Result<bool, SnapshotDatabaseError> {
+        match self.peertransportsurface.stat(peer, LIVE_SNAPSHOT_PATH) {
+            Ok(metadata) => {
+                if metadata.is_dir {
+                    return Err(self.peer_transport_error());
+                }
+            }
+            Err(PeerTransportError::NotFound) => return Ok(false),
+            Err(_) => return Err(self.peer_transport_error()),
+        }
+
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent).map_err(|_| self.local_file_error())?;
         }
 
         let mut read_handle = match self.peertransportsurface.open_read(peer, LIVE_SNAPSHOT_PATH) {
             Ok(handle) => handle,
-            Err(PeerTransportError::NotFound) => return Ok(false),
             Err(_) => return Err(self.peer_transport_error()),
         };
         let mut local_file = fs::File::create(local_path).map_err(|_| self.local_file_error())?;
