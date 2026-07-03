@@ -1,0 +1,28 @@
+{
+  "shared": false,
+  "entry": false,
+  "interface": "src/api.rs",
+  "wiring": "per-dependent",
+  "deps": [":peertransportsurface"],
+  "reqs": [
+    "002.14",
+    "002.15",
+    "002.19",
+    "003.2",
+    "003.5",
+    "003.6",
+    "003.7",
+    "003.8",
+    "003.11",
+    "003.12",
+    "003.13",
+    "003.15",
+    "003.43"
+  ],
+  "packages": [
+    {
+      "name": "ssh2",
+      "version": "0.9.5"
+    }
+  ]
+}
