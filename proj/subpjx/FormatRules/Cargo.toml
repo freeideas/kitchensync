@@ -1,0 +1,11 @@
+[package]
+name = "formatrules"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"twox-hash" = "2.1.2"
+"chrono" = "0.4.38"
