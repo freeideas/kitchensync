@@ -426,8 +426,12 @@ impl SftpTransport for SftpTransportImpl {
         let sftp = root.sftp.lock().map_err(|_| PeerTransportError::IoError)?;
         match sftp.stat(Path::new(&dst)) {
             Ok(_) => return Err(PeerTransportError::IoError),
-            Err(error) if map_ssh_error(error) == PeerTransportError::NotFound => {}
-            Err(error) => return Err(map_ssh_error(error)),
+            Err(error) => {
+                let error = map_ssh_error(error);
+                if error != PeerTransportError::NotFound {
+                    return Err(error);
+                }
+            }
         }
         sftp.rename(Path::new(&src), Path::new(&dst), None)
             .map_err(map_ssh_error)
