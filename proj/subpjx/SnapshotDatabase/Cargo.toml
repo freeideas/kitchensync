@@ -1,0 +1,12 @@
+[package]
+name = "snapshotdatabase"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"formatrules" = { path = "../FormatRules" }
+"peertransportsurface" = { path = "../PeerTransportSurface" }
+"rusqlite" = "0.32.1"
