@@ -1,15 +1,15 @@
 [package]
-name = "aisf_root"
+name = "kitchensync"
 version = "0.0.0"
 edition = "2021"
 
 [[bin]]
-name = "aisf_root"
+name = "kitchensync"
 path = "src/main.rs"
 
 [dependencies]
+commandline = { path = "subpjx/CommandLine" }
 
 [workspace]
 resolver = "2"
 exclude = ["subpjx"]
-
