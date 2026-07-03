@@ -7,3 +7,4 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+"filetime" = "0.2.29"
