@@ -1,10 +1,9 @@
 use crate::api::*;
-use filetime::{set_file_mtime, FileTime};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct PeerTransportSurfaceImpl;
 
@@ -57,6 +56,57 @@ fn write_file(handle: &mut PeerWriteHandle) -> Result<&mut File, PeerTransportEr
         .handle
         .downcast_mut::<File>()
         .ok_or(PeerTransportError::IoError)
+}
+
+#[cfg(unix)]
+fn set_path_mod_time(path: &Path, mod_time: SystemTime) -> Result<(), PeerTransportError> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_long};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: c_long,
+        tv_nsec: c_long,
+    }
+
+    unsafe extern "C" {
+        fn utimensat(
+            dirfd: c_int,
+            pathname: *const c_char,
+            times: *const Timespec,
+            flags: c_int,
+        ) -> c_int;
+    }
+
+    const AT_FDCWD: c_int = -100;
+    const UTIME_OMIT: c_long = 1_073_741_822;
+
+    let duration = mod_time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| PeerTransportError::IoError)?;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| PeerTransportError::IoError)?;
+    let times = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        Timespec {
+            tv_sec: duration.as_secs().try_into().map_err(|_| PeerTransportError::IoError)?,
+            tv_nsec: duration.subsec_nanos().into(),
+        },
+    ];
+
+    if unsafe { utimensat(AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(map_io_error(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(not(unix))]
+fn set_path_mod_time(_path: &Path, _mod_time: SystemTime) -> Result<(), PeerTransportError> {
+    Err(PeerTransportError::IoError)
 }
 
 impl PeerTransportSurface for PeerTransportSurfaceImpl {
@@ -165,7 +215,7 @@ impl PeerTransportSurface for PeerTransportSurfaceImpl {
     fn set_mod_time( &self, peer: &ConnectedPeerRoot, path: &str, mod_time: SystemTime, ) -> Result<(), PeerTransportError> {
         let path = peer_path(peer, path)?;
         metadata_for(&path)?;
-        set_file_mtime(path, FileTime::from_system_time(mod_time)).map_err(map_io_error)
+        set_path_mod_time(&path, mod_time)
     }
 }
 
