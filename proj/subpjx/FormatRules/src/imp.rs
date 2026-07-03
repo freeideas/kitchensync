@@ -325,6 +325,27 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), FormatRulesV
     if authority.is_empty() {
         return Err(validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl));
     }
+    if authority.starts_with('[') {
+        let close = authority
+            .find(']')
+            .ok_or_else(|| validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl))?;
+        if close == 1 {
+            return Err(validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl));
+        }
+        let host = &authority[..=close];
+        let remainder = &authority[close + 1..];
+        return match remainder.strip_prefix(':') {
+            Some(port) if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
+                Ok((host, Some(port)))
+            }
+            Some(_) => Err(validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl)),
+            None if remainder.is_empty() => Ok((host, None)),
+            None => Err(validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl)),
+        };
+    }
+    if authority.contains(['[', ']']) {
+        return Err(validation_error(FormatRulesValidationErrorKind::InvalidPeerUrl));
+    }
     match authority.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
             Ok((host, Some(port)))
