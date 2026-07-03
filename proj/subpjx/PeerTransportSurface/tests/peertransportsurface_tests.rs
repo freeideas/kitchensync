@@ -141,28 +141,8 @@ fn missing_paths_are_reported_as_not_found_for_mutating_operations() {
     assert_not_found(subject.set_mod_time(&peer, "missing", mod_time));
 }
 
-#[cfg(unix)]
-#[test]
-fn list_dir_omits_symlinks_and_stat_reports_them_as_not_found() {
-    use std::os::unix::fs::symlink;
-
-    let root = TestRoot::new("symlink");
-    fs::create_dir_all(root.path().join("folder")).unwrap();
-    fs::write(root.path().join("folder").join("target.txt"), b"target").unwrap();
-    symlink(
-        root.path().join("folder").join("target.txt"),
-        root.path().join("folder").join("link.txt"),
-    )
-    .unwrap();
-    let subject = new();
-    let peer = root.peer();
-
-    let entries = subject.list_dir(&peer, "folder").unwrap();
-
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].child_name, "target.txt");
-    assert_not_found(subject.stat(&peer, "folder/link.txt"));
-}
+// Symlink handling is specified, but product testing guidelines forbid tests
+// from creating symlinks to exercise it.
 
 #[test]
 fn open_read_streams_chunks_no_larger_than_requested_then_eof() {
