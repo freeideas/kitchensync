@@ -1,59 +1,7 @@
 use crate::api::*;
 use std::sync::Arc;
 
-const HELP_TEXT: &str = "Usage: kitchensync [options] <peer> <peer> [<peer>...]\n\
-\n\
-Synchronize file trees across multiple peers.\n\
-\n\
-Running with no arguments prints this help. See the specs for full behavior.\n\
-\n\
-Peers:\n\
-  /path or c:\\path                 Local path (same as file://)\n\
-  sftp://user@host/path            Remote over SSH\n\
-  sftp://user@host:port/path       Non-standard SSH port\n\
-  sftp://host/path                 Remote over SSH, current OS user\n\
-  sftp://user:password@host/path   Inline password (prefer SSH keys)\n\
-\n\
-Prefix modifiers:\n\
-  +<peer>                          Canon - this peer's state wins all conflicts\n\
-  -<peer>                          Subordinate - overwritten to match the group\n\
-\n\
-Fallback URLs (multiple paths to the same data):\n\
-  [url1,url2,...]                  Try in order, first that connects wins\n\
-  +[url1,url2,...]                 Canon peer with fallbacks\n\
-  -[url1,url2,...]                 Subordinate peer with fallbacks\n\
-\n\
-Per-URL settings (query string, inside quotes):\n\
-  \"sftp://host/path?timeout-conn=60\"     Connection timeout for this URL\n\
-  \"sftp://host/path?timeout-idle=10\"     SFTP idle keep-alive TTL for this URL\n\
-  \"sftp://host/path?timeout-conn=60&timeout-idle=10\"  Combine multiple\n\
-\n\
-Options:\n\
-  --dry-run          Read-only and plan, but make no peer changes\n\
-  --max-copies N     Max active file copies across the whole run (default: 10)\n\
-  --retries-copy N   Give up copying after this many tries (default: 3)\n\
-  --retries-list N   Give up listing after this many tries (default: 3)\n\
-  --timeout-conn N   SSH handshake timeout in seconds (default: 30)\n\
-  --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)\n\
-  --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)\n\
-  -x RELPATH         Exclude relative slash path from sync; repeatable\n\
-  --keep-tmp-days N  Delete stale TMP staging after N days (default: 2)\n\
-  --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)\n\
-  --keep-del-days N  Forget deletion records after N days (default: 180)\n\
-\n\
-Quick start:\n\
-  kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)\n\
-  kitchensync c:/photos sftp://host/photos            Bidirectional\n\
-  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate\n\
-  kitchensync c:/photos \"sftp://user:p%40ss@host/photos\"  Inline password\n\
-\n\
-Canon (+) is required on first sync when no peer has snapshot history.\n\
-After the first sync, bidirectional sync works without canon.\n\
-\n\
-Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.\n\
-\n\
-Displaced files are recoverable from nearby:\n\
-  .kitchensync/BAK/ directories (kept for --keep-bak-days days).\n";
+const HELP_SPEC: &str = include_str!("../../../../specs/help.md");
 
 struct CommandLineImpl;
 
@@ -73,7 +21,7 @@ impl CommandLine for CommandLineImpl {
 
     fn help_output(&self) -> CommandLineProcessOutput {
         CommandLineProcessOutput {
-            stdout: HELP_TEXT.to_string(),
+            stdout: help_text().to_string(),
             exit_code: 0,
         }
     }
@@ -83,7 +31,7 @@ impl CommandLine for CommandLineImpl {
         error: &CommandLineValidationError,
     ) -> CommandLineProcessOutput {
         CommandLineProcessOutput {
-            stdout: format!("{}\n\n{}", error.message, HELP_TEXT),
+            stdout: format!("{}\n\n{}", error.message, help_text()),
             exit_code: 1,
         }
     }
@@ -115,6 +63,14 @@ impl CommandLine for CommandLineImpl {
 
 pub fn new() -> std::sync::Arc<dyn CommandLine> {
     Arc::new(CommandLineImpl)
+}
+
+fn help_text() -> &'static str {
+    HELP_SPEC
+        .split_once("```\n")
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(screen, _)| screen)
+        .expect("help.md must contain the verbatim help screen")
 }
 
 fn parse_run(args: Vec<String>) -> Result<CommandLineRunRequest, String> {
