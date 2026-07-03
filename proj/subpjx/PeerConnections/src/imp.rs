@@ -1,10 +1,13 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use crate::api::*;
+
+static NEXT_LOCAL_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 
 struct PeerConnectionsImpl {
     formatrules: std::sync::Arc<dyn formatrules::FormatRules>,
@@ -315,9 +318,11 @@ fn prepare_snapshots(
 }
 
 fn local_snapshot_path(peer_index: usize) -> PathBuf {
+    let unique_id = NEXT_LOCAL_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "kitchensync-{}-peer-{}-snapshot.db",
+        "kitchensync-{}-{}-peer-{}-snapshot.db",
         std::process::id(),
+        unique_id,
         peer_index
     ))
 }
