@@ -1,0 +1,17 @@
+{
+  "shared": false,
+  "entry": false,
+  "interface": "src/api.rs",
+  "wiring": "per-dependent",
+  "deps": [
+    ":peer_transport_surface"
+  ],
+  "reqs": [
+    "002.16",
+    "002.17",
+    "002.18",
+    "003.1",
+    "003.16",
+    "003.17"
+  ]
+}
