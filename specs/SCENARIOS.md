@@ -152,6 +152,42 @@ empty. `B/item` is a file with bytes `file wins\n` and modification time
 timestamp-named directory containing the displaced directory `item/` with
 `nested.txt` inside it.
 
+## S-10: New Peer Without Snapshot Is Subordinate
+
+Setup:
+
+- `A/shared.txt` exists with bytes `group\n` and modification time
+  `2024-01-01_10-00-00_000000Z`.
+- `B/` exists and has no user files.
+- First run `released/kitchensync.exe --verbosity error +A B` and require it to
+  exit 0.
+- `C/shared.txt` exists with bytes `wrong\n`.
+- `C/extra.txt` exists with bytes `extra\n`.
+- `C/` has no `.kitchensync/snapshot.db`.
+
+Action: run `released/kitchensync.exe --verbosity error A B C`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
+empty. `C/shared.txt` exists with bytes `group\n` and modification time
+`2024-01-01_10-00-00_000000Z`. `C/extra.txt` does not exist. The files under
+`C/.kitchensync/BAK/*/` are exactly `shared.txt` with bytes `wrong\n` and
+`extra.txt` with bytes `extra\n`. `C/.kitchensync/snapshot.db` exists.
+
+## S-11: Info Verbosity Emits Copy Progress
+
+Setup:
+
+- `A/note.txt` exists with bytes `copy me\n` and modification time
+  `2024-01-01_10-00-00_000000Z`.
+- `B/` exists and has no user files.
+- Neither peer has `.kitchensync/snapshot.db`.
+
+Action: run `released/kitchensync.exe --verbosity info +A B`.
+
+Outcome: the process exits 0. stdout is exactly `C note.txt\nsync complete\n`.
+stderr is empty. `B/note.txt` exists with bytes `copy me\n` and modification
+time `2024-01-01_10-00-00_000000Z`.
+
 # Properties
 
 ## P-01: Output Channels
