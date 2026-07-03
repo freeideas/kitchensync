@@ -83,7 +83,7 @@ impl CommandLine for CommandLineImpl {
         error: &CommandLineValidationError,
     ) -> CommandLineProcessOutput {
         CommandLineProcessOutput {
-            stdout: format!("error: {}\n\n{}", error.message, HELP_TEXT),
+            stdout: format!("{}\n\n{}", error.message, HELP_TEXT),
             exit_code: 1,
         }
     }
@@ -360,6 +360,6 @@ fn verbosity_rank(verbosity: CommandLineVerbosity) -> u8 {
     match verbosity {
         CommandLineVerbosity::Error => 0,
         CommandLineVerbosity::Info | CommandLineVerbosity::Debug => 1,
-        CommandLineVerbosity::Trace => 2,
+        CommandLineVerbosity::Trace => 3,
     }
 }
