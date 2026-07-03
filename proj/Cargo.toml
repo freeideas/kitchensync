@@ -9,6 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 commandline = { path = "subpjx/CommandLine" }
+copystaging = { path = "subpjx/CopyStaging" }
+formatrules = { path = "subpjx/FormatRules" }
+peerconnections = { path = "subpjx/PeerConnections" }
+peertransportsurface = { path = "subpjx/PeerTransportSurface" }
+snapshotdatabase = { path = "subpjx/SnapshotDatabase" }
+synctraversal = { path = "subpjx/SyncTraversal" }
 
 [workspace]
 resolver = "2"

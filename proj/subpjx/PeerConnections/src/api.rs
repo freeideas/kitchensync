@@ -1,3 +1,5 @@
+use peertransportsurface::ConnectedPeerRoot;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerConnectionsStartupRequest {
     pub dry_run: bool,
@@ -24,7 +26,7 @@ pub struct PeerConnectionsPeer {
     pub role: PeerConnectionsPeerRole,
     pub had_snapshot_history: bool,
     pub winning_url: String,
-    pub transport_handle: PeerConnectionsTransportHandle,
+    pub root: ConnectedPeerRoot,
     pub snapshot_database: PeerConnectionsSnapshotDatabase,
 }
 
@@ -33,11 +35,6 @@ pub enum PeerConnectionsPeerRole {
     Normal,
     Canon,
     Subordinate,
-}
-
-#[derive(Clone)]
-pub struct PeerConnectionsTransportHandle {
-    pub(crate) handle: std::sync::Arc<dyn Send + Sync>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

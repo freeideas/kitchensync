@@ -2,8 +2,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::thread;
+use std::sync::Arc;
 
 use crate::api::*;
 
@@ -118,9 +118,7 @@ impl PreparedPeer {
             role: final_role(self.role, self.had_snapshot_history),
             had_snapshot_history: self.had_snapshot_history,
             winning_url: self.winning_url,
-            transport_handle: PeerConnectionsTransportHandle {
-                handle: Arc::new(self.peer.clone()),
-            },
+            root: self.peer,
             snapshot_database: PeerConnectionsSnapshotDatabase {
                 path: self.snapshot_path,
             },
