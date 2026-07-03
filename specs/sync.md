@@ -121,7 +121,12 @@ Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
 A canon peer is authoritative - its state wins all conflicts unconditionally.
 
-Canon is required when no peer in the group has snapshot history (first run). Without snapshots, there's no history to distinguish new files from deleted files, so one peer must be the source of truth. Once snapshots exist, bidirectional sync works without a canon peer.
+Canon is required when no reachable peer in the group had
+`.kitchensync/snapshot.db` on disk at startup (first run). Without snapshots,
+there's no history to distinguish new files from deleted files, so one peer
+must be the source of truth. Once a snapshot file exists, even if its
+`snapshot` table has no rows because the synced tree is empty, bidirectional
+sync works without a canon peer.
 
 On a first run with no canon, print: `First sync? Mark the authoritative peer with a leading +`
 
@@ -140,7 +145,14 @@ A subordinate peer's snapshot is still downloaded and updated. On future runs (w
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
 5. In normal runs, recover any incomplete `.kitchensync/SWAP/snapshot.db/` state, then download each peer's `.kitchensync/snapshot.db` to a local temp directory (`{tmp}/{uuid}/snapshot.db`). In `--dry-run`, skip peer-side snapshot SWAP recovery and download the live `.kitchensync/snapshot.db` as-is. If a peer has no `snapshot.db` (transport returns 'not found'), create a new empty one locally. If recovery or download fails with any other error (I/O error, permission denied), treat the peer as unreachable: log an error-level diagnostic and exclude it from the reachable set, then re-evaluate steps 3-4 against the updated set and exit with the corresponding error if either check now fails.
-6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new empty database was created in step 5) are automatically treated as subordinate unless they are the canon peer (`+`). If no peer has any snapshot data and no canon peer (`+`) is designated, print `First sync? Mark the authoritative peer with a leading +` and exit 1.
+6. Peers whose `.kitchensync/snapshot.db` did not exist on disk (i.e., a new
+   empty database was created in step 5) are automatically treated as
+   subordinate unless they are the canon peer (`+`). If no reachable peer had
+   `.kitchensync/snapshot.db` on disk at the start of step 5 and no canon peer
+   (`+`) is designated, print
+   `First sync? Mark the authoritative peer with a leading +` and exit 1. An
+   existing `snapshot.db` counts as snapshot history even when its `snapshot`
+   table has no rows.
 7. If no contributing (non-subordinate) peer is reachable after auto-subordination, exit with error: `No contributing peer reachable - cannot make sync decisions`
 
 ## Run
@@ -191,10 +203,10 @@ or upload anything through a `file://` or `sftp://` peer URL. This means:
 - updated local temp snapshots are not uploaded back to peers;
 - BAK/TMP cleanup and SWAP recovery on peers are skipped.
 
-Dry-run output includes the phrase `dry run` at least once on stdout. Dry-run
-progress output follows the same verbosity rules as normal progress output. The
-local temp databases may be written because they are local working state, not
-peer state.
+At the start of every dry-run sync, before progress or completion output,
+KitchenSync prints exactly `dry run` as one stdout line. Dry-run progress output
+follows the same verbosity rules as normal progress output. The local temp
+databases may be written because they are local working state, not peer state.
 
 ### Rename Compatibility
 

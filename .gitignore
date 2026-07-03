@@ -1,5 +1,5 @@
-# The old aitc framework checkout also lives here; ignore it like aisf.
-/aitc/
+# The old aisf framework checkout also lives here; ignore it like aisf.
+/aisf/
 # The aisf framework is its own nested repo; the workspace repo ignores it
 # entirely so the two never entangle.
 /aisf/

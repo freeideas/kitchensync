@@ -10,9 +10,9 @@ point tests at `127.0.0.1`.
 it as a subprocess through the bundled uv for the platform:
 
 ```
-aitc/bin/uv.linux  run --script extart/ephemeral-sftp-server.py   # Linux
-aitc/bin/uv.mac    run --script extart/ephemeral-sftp-server.py   # macOS
-aitc/bin/uv.exe    run --script extart/ephemeral-sftp-server.py   # Windows
+aisf/bin/uv.linux  run --script extart/ephemeral-sftp-server.py   # Linux
+aisf/bin/uv.mac    run --script extart/ephemeral-sftp-server.py   # macOS
+aisf/bin/uv.exe    run --script extart/ephemeral-sftp-server.py   # Windows
 ```
 
 - It binds `127.0.0.1` on an OS-assigned port and prints **exactly one line to

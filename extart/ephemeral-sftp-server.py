@@ -11,7 +11,7 @@ when the process stops -- so uploaded files vanish on shutdown.
 
 A test harness launches this through the bundled uv, e.g.
 
-    aitc/bin/uv.<plat> run --script extart/ephemeral-sftp-server.py
+    aisf/bin/uv.<plat> run --script extart/ephemeral-sftp-server.py
 
 reads the first stdout line to learn the port, connects an SFTP client to
 127.0.0.1:<port>, does its work, then terminates the process.
