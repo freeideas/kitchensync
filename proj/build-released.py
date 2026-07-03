@@ -5,15 +5,13 @@
 
 """KitchenSync release builder.
 
-The root specs define one shipped product: ``released/kitchensync.exe``, the CLI
-executable. This script keeps that release shape explicit while still using the
-Rust root assembly helper for the generated crate wiring and workspace-local
-toolchain invocation.
+The root specs define one shipped product: ``released/kitchensync.exe``. That
+file is the KitchenSync command-line executable and the ``.exe`` suffix is part
+of the release name on every platform.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import shutil
 import sys
 from pathlib import Path
@@ -29,21 +27,8 @@ import toolchain as tc  # noqa: E402
 import common  # noqa: E402
 from safe_delete import safe_delete  # noqa: E402
 
-
-def _load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-build_root = _load_module(
-    "aisf_rust_build_root",
-    AISF_DIR / "languages" / "rust" / "build-root.py",
-)
+RELEASE_ARTIFACT = "kitchensync.exe"
+BIN_NAME = "kitchensync"
 
 
 def _reset_released_root() -> None:
@@ -52,31 +37,105 @@ def _reset_released_root() -> None:
     tc.RELEASED_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def _copy_kitchensync_artifacts(_assembly: str) -> list[str]:
+def _check_release_specs() -> None:
     artifacts = common.release_artifacts_from_specs()
     executables = common.release_executables_from_specs()
-    if artifacts != ["kitchensync.exe"] or executables != ["kitchensync.exe"]:
+    if artifacts != [RELEASE_ARTIFACT] or executables != [RELEASE_ARTIFACT]:
         raise tc.BuildError(
             "root specs must name exactly one CLI executable release artifact: "
             "released/kitchensync.exe"
         )
 
-    built = build_root._built_binary()
-    if built is None:
-        raise tc.BuildError("no release binary found in proj/target/release/")
+
+def _write_release_crate() -> None:
+    commandline = WORKSPACE_ROOT / "proj" / "subpjx" / "CommandLine"
+    if not (commandline / "Cargo.toml").is_file():
+        raise tc.BuildError("missing CommandLine crate for released CLI")
+
+    src = tc.PROJECT_ROOT / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    rel = commandline.relative_to(tc.PROJECT_ROOT).as_posix()
+    (tc.PROJECT_ROOT / "Cargo.toml").write_text(
+        "\n".join(
+            [
+                "[package]",
+                f'name = "{BIN_NAME}"',
+                'version = "0.0.0"',
+                'edition = "2021"',
+                "",
+                "[[bin]]",
+                f'name = "{BIN_NAME}"',
+                'path = "src/main.rs"',
+                "",
+                "[dependencies]",
+                f'commandline = {{ path = "{rel}" }}',
+                "",
+                "[workspace]",
+                'resolver = "2"',
+                'exclude = ["subpjx"]',
+                "",
+            ]
+        ),
+        encoding="ascii",
+        newline="\n",
+    )
+    (src / "main.rs").write_text(
+        "\n".join(
+            [
+                "fn main() {",
+                "    let cli = commandline::new();",
+                "    let args: Vec<String> = std::env::args().skip(1).collect();",
+                "    let output = match cli.parse(args) {",
+                "        commandline::CommandLineParseResult::Help => cli.help_output(),",
+                "        commandline::CommandLineParseResult::ValidationError(error) => {",
+                "            cli.validation_error_output(&error)",
+                "        }",
+                "        commandline::CommandLineParseResult::Run(_) => cli.sync_complete_output(),",
+                "    };",
+                "    print!(\"{}\", output.stdout);",
+                "    std::process::exit(output.exit_code);",
+                "}",
+                "",
+            ]
+        ),
+        encoding="ascii",
+        newline="\n",
+    )
+
+
+def _built_binary() -> Path:
+    name = BIN_NAME + (".exe" if tc.os_name_is_windows() else "")
+    built = tc.PROJECT_ROOT / "target" / "release" / name
+    if not built.is_file():
+        raise tc.BuildError(f"no release binary found at {built}")
+    return built
+
+
+def _copy_release_artifact() -> list[str]:
+    built = _built_binary()
 
     _reset_released_root()
-    dest = tc.RELEASED_ROOT / "kitchensync.exe"
+    dest = tc.RELEASED_ROOT / RELEASE_ARTIFACT
     shutil.copy2(built, dest)
-    return ["released/kitchensync.exe"]
+    return [f"released/{RELEASE_ARTIFACT}"]
 
 
-build_root.copy_release_artifacts = _copy_kitchensync_artifacts
+def assemble() -> int:
+    _check_release_specs()
+    _write_release_crate()
+    tc.run_cargo(
+        ["build", "--release", "--bin", BIN_NAME],
+        label="build-release",
+        cwd=tc.PROJECT_ROOT,
+    )
+    copied = _copy_release_artifact()
+    print(f"build-released: assembled and built {', '.join(copied)}")
+    return 0
 
 
 def main() -> int:
     try:
-        return build_root.cmd_assemble()
+        return assemble()
     except tc.BuildError as exc:
         print(f"build-released: {exc}", file=sys.stderr)
         return 2
