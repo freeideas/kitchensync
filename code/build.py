@@ -70,6 +70,11 @@ def main(argv: list[str]) -> int:
     cargo_home = REPO_ROOT / "tools" / "cargo-home"
     env = os.environ.copy()
     env["PATH"] = f"{tools_bin}{os.pathsep}{env.get('PATH', '')}"
+    # russh's crypto backend (aws-lc-sys) needs NASM when built with MSVC.
+    # A portable copy lives under ./tools/nasm/ (see specs/DEVELOPMENT.md).
+    nasm_dir = REPO_ROOT / "tools" / "nasm"
+    if platform.system() == "Windows" and nasm_dir.is_dir():
+        env["PATH"] = f"{nasm_dir}{os.pathsep}{env['PATH']}"
     env["CARGO_HOME"] = str(cargo_home)
 
     manifest = REPO_ROOT / "code" / "Cargo.toml"

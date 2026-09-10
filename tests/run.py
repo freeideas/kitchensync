@@ -464,7 +464,9 @@ def s11(tmp: Path) -> None:
         f"first stdout line does not match the rollback hint pattern {ROLLBACK_HINT_RE.pattern!r}: {lines[0]!r}",
     )
     actual_peers = match.group(1)
-    expected_peers = f"file://{peer_a} file://{peer_b}"
+    # Path.as_uri() gives file:///tmp/x on POSIX and file:///C:/x on Windows,
+    # which is how the binary prints local peers.
+    expected_peers = f"{peer_a.as_uri()} {peer_b.as_uri()}"
     expect(
         actual_peers == expected_peers,
         "rollback hint peers part mismatch: expected "

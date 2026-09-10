@@ -59,6 +59,8 @@ cargo build --release --manifest-path code/Cargo.toml
 
 The `CARGO_HOME` line keeps downloaded crates under `./tools/` too, instead of the user's home directory. `code/build.py` runs these steps and copies the result to `./released/` under the right name.
 
+On Windows the SSH library's crypto backend (`aws-lc-sys`, pulled in by `russh`) compiles assembly and needs NASM, plus the MSVC linker from Visual Studio Build Tools. Unzip a NASM release (https://www.nasm.us/pub/nasm/releasebuilds/) so that `./tools/nasm/nasm.exe` exists; `code/build.py` puts that directory on `PATH` for the build. The Rust toolchain itself is the standalone installer from https://static.rust-lang.org/dist/ (the `x86_64-pc-windows-msvc` tarball), installed with `install.sh --prefix=./tools/rust`.
+
 ## Tests
 
 Tests run the released binary for the current platform directly from `./released/` and observe its exit code, stdout, stderr, and the filesystem under directories they create. They do not link against the code. All diagnostics and progress output go to stdout and stderr must remain empty. SFTP tests must follow `specs/TESTING-GUIDELINES.md` and use the ephemeral server in `extart/` rather than any real host.
