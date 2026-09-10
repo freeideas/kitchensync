@@ -1,13 +1,13 @@
 ﻿# Help Screen
 
-No arguments prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1.
+No arguments, or `--help`, `-h`, or `/?` anywhere on the command line, prints the following text verbatim to stdout and exits 0. Output goes to stdout only; stderr is empty. Argument validation errors on non-help invocations (too few peers, multiple `+` peers, unrecognized flags, invalid values) print a specific error message followed by the help text, and exit 1.
 
 ```
 Usage: kitchensync [options] <peer> <peer> [<peer>...]
 
 Synchronize file trees across multiple peers.
 
-Running with no arguments prints this help. See the specs for full behavior.
+Running with no arguments (or --help, -h, /?) prints this help. See the specs for full behavior.
 
 Peers:
   /path or c:\path                 Local path (same as file://)
@@ -32,14 +32,15 @@ Per-URL settings (query string, inside quotes):
 
 Options:
   --dry-run          Read-only and plan, but make no peer changes
-  --max-copies N     Max active file copies across the whole run (default: 10)
+  --parallel N       Files copied at the same time (default: 5)
   --retries-copy N   Give up copying after this many tries (default: 3)
   --retries-list N   Give up listing after this many tries (default: 3)
   --timeout-conn N   SSH handshake timeout in seconds (default: 30)
   --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)
   --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)
-  -x RELPATH         Exclude relative slash path from sync; repeatable
-  --keep-tmp-days N  Delete stale TMP staging after N days (default: 2)
+  --rollback TS      Roll the given peers back to timestamp TS, then exit
+  --undo             Roll the given peers back to just before their newest run
+  -x PATTERN         Exclude like .gitignore (or @file of patterns); repeatable
   --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)
   --keep-del-days N  Forget deletion records after N days (default: 180)
 
@@ -49,8 +50,8 @@ Quick start:
   kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate
   kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password
 
-Canon (+) is required on first sync when no peer has snapshot history.
-After the first sync, bidirectional sync works without canon.
+Without + on a first sync, peers are merged both ways and nothing is deleted.
+Use + to make one peer's contents win instead.
 
 Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 

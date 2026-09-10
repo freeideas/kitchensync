@@ -7,12 +7,10 @@ point tests at `127.0.0.1`.
 ## The ephemeral SFTP server
 
 `extart/ephemeral-sftp-server.py` is a self-contained SFTP server for tests. Launch
-it as a subprocess through the bundled uv for the platform:
+it as a subprocess through `uv` (the script declares its own dependencies):
 
 ```
-aisf/bin/uv.linux  run --script extart/ephemeral-sftp-server.py   # Linux
-aisf/bin/uv.mac    run --script extart/ephemeral-sftp-server.py   # macOS
-aisf/bin/uv.exe    run --script extart/ephemeral-sftp-server.py   # Windows
+uv run --script extart/ephemeral-sftp-server.py
 ```
 
 - It binds `127.0.0.1` on an OS-assigned port and prints **exactly one line to

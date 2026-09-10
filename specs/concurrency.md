@@ -3,15 +3,15 @@
 ## Copy Concurrency
 
 KitchenSync limits total file-copy work, not connections. By default, at most
-10 file copies may be active at one time across the whole run.
+5 file copies may be active at one time across the whole run.
 
-`--max-copies N` sets the global maximum number of active file copies. A copy counts
+`--parallel N` sets the global maximum number of active file copies. A copy counts
 against this limit whether it is `file://` to `file://`, `file://` to `sftp://`,
 `sftp://` to `file://`, or `sftp://` to `sftp://`.
 
-Directory listing, snapshot download/upload, directory creation, and BAK/TMP/SWAP
+Directory listing, manifest reads and writes, directory creation, and BAK/SWAP
 cleanup do not count as file copies. They may still run concurrently where the
-sync algorithm requires it, but they must not allow more than `--max-copies` active
+sync algorithm requires it, but they must not allow more than `--parallel` active
 file-copy operations.
 
 Copying is incremental. KitchenSync does not first scan the whole tree and then
@@ -23,11 +23,11 @@ There is no per-peer, per-host, or per-connection transfer limit in the user
 interface. Startup keeps the selected peer connection state as the reachable
 peer handle, including the established SSH/SFTP session and remote root path for
 an `sftp://` peer, but this must not change the externally visible rule:
-`--max-copies` means max active file copies for the whole run.
+`--parallel` means max active file copies for the whole run.
 
 | Setting                   | Default | Global flag      |
 | ------------------------- | ------- | ---------------- |
-| Max active file copies    | 10      | `--max-copies`   |
+| Files copied at once      | 5       | `--parallel`     |
 | Failed copy tries         | 3       | `--retries-copy` |
 | Directory listing tries   | 3       | `--retries-list` |
 | SSH connection timeout    | 30s     | `--timeout-conn` |
@@ -53,7 +53,7 @@ keep-alive behavior:
 kitchensync "[sftp://192.168.1.50/photos?timeout-conn=20,sftp://nas.vpn/photos?timeout-conn=60&timeout-idle=10]" /local/photos
 ```
 
-`max-copies` is not a per-URL setting. If a URL contains `max-copies`,
+`parallel` is not a per-URL setting. If a URL contains `parallel`,
 argument validation must reject it with a clear error.
 
 ## Connection Establishment
@@ -113,20 +113,31 @@ action to stdout during sync execution, in the order the actions happen. At
 screen, progress bar, percentage, scanned-directory indicator, or terminal
 control sequence. Output is identical whether or not stdout is a terminal.
 
-Each line is an action letter, a single space, then the slash-separated relative
-path from the sync root:
+The first progress line of every normal (non-dry-run) run is the rollback hint
+described in sync.md, "Logging". It is printed once, right after startup
+succeeds and before any action line:
+
+```text
+undo later with: kitchensync --rollback 2024-03-05_08-00-01_120394Z /photos sftp://user@host/photos
+```
+
+Every line after it is an action letter, a single space, then the
+slash-separated relative path from the sync root:
 
 ```text
 C path/to/file.ext
 X path/to/file.ext
+R path/to/file.ext
 ```
 
 - `C <relpath>` - the file is being copied from one peer to one or more other
   peers. One line per path, regardless of how many peers receive it.
 - `X <relpath>` - the path is being deleted (displaced to BAK/) on one or more
   peers. One line per path. Files and directories use the same letter.
+- `R <relpath>` - the path is being restored from BAK/ during a rollback (see
+  sync.md, "Rollback"). One line per path.
 
-No line is emitted for directory creation, listing, snapshot work, or BAK/TMP
+No line is emitted for directory creation, listing, manifest work, or BAK
 cleanup. These lines are `info`-level. Errors and the final `sync complete`
 message are separate output and remain visible.
 

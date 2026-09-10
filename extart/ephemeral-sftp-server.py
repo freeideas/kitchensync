@@ -25,6 +25,12 @@ Authentication (simple by default, overridable):
   --authorized-key F   accept only the public key in F (one OpenSSH public-key
                        line) and reject passwords -- e.g. to exercise an
                        Ed25519-only key-auth path
+
+Server quirks (to reproduce real peers in tests):
+  --plain-rename-fails answer every standard SSH_FXP_RENAME with "Failure",
+                       as macOS 26's fskit SFTP stack does on exFAT; the
+                       posix-rename@openssh.com extension still works
+  --no-posix-rename    answer posix-rename@openssh.com with "op unsupported"
 """
 
 from __future__ import annotations
@@ -242,9 +248,29 @@ class _SFTP(paramiko.SFTPServerInterface):
             return paramiko.SFTPServer.convert_errno(exc.errno)
         return paramiko.SFTP_OK
 
+    # Test knobs, set from the command line. See --plain-rename-fails and
+    # --no-posix-rename.
+    PLAIN_RENAME_FAILS: bool = False
+    NO_POSIX_RENAME: bool = False
+
     def rename(self, oldpath, newpath):
+        if self.PLAIN_RENAME_FAILS:
+            # Mimic servers that reject SSH_FXP_RENAME with a bare "Failure"
+            # even when the destination is absent (macOS 26 fskit exFAT).
+            return paramiko.SFTP_FAILURE
         try:
             os.rename(self._real(oldpath), self._real(newpath))
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
+        return paramiko.SFTP_OK
+
+    def posix_rename(self, oldpath, newpath):
+        # The posix-rename@openssh.com extension: overwrites an existing
+        # destination, as OpenSSH's sftp-server does.
+        if self.NO_POSIX_RENAME:
+            return paramiko.SFTP_OP_UNSUPPORTED
+        try:
+            os.replace(self._real(oldpath), self._real(newpath))
         except OSError as exc:
             return paramiko.SFTPServer.convert_errno(exc.errno)
         return paramiko.SFTP_OK
@@ -309,7 +335,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--host-key", default=None,
                         help="use this private host key file (Ed25519/ECDSA/RSA) "
                              "instead of a freshly generated one")
+    parser.add_argument("--plain-rename-fails", action="store_true",
+                        help="answer every standard rename with 'Failure', like "
+                             "macOS 26's fskit SFTP stack on exFAT; posix-rename "
+                             "still works")
+    parser.add_argument("--no-posix-rename", action="store_true",
+                        help="report the posix-rename@openssh.com extension as "
+                             "unsupported")
     args = parser.parse_args(argv)
+    _SFTP.PLAIN_RENAME_FAILS = args.plain_rename_fails
+    _SFTP.NO_POSIX_RENAME = args.no_posix_rename
 
     global _root
     listener: socket.socket | None = None

@@ -22,9 +22,8 @@
 /orchestrator.log
 /orchestrator.log.*
 
-# Generated final artifacts are intentionally kept at the outer workspace root,
-# not inside ./proj/. Adjust this if the product's release policy changes.
-/released/
+# The shipped binary under ./released/ IS committed (see specs/DEVELOPMENT.md),
+# so re-include it below after the generic *.exe rule.
 
 # Local agent instructions and credentials
 /AGENTS.md
@@ -105,6 +104,10 @@ desktop.ini
 !/docs/**
 !/extart/
 !/extart/**
+!/released/
+!/released/kitchensync.exe
+!/released/kitchensync.mac
+!/released/kitchensync.linux
 /specs/**/__pycache__/
 /specs/**/*.py[cod]
 /docs/**/__pycache__/
