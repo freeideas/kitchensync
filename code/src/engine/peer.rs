@@ -27,6 +27,20 @@ impl Peer {
     pub fn contributes(&self) -> bool {
         self.role != Role::Subordinate
     }
+    /// One-character peer label for progress lines: the peer's 1-based
+    /// command-line position as a lower-case base-36 digit (1-9, then a-z).
+    pub fn tag(&self) -> char {
+        peer_tag(self.index)
+    }
+}
+
+/// See `Peer::tag`. Positions past 35 all print as `?`.
+pub fn peer_tag(index: usize) -> char {
+    match index + 1 {
+        n @ 1..=9 => (b'0' + n as u8) as char,
+        n @ 10..=35 => (b'a' + (n - 10) as u8) as char,
+        _ => '?',
+    }
 }
 
 pub const META: &str = ".kitchensync";

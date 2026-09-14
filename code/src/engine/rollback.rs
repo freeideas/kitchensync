@@ -115,7 +115,7 @@ impl Rollback<'_> {
         for (name, (_, stamp)) in &earliest {
             let rel = join(dir, name);
             let from = join(&join(&bak_root, stamp), name);
-            output::info(&format!("R {rel}"));
+            output::info(&format!("R{} {rel}", self.peer.tag()));
             if self.cfg.dry_run {
                 continue;
             }
@@ -138,7 +138,7 @@ impl Rollback<'_> {
             let placed_after = lines.get(&e.name).and_then(|l| l.placed).is_some_and(|p| p > self.t);
             if placed_after {
                 let rel = join(dir, &e.name);
-                output::info(&format!("X {rel}"));
+                output::info(&format!("X{} {rel}", self.peer.tag()));
                 if !self.cfg.dry_run && fsops::displace(self.peer, &rel, false) {
                     lines.remove(&e.name);
                     changed = true;

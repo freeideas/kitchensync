@@ -121,21 +121,35 @@ succeeds and before any action line:
 undo later with: kitchensync --rollback 2024-03-05_08-00-01_120394Z /photos sftp://user@host/photos
 ```
 
-Every line after it is an action letter, a single space, then the
+Every line after it is an action code, a single space, then the
 slash-separated relative path from the sync root:
 
 ```text
-C path/to/file.ext
-X path/to/file.ext
-R path/to/file.ext
+1C2 path/to/file.ext
+1C23 path/to/file.ext
+X2 path/to/file.ext
+X23 path/to/file.ext
+R1 path/to/file.ext
 ```
 
-- `C <relpath>` - the file is being copied from one peer to one or more other
-  peers. One line per path, regardless of how many peers receive it.
-- `X <relpath>` - the path is being deleted (displaced to BAK/) on one or more
-  peers. One line per path. Files and directories use the same letter.
-- `R <relpath>` - the path is being restored from BAK/ during a rollback (see
-  sync.md, "Rollback"). One line per path.
+The digits around the action letter name peers by their position on the
+command line: the first peer is `1`, the second `2`, and so on. Positions past
+`9` continue as lower-case base-36 digits (`a` is the tenth peer, `z` the
+thirty-fifth); anything beyond that prints as `?`. The digit is the peer's
+position among all peers named on the command line, including a `+` canon peer
+and a `-` subordinate peer, so it does not change with the peer's role.
+
+- `<src>C<dsts> <relpath>` - the file is being copied from peer `<src>` to each
+  peer in `<dsts>`, one digit per receiving peer. One line per path, regardless
+  of how many peers receive it.
+- `X<peers> <relpath>` - the path is being deleted (displaced to BAK/) on each
+  peer in `<peers>`. One line per path. Files and directories use the same
+  letter.
+- `R<peer> <relpath>` - the path is being restored from BAK/ on that peer
+  during a rollback (see sync.md, "Rollback"). One line per path.
+
+A type conflict prints an `X` line for the directory being displaced followed
+by the `C` line for the file replacing it.
 
 No line is emitted for directory creation, listing, manifest work, or BAK
 cleanup. These lines are `info`-level. Errors and the final `sync complete`

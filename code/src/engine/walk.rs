@@ -230,11 +230,16 @@ impl Walker {
         Decision::Directory { conflict }
     }
 
-    fn displace_view(&self, v: &View, rel: &str, name: &str, printed: &mut bool) -> bool {
-        if !*printed {
-            output::info(&format!("X {rel}"));
-            *printed = true;
+    /// Print one `X<peers> <relpath>` line for the peers collected so far.
+    fn print_x(rel: &str, tags: &mut String) {
+        if !tags.is_empty() {
+            output::info(&format!("X{tags} {rel}"));
+            tags.clear();
         }
+    }
+
+    fn displace_view(&self, v: &View, rel: &str, name: &str, tags: &mut String) -> bool {
+        tags.push(v.peer().tag());
         if fsops::displace(v.peer(), rel, self.cfg.dry_run) {
             v.state.confirm_absent(name);
             true
@@ -245,7 +250,7 @@ impl Walker {
 
     /// Returns whether the directory still exists after this run.
     fn apply_directory(&self, views: &[View], rel: &str, name: &str, conflict: bool) -> bool {
-        let mut printed = false;
+        let mut tags = String::new();
         let mut recurse: Vec<PeerRef> = Vec::new();
         for v in views {
             match &v.live {
@@ -254,7 +259,7 @@ impl Walker {
                     recurse.push(Arc::clone(v.peer()));
                 }
                 other => {
-                    if other.is_some() && !self.displace_view(v, rel, name, &mut printed) {
+                    if other.is_some() && !self.displace_view(v, rel, name, &mut tags) {
                         continue;
                     }
                     if !self.cfg.dry_run {
@@ -269,6 +274,7 @@ impl Walker {
                 }
             }
         }
+        Self::print_x(rel, &mut tags);
         if recurse.is_empty() {
             return false;
         }
@@ -276,8 +282,9 @@ impl Walker {
         if conflict && !kept {
             // Everything inside was older than the deletion: the directory goes too.
             for v in views.iter().filter(|v| recurse.iter().any(|p| p.index == v.peer().index)) {
-                self.displace_view(v, rel, name, &mut printed);
+                self.displace_view(v, rel, name, &mut tags);
             }
+            Self::print_x(rel, &mut tags);
             return false;
         }
         true
@@ -285,8 +292,8 @@ impl Walker {
 
     fn apply_file(&self, views: &[View], rel: &str, name: &str, src: usize, mod_time: i64, byte_size: i64) {
         let src_peer = views.iter().find(|v| v.peer().index == src).map(|v| Arc::clone(v.peer())).unwrap();
-        let mut printed_x = false;
-        let mut printed_c = false;
+        let mut x_tags = String::new();
+        let mut dsts: Vec<&View> = Vec::new();
         for v in views {
             match &v.live {
                 Some(e) if !e.is_dir && within(system_to_micros(e.mod_time), mod_time) && e.byte_size == byte_size => {
@@ -295,19 +302,24 @@ impl Walker {
                 }
                 Some(e) if e.is_dir => {
                     // Type conflict: the directory must go before the file can land.
-                    if !self.displace_view(v, rel, name, &mut printed_x) {
+                    if !self.displace_view(v, rel, name, &mut x_tags) {
                         continue;
                     }
                 }
                 _ => {}
             }
-            if !printed_c {
-                output::info(&format!("C {rel}"));
-                printed_c = true;
-            }
-            if self.cfg.dry_run {
-                continue;
-            }
+            dsts.push(v);
+        }
+        Self::print_x(rel, &mut x_tags);
+        if dsts.is_empty() {
+            return;
+        }
+        let c_tags: String = dsts.iter().map(|v| v.peer().tag()).collect();
+        output::info(&format!("{}C{c_tags} {rel}", src_peer.tag()));
+        if self.cfg.dry_run {
+            return;
+        }
+        for v in dsts {
             v.state.intend_push(name, mod_time, byte_size);
             self.queue.enqueue(CopyJob {
                 src: Arc::clone(&src_peer),
@@ -321,14 +333,15 @@ impl Walker {
     }
 
     fn apply_delete(&self, views: &[View], rel: &str, name: &str) {
-        let mut printed = false;
+        let mut tags = String::new();
         for v in views {
             if v.live.is_some() {
-                self.displace_view(v, rel, name, &mut printed);
+                self.displace_view(v, rel, name, &mut tags);
             } else {
                 v.state.confirm_absent(name);
             }
         }
+        Self::print_x(rel, &mut tags);
     }
 }
 

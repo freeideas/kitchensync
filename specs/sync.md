@@ -357,8 +357,8 @@ trimmed to its last 1000 lines. It is per sync root: syncing `/X/b/c` and later
 
 Progress output follows the usual verbosity rules (suppressed at `error`):
 
-- `R <relpath>` for each entry restored from `BAK/`;
-- `X <relpath>` for each entry that was added after the target time and is
+- `R<peer> <relpath>` for each entry restored from `BAK/`;
+- `X<peer> <relpath>` for each entry that was added after the target time and is
   therefore removed. Removals are displaced to `BAK/` like any other deletion,
   so a rollback can itself be rolled back.
 

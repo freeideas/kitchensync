@@ -475,7 +475,7 @@ def s11(tmp: Path) -> None:
         "rather than assuming a bug",
     )
 
-    expect(lines[1] == "C note.txt", f"second stdout line: expected 'C note.txt', got {lines[1]!r}")
+    expect(lines[1] == "1C2 note.txt", f"second stdout line: expected '1C2 note.txt', got {lines[1]!r}")
     expect(lines[2] == "sync complete", f"third stdout line: expected 'sync complete', got {lines[2]!r}")
 
     check_file_bytes(peer_b / "note.txt", b"copy me\n")

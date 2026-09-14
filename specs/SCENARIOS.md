@@ -196,7 +196,7 @@ Setup:
 Action: run `released/kitchensync.exe --verbosity info +A B`.
 
 Outcome: the process exits 0. stdout is exactly three lines: the rollback hint,
-then `C note.txt`, then `sync complete`. The test compares the first line by
+then `1C2 note.txt`, then `sync complete`. The test compares the first line by
 pattern, not literally: it is
 `undo later with: kitchensync --rollback <TS> <A> <B>`, where `<TS>` is any
 27-character timestamp and `<A>` and `<B>` are the two peers' absolute paths as
