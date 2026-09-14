@@ -2,7 +2,7 @@
 
 ## Overview
 
-Synchronizes N file trees in a single recursive combined-tree walk. At each directory level: list all peers in parallel, union their entries, decide the authoritative state for each, act, and recurse. The traversal is pre-order: every entry in a directory is decided and acted on before recursing into any subdirectory. Entry traversal order within a directory is deterministic, case-insensitive lexicographic order with the original case-sensitive name as a tie-breaker. This means a directory marked for displacement is renamed (with its entire subtree) before its children are ever visited - there is no separate "file deletion" pass. Each directory's manifest (see manifest.md) is read per peer, alongside that peer's listing of the directory, and is consulted for reconciliation (detecting deletions and modifications). It does not contribute entries to the union - only live peer listings drive traversal.
+Synchronizes N file trees in a single recursive combined-tree walk. At each directory level: list all peers in parallel, union their entries, decide the authoritative state for each, act, and recurse. The traversal is pre-order: every entry in a directory is decided and acted on (files copied or displaced, subdirectories displaced or created) before recursing into any of its subdirectories. Recursion happens only after the last entry of the directory is settled, so a change in a shallow directory is found and acted on before the walk descends into deep, slow subtrees that sort before it. Entry traversal order within a directory is deterministic, case-insensitive lexicographic order with the original case-sensitive name as a tie-breaker. This means a directory marked for displacement is renamed (with its entire subtree) before its children are ever visited - there is no separate "file deletion" pass. Each directory's manifest (see manifest.md) is read per peer, alongside that peer's listing of the directory, and is consulted for reconciliation (detecting deletions and modifications). It does not contribute entries to the union - only live peer listings drive traversal.
 
 Subordinate peers (`-` prefix) are listed and receive outcomes, but their entries do not influence decisions. See "Subordinate Peers" below.
 
@@ -72,7 +72,7 @@ function sync_directory(peers, path):
                     if displace(peer, path/name) succeeds:
                         record_absent(peer, name)
             if recursion_peers:
-                sync_directory(recursion_peers, path/name)
+                pending.append((recursion_peers, path/name))  // recursed into in Phase 3b
 
         if decision.type == file:
             record_present(peers whose listing showed the winning file, name)
@@ -85,6 +85,11 @@ function sync_directory(peers, path):
             for each peer where file should be deleted:
                 if displace(peer, path/name) succeeds:
                     record_absent(peer, name)
+
+    // Phase 3b: Recurse into the subdirectories prepared above, in the same
+    // order, now that every entry of this directory has been decided and acted on.
+    for (recursion_peers, subdir) in pending:
+        sync_directory(recursion_peers, subdir)
 
     // Phase 4: Write this directory's manifest on each active peer, once every
     // entry here has been decided and every copy into this directory on that

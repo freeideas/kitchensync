@@ -67,6 +67,7 @@ impl Walker {
                 return None;
             }
         }
+        let t0 = std::time::Instant::now();
         let entries = match fsops::list_with_retries(t, dir, self.cfg.retries_list) {
             Ok(v) => v,
             // In a dry run a directory that would have been created does not
@@ -81,6 +82,7 @@ impl Walker {
                 return None;
             }
         };
+        let t1 = std::time::Instant::now();
         let text = match peer::read_manifest(t, dir) {
             Ok(v) => v,
             Err(e) => {
@@ -88,6 +90,17 @@ impl Walker {
                 return None;
             }
         };
+        if output::level() >= output::Verbosity::Trace {
+            output::trace(&format!(
+                "listed {} on {}: {} entries in {} ms, manifest {} bytes in {} ms",
+                if dir.is_empty() { "." } else { dir },
+                p.tag(),
+                entries.len(),
+                (t1 - t0).as_millis(),
+                text.as_ref().map_or(0, |t| t.len()),
+                t1.elapsed().as_millis()
+            ));
+        }
         Some(Listed { state: DirState::new(Arc::clone(p), dir, text, self.cfg.dry_run, self.cfg.keep_del_days), entries })
     }
 
@@ -129,8 +142,12 @@ impl Walker {
         let mut ordered: Vec<String> = names.into_iter().collect();
         ordered.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
 
-        // Phase 3: decide and act.
+        // Phase 3: decide and act on every entry here. Subdirectories are
+        // prepared (displaced, created) in this pass but recursed into only
+        // after every entry of this directory is settled, so that changes in
+        // a shallow directory are found and acted on before deep ones.
         let mut kept = kept_excluded;
+        let mut pending: Vec<PendingDir> = Vec::new();
         for name in ordered {
             let rel = join(dir, &name);
             let views: Vec<View> = active
@@ -143,8 +160,8 @@ impl Walker {
                 .collect();
             match self.decide(&views) {
                 Decision::Directory { conflict } => {
-                    if self.apply_directory(&views, &rel, &name, conflict) {
-                        kept = true;
+                    if let Some(p) = self.prepare_directory(views, rel, name, conflict) {
+                        pending.push(p);
                     }
                 }
                 Decision::File { src, mod_time, byte_size } => {
@@ -157,6 +174,13 @@ impl Walker {
 
         for l in &active {
             l.state.finish_deciding();
+        }
+
+        // Phase 3b: recurse into the subdirectories prepared above.
+        for p in pending {
+            if self.recurse_directory(p) {
+                kept = true;
+            }
         }
 
         // BAK cleanup piggybacks on the traversal.
@@ -250,43 +274,51 @@ impl Walker {
         }
     }
 
-    /// Returns whether the directory still exists after this run.
-    fn apply_directory(&self, views: &[View], rel: &str, name: &str, conflict: bool) -> bool {
+    /// Make the directory exist on every peer that should have it (displacing
+    /// a wrong-typed entry first) and return what recursion into it needs, or
+    /// None when no peer keeps it.
+    fn prepare_directory(&self, views: Vec<View>, rel: String, name: String, conflict: bool) -> Option<PendingDir> {
         let mut tags = String::new();
         let mut recurse: Vec<PeerRef> = Vec::new();
-        for v in views {
+        for v in &views {
             match &v.live {
                 Some(e) if e.is_dir => {
-                    v.state.confirm_present(name, true, system_to_micros(e.mod_time), -1);
+                    v.state.confirm_present(&name, true, system_to_micros(e.mod_time), -1);
                     recurse.push(Arc::clone(v.peer()));
                 }
                 other => {
-                    if other.is_some() && !self.displace_view(v, rel, name, &mut tags) {
+                    if other.is_some() && !self.displace_view(v, &rel, &name, &mut tags) {
                         continue;
                     }
                     if !self.cfg.dry_run {
-                        if let Err(e) = v.peer().transport.create_dir(rel) {
+                        if let Err(e) = v.peer().transport.create_dir(&rel) {
                             output::error(&format!("create directory failed for {} on {}: {}", rel, v.peer().url, e));
                             peer::note_failure();
                             continue;
                         }
                     }
-                    v.state.created_dir(name);
+                    v.state.created_dir(&name);
                     recurse.push(Arc::clone(v.peer()));
                 }
             }
         }
-        Self::print_x(rel, &mut tags);
+        Self::print_x(&rel, &mut tags);
         if recurse.is_empty() {
-            return false;
+            return None;
         }
-        let kept = self.sync_directory(&recurse, rel);
-        if conflict && !kept {
+        Some(PendingDir { views, rel, name, conflict, recurse })
+    }
+
+    /// Returns whether the directory still exists after this run.
+    fn recurse_directory(&self, p: PendingDir) -> bool {
+        let kept = self.sync_directory(&p.recurse, &p.rel);
+        if p.conflict && !kept {
             // Everything inside was older than the deletion: the directory goes too.
-            for v in views.iter().filter(|v| recurse.iter().any(|p| p.index == v.peer().index)) {
-                self.displace_view(v, rel, name, &mut tags);
+            let mut tags = String::new();
+            for v in p.views.iter().filter(|v| p.recurse.iter().any(|r| r.index == v.peer().index)) {
+                self.displace_view(v, &p.rel, &p.name, &mut tags);
             }
-            Self::print_x(rel, &mut tags);
+            Self::print_x(&p.rel, &mut tags);
             return false;
         }
         true
@@ -345,6 +377,16 @@ impl Walker {
         }
         Self::print_x(rel, &mut tags);
     }
+}
+
+/// A subdirectory whose entry has been settled here and that still has to be
+/// recursed into, on the peers that keep it.
+struct PendingDir {
+    views: Vec<View>,
+    rel: String,
+    name: String,
+    conflict: bool,
+    recurse: Vec<PeerRef>,
 }
 
 enum Decision {

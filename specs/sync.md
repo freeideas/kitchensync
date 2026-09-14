@@ -452,7 +452,7 @@ Displaced entries are recoverable from BAK/ until cleaned. BAK/ is created at th
 
 ## Peer Transports
 
-Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
+Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. A directory listing must return each entry's name, type, size and modification time in as few filesystem calls as the platform allows: on macOS that is one bulk attribute call per directory (`getattrlistbulk`), falling back to a per-entry stat only where the call is unavailable. On an external exFAT drive a per-entry stat costs a disk seek and a round trip through the user-space filesystem driver, tens of milliseconds each, which made a large directory take longer to list locally than over SFTP. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
 
 ### Required Operations
 
