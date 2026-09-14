@@ -72,7 +72,15 @@ impl Transport for LocalTransport {
                 // Non-UTF-8 names are silently skipped.
                 continue;
             };
-            let meta = entry.metadata()?;
+            // A child whose attributes cannot be read makes the whole listing
+            // fail as an I/O error, never as "not found": the engine would
+            // otherwise treat a missing peer directory as empty, or the child
+            // as deleted, and act on that. Seen on macOS exFAT volumes where
+            // some non-ASCII names come back from the directory scan but
+            // cannot be looked up again (ENOENT).
+            let meta = entry.metadata().map_err(|e| {
+                TransportError::io(format!("cannot read attributes of {}: {e}", entry.path().display()))
+            })?;
             if let Some(e) = entry_from_metadata(name, &meta) {
                 out.push(e);
             }

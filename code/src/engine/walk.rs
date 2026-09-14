@@ -71,7 +71,9 @@ impl Walker {
             Ok(v) => v,
             // In a dry run a directory that would have been created does not
             // exist yet; treat it as empty so the copies into it are still planned.
-            Err(e) if self.cfg.dry_run && e.is_not_found() => {
+            // Only when the directory itself is absent: a "not found" raised by
+            // something inside an existing directory is a real listing failure.
+            Err(e) if self.cfg.dry_run && e.is_not_found() && t.stat(dir).is_err() => {
                 return Some(Listed { state: DirState::new(Arc::clone(p), dir, None, true, self.cfg.keep_del_days), entries: Vec::new() });
             }
             Err(e) => {
