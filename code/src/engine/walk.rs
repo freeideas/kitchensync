@@ -1,8 +1,8 @@
 //! The combined-tree walk: list, decide, act, recurse.
 //! See specs/multi-tree-sync.md.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::config::Config;
 use crate::manifest::Line;
@@ -20,6 +20,81 @@ pub struct Walker {
     pub cfg: Config,
     pub queue: Arc<CopyQueue>,
     pub ignore: crate::ignore::IgnoreSet,
+    pub prefetch: Prefetch,
+}
+
+/// Directories to list ahead of the walk, and the listings that are ready.
+///
+/// A listing is mostly waiting on round trips, so a few threads list
+/// directories the walk will need soon while it works on the current one.
+/// The walk pushes a directory's subdirectories here once its entries are
+/// settled, and takes each listing back when it recurses. The stack is
+/// last-in-first-out so that the workers stay just ahead of the depth-first
+/// walk, and the number of ready-but-unconsumed listings is capped so they
+/// never run far ahead (a listing goes stale if it waits too long). Nothing
+/// but listing and manifest reading runs ahead; decisions, copies and
+/// displacements happen in the walk, in the usual order.
+pub struct Prefetch {
+    inner: Mutex<PrefetchState>,
+    changed: Condvar,
+}
+
+/// A directory's position in the walk: its path components in the walk's
+/// sort order (case-insensitive, original case as tie-breaker). Pre-order
+/// traversal visits directories in ascending key order, so "the next
+/// directory the walk needs" is simply the smallest key not yet visited.
+type WalkKey = Vec<(String, String)>;
+
+fn walk_key(rel: &str) -> WalkKey {
+    rel.split('/').filter(|c| !c.is_empty()).map(|c| (c.to_lowercase(), c.to_string())).collect()
+}
+
+#[derive(Default)]
+struct PrefetchState {
+    /// Directories not yet started, in walk order.
+    todo: BTreeMap<WalkKey, (String, Vec<PeerRef>)>,
+    in_progress: HashSet<String>,
+    /// Listings by directory, with the indices of the peers they were taken
+    /// on, in order. The walk uses one only when it wants exactly those peers.
+    ready: BTreeMap<WalkKey, (Vec<usize>, Vec<Option<Listed>>)>,
+    /// Where the walk is; everything before it is no longer needed.
+    position: WalkKey,
+    stopped: bool,
+}
+
+/// Listing threads, and the cap on ready listings waiting for the walk.
+pub const PREFETCH_THREADS: usize = 8;
+const PREFETCH_READY_CAP: usize = 64;
+
+impl Prefetch {
+    pub fn new() -> Prefetch {
+        Prefetch { inner: Mutex::new(PrefetchState::default()), changed: Condvar::new() }
+    }
+
+    /// Queue directories for listing, unless already queued, listed or passed.
+    fn push(&self, dirs: Vec<(String, Vec<PeerRef>)>) {
+        let mut st = self.inner.lock().unwrap();
+        for (rel, peers) in dirs {
+            let key = walk_key(&rel);
+            if key < st.position || st.in_progress.contains(&rel) || st.ready.contains_key(&key) {
+                continue;
+            }
+            st.todo.entry(key).or_insert((rel, peers));
+        }
+        self.changed.notify_all();
+    }
+
+    /// Stop the workers once the walk is over.
+    pub fn stop(&self) {
+        self.inner.lock().unwrap().stopped = true;
+        self.changed.notify_all();
+    }
+}
+
+impl Default for Prefetch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One peer's view of one entry name at the current level.
@@ -49,7 +124,7 @@ fn within(a: i64, b: i64) -> bool {
 }
 
 /// Listing plus manifest for one peer at one directory.
-struct Listed {
+pub struct Listed {
     state: Arc<DirState>,
     entries: Vec<Entry>,
 }
@@ -67,8 +142,16 @@ impl Walker {
                 return None;
             }
         }
+        // The listing and the manifest read are independent round trips:
+        // issue them together.
         let t0 = std::time::Instant::now();
-        let entries = match fsops::list_with_retries(t, dir, self.cfg.retries_list) {
+        let (entries, text) = std::thread::scope(|s| {
+            let manifest = s.spawn(|| peer::read_manifest(t, dir));
+            let entries = fsops::list_with_retries(t, dir, self.cfg.retries_list);
+            (entries, manifest.join().unwrap_or_else(|_| Err(crate::transport::TransportError::io("manifest read thread failed".to_string()))))
+        });
+        let t1 = std::time::Instant::now();
+        let entries = match entries {
             Ok(v) => v,
             // In a dry run a directory that would have been created does not
             // exist yet; treat it as empty so the copies into it are still planned.
@@ -82,8 +165,7 @@ impl Walker {
                 return None;
             }
         };
-        let t1 = std::time::Instant::now();
-        let text = match peer::read_manifest(t, dir) {
+        let text = match text {
             Ok(v) => v,
             Err(e) => {
                 output::error(&format!("manifest read failed for {} at {}, excluding from this subtree: {}", p.url, dir, e));
@@ -92,13 +174,12 @@ impl Walker {
         };
         if output::level() >= output::Verbosity::Trace {
             output::trace(&format!(
-                "listed {} on {}: {} entries in {} ms, manifest {} bytes in {} ms",
+                "listed {} on {}: {} entries, manifest {} bytes, in {} ms",
                 if dir.is_empty() { "." } else { dir },
                 p.tag(),
                 entries.len(),
-                (t1 - t0).as_millis(),
                 text.as_ref().map_or(0, |t| t.len()),
-                t1.elapsed().as_millis()
+                (t1 - t0).as_millis()
             ));
         }
         Some(Listed { state: DirState::new(Arc::clone(p), dir, text, self.cfg.dry_run, self.cfg.keep_del_days), entries })
@@ -106,16 +187,124 @@ impl Walker {
 
     /// Sync one directory level across `peers`, then recurse. Returns whether
     /// any entry remains live in the directory after this run's decisions.
-    pub fn sync_directory(&self, peers: &[PeerRef], dir: &str) -> bool {
-        // A long silence worries the person watching: say where the walk is.
+    /// Phase 0/1 for one directory: recover and list every peer in parallel.
+    fn list_all(&self, peers: &[PeerRef], dir: &str) -> Vec<Option<Listed>> {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = peers.iter().map(|p| s.spawn(move || self.list_peer(p, dir))).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(None)).collect()
+        })
+    }
+
+    /// Body of one prefetch thread: list the most recently queued directory
+    /// until the walk stops. Waits while enough listings are already ready.
+    pub fn prefetch_worker(&self) {
+        loop {
+            let (dir, peers) = {
+                let mut st = self.prefetch.inner.lock().unwrap();
+                loop {
+                    if st.stopped {
+                        return;
+                    }
+                    if !st.todo.is_empty() && st.ready.len() < PREFETCH_READY_CAP {
+                        break;
+                    }
+                    st = self.prefetch.changed.wait(st).unwrap();
+                }
+                let item = st.todo.pop_first().unwrap().1;
+                st.in_progress.insert(item.0.clone());
+                item
+            };
+            let listings = self.list_all(&peers, &dir);
+            // Queue this directory's subdirectories right away, on the peers
+            // that list them, so a deep chain of single subdirectories is
+            // fetched ahead too. Listing is read-only, so running ahead of the
+            // walk's decisions costs nothing but a wasted listing when the
+            // walk displaces a directory instead of entering it.
+            let children = self.subdirectories(&dir, &listings);
+            let indices: Vec<usize> = peers.iter().map(|p| p.index).collect();
+            let mut st = self.prefetch.inner.lock().unwrap();
+            st.in_progress.remove(&dir);
+            st.ready.insert(walk_key(&dir), (indices, listings));
+            drop(st);
+            self.prefetch.push(children);
+        }
+    }
+
+    /// The subdirectories a listing shows, in walk order, each with the peers
+    /// that list it as a directory.
+    fn subdirectories(&self, dir: &str, listings: &[Option<Listed>]) -> Vec<(String, Vec<PeerRef>)> {
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for l in listings.iter().flatten() {
+            for e in l.entries.iter().filter(|e| e.is_dir) {
+                if e.name != ".kitchensync" && e.name != ".git" {
+                    names.insert(&e.name);
+                }
+            }
+        }
+        let mut ordered: Vec<&str> = names.into_iter().collect();
+        ordered.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+        ordered
+            .into_iter()
+            .map(|name| (join(dir, name), name))
+            .filter(|(rel, _)| !self.excluded(rel, true))
+            .map(|(rel, name)| {
+                let peers = listings
+                    .iter()
+                    .flatten()
+                    .filter(|l| l.entries.iter().any(|e| e.is_dir && e.name == name))
+                    .map(|l| Arc::clone(&l.state.peer))
+                    .collect();
+                (rel, peers)
+            })
+            .collect()
+    }
+
+    /// The listings for `dir`: ready ones are taken, in-progress ones waited
+    /// for, and the rest listed right here.
+    fn take_listings(&self, peers: &[PeerRef], dir: &str) -> Vec<Option<Listed>> {
+        let wanted: Vec<usize> = peers.iter().map(|p| p.index).collect();
+        let key = walk_key(dir);
+        {
+            let mut st = self.prefetch.inner.lock().unwrap();
+            // The walk has moved here: whatever was queued or fetched for
+            // directories before this one (skipped, displaced, or excluded)
+            // will never be asked for.
+            st.position = key.clone();
+            st.todo = st.todo.split_off(&key);
+            st.ready = st.ready.split_off(&key);
+            loop {
+                if let Some((indices, l)) = st.ready.remove(&key) {
+                    self.prefetch.changed.notify_all();
+                    if indices == wanted {
+                        return l;
+                    }
+                    // Fetched on a different peer set (a directory the walk
+                    // created or dropped a peer for): list it again below.
+                    break;
+                }
+                if !st.in_progress.contains(dir) {
+                    st.todo.remove(&key);
+                    self.prefetch.changed.notify_all();
+                    break;
+                }
+                st = self.prefetch.changed.wait(st).unwrap();
+            }
+        }
+        self.list_all(peers, dir)
+    }
+
+    /// A long silence worries the person watching: say where the walk is.
+    fn heartbeat(dir: &str) {
         if output::quiet_for_a_while() {
             output::info(&format!("S {}", if dir.is_empty() { "." } else { dir }));
         }
-        // Phase 0/1: recover and list all peers in parallel.
-        let listings: Vec<Option<Listed>> = std::thread::scope(|s| {
-            let handles: Vec<_> = peers.iter().map(|p| s.spawn(move || self.list_peer(p, dir))).collect();
-            handles.into_iter().map(|h| h.join().unwrap_or(None)).collect()
-        });
+    }
+
+    pub fn sync_directory(&self, peers: &[PeerRef], dir: &str) -> bool {
+        Self::heartbeat(dir);
+        // Phase 0/1: the listings, fetched ahead where the prefetch got to
+        // them first (see `Prefetch`).
+        let listings = self.take_listings(peers, dir);
 
         // Phase 1b: drop failed peers.
         if peers.iter().zip(&listings).any(|(p, l)| p.is_canon() && l.is_none()) {
@@ -180,8 +369,11 @@ impl Walker {
             l.state.finish_deciding();
         }
 
-        // Phase 3b: recurse into the subdirectories prepared above.
-        for p in pending {
+        // Phase 3b: recurse into the subdirectories prepared above, in order,
+        // after handing them to the prefetch so their listings are fetched
+        // while the walk is busy.
+        self.prefetch.push(pending.iter().map(|p| (p.rel.clone(), p.recurse.clone())).collect());
+        for p in &pending {
             if self.recurse_directory(p) {
                 kept = true;
             }
@@ -314,7 +506,7 @@ impl Walker {
     }
 
     /// Returns whether the directory still exists after this run.
-    fn recurse_directory(&self, p: PendingDir) -> bool {
+    fn recurse_directory(&self, p: &PendingDir) -> bool {
         let kept = self.sync_directory(&p.recurse, &p.rel);
         if p.conflict && !kept {
             // Everything inside was older than the deletion: the directory goes too.

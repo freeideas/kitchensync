@@ -104,8 +104,14 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
     // Run 1-3: walk and wait for copies.
     let queue = CopyQueue::new(cfg.parallel, cfg.retries_copy);
     let workers = queue.start_workers();
-    let walker = walk::Walker { cfg: cfg.clone(), queue: Arc::clone(&queue), ignore: build_ignore(cfg, &peers) };
-    walker.sync_directory(&peers, "");
+    let walker = walk::Walker { cfg: cfg.clone(), queue: Arc::clone(&queue), ignore: build_ignore(cfg, &peers), prefetch: walk::Prefetch::new() };
+    std::thread::scope(|s| {
+        for _ in 0..walk::PREFETCH_THREADS {
+            s.spawn(|| walker.prefetch_worker());
+        }
+        walker.sync_directory(&peers, "");
+        walker.prefetch.stop();
+    });
     queue.close_and_wait(workers);
 
     finish("sync complete")

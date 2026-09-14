@@ -87,7 +87,30 @@ listing error for that subtree. A later transfer failure is a transfer failure.
 During multi-tree traversal, directory listings for all reachable peers at each
 directory level must be issued concurrently, not sequentially. The
 implementation starts listing operations for every reachable peer at that
-directory level before awaiting any listing result.
+directory level before awaiting any listing result. A peer's listing and the
+read of that directory's manifest are likewise issued together.
+
+Listings are also fetched ahead of the walk. A small pool of listing threads
+(8) works through the directories the walk has not reached yet, in the walk's
+own order, and keeps a bounded number of finished listings (64) ready for it.
+As soon as a listing lands, the subdirectories it shows are queued too, on the
+peers that list them, so even a deep chain of single subdirectories is fetched
+ahead. A listing is mostly waiting on round trips, so overlapping them hides
+latency: on a tree of many small directories over SFTP this made the walk
+about ten times faster. Listing and manifest reading are read-only, so running
+them ahead of the walk's decisions is safe; the walk uses a ready listing only
+if it was taken on exactly the peers the walk wants for that directory, and
+lists the directory itself otherwise (a directory the walk created on a peer,
+or a peer it dropped after a failure). Anything fetched for a directory the
+walk has passed is discarded. The order in which entries are decided and acted
+on, and the order of the progress lines, are unchanged: only listing and
+manifest reading run ahead, never decisions, copies, or displacements.
+
+An `sftp://` peer is served over several SFTP channels (4) on its one SSH
+connection, because OpenSSH answers each channel from its own single-threaded
+`sftp-server` process, so requests on one channel wait for each other. Each
+operation picks a channel and completes on it; a file handle stays on the
+channel that opened it. Extra channels the server refuses are simply not used.
 
 ## Copy Queue Tries
 

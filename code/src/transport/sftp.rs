@@ -32,6 +32,7 @@ use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::extensions::HardlinkExtension;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, Packet, StatusCode};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -43,6 +44,8 @@ const POSIX_RENAME: &str = "posix-rename@openssh.com";
 /// Bytes per READ/WRITE request unless the server advertises other limits via
 /// `limits@openssh.com`. 32 KiB is accepted by every known server.
 const DEFAULT_CHUNK: usize = 32 * 1024;
+/// SFTP channels opened per peer connection (see `SftpTransport::sessions`).
+const SFTP_CHANNELS: usize = 4;
 
 /// How many READ/WRITE requests one transport call keeps in flight at once.
 /// The engine copies in 1 MiB buffers, so a call is split into chunks and the
@@ -151,7 +154,14 @@ impl client::Handler for HostKeyCheck {
 pub struct SftpTransport {
     /// Shared with the streaming handles, which may outlive a transport call
     /// and need to close their server-side handle on drop.
-    session: Arc<RawSftpSession>,
+    /// A few SFTP channels over the one SSH connection. OpenSSH serves each
+    /// channel from its own single-threaded `sftp-server` process, so requests
+    /// on one channel wait for each other; spreading them over several lets
+    /// concurrent listings and copies overlap. Every operation picks one
+    /// channel and stays on it for its whole exchange (a handle belongs to the
+    /// channel that opened it).
+    sessions: Vec<Arc<RawSftpSession>>,
+    next_session: AtomicUsize,
     /// Largest READ and WRITE payloads the server accepts.
     read_len: usize,
     write_len: usize,
@@ -315,8 +325,17 @@ pub fn connect_with_known_hosts(
             Err(e) => return Err(map_err(e)),
         }
 
+        let mut sessions = vec![Arc::new(session)];
+        for _ in 1..SFTP_CHANNELS {
+            match open_sftp(&ssh).await {
+                Ok((extra, _, _)) => sessions.push(Arc::new(extra)),
+                // A server that limits channels still works, just with less overlap.
+                Err(_) => break,
+            }
+        }
         Ok(SftpTransport {
-            session: Arc::new(session),
+            sessions,
+            next_session: AtomicUsize::new(0),
             read_len,
             write_len,
             root,
@@ -739,16 +758,22 @@ impl Drop for SftpWriteHandle {
 // ---------------------------------------------------------------------------
 
 impl SftpTransport {
+    /// The channel for one operation, chosen round-robin.
+    fn session(&self) -> Arc<RawSftpSession> {
+        let i = self.next_session.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        Arc::clone(&self.sessions[i])
+    }
     /// Send `posix-rename@openssh.com`. `Ok(false)` means the server does not
     /// implement the extension, so the caller may try the standard rename.
     async fn posix_rename(&self, src: &str, dst: &str) -> Result<bool> {
+        let session = self.session();
         let payload: Vec<u8> = HardlinkExtension {
             oldpath: src.to_string(),
             newpath: dst.to_string(),
         }
         .try_into()
         .map_err(|e| TransportError::io(format!("cannot encode rename request: {e}")))?;
-        match self.session.extended(POSIX_RENAME, payload).await {
+        match session.extended(POSIX_RENAME, payload).await {
             Ok(Packet::Status(s)) if s.status_code == StatusCode::Ok => Ok(true),
             Ok(Packet::Status(s)) if s.status_code == StatusCode::OpUnsupported => Ok(false),
             Ok(Packet::Status(s)) => Err(map_err(SftpError::Status(s))),
@@ -761,10 +786,10 @@ impl SftpTransport {
 
 impl Transport for SftpTransport {
     fn list_dir(&self, path: &str) -> Result<Vec<Entry>> {
+        let session = self.session();
         let dir = self.remote(path);
         runtime().block_on(async {
-            let handle = self
-                .session
+            let handle = session
                 .opendir(dir.clone())
                 .await
                 .map_err(map_err)?
@@ -772,7 +797,7 @@ impl Transport for SftpTransport {
             let mut out = Vec::new();
             let mut failure = None;
             loop {
-                let batch = match self.session.readdir(handle.as_str()).await {
+                let batch = match session.readdir(handle.as_str()).await {
                     Ok(name) => name.files,
                     Err(e) if is_status(&e, StatusCode::Eof) => break,
                     Err(e) => {
@@ -791,7 +816,7 @@ impl Transport for SftpTransport {
                     // reported as a file.
                     let attrs = if file.attrs.permissions.is_none() {
                         let child = format!("{}/{}", dir.trim_end_matches('/'), name);
-                        match self.session.lstat(child).await {
+                        match session.lstat(child).await {
                             Ok(reply) => reply.attrs,
                             Err(_) => continue,
                         }
@@ -803,7 +828,7 @@ impl Transport for SftpTransport {
                     }
                 }
             }
-            let _ = self.session.close(handle).await;
+            let _ = session.close(handle).await;
             match failure {
                 Some(e) => Err(e),
                 None => Ok(out),
@@ -812,10 +837,11 @@ impl Transport for SftpTransport {
     }
 
     fn stat(&self, path: &str) -> Result<Entry> {
+        let session = self.session();
         let full = self.remote(path);
         runtime().block_on(async {
             // lstat, so a symlink is seen as a symlink and reported missing.
-            let reply = self.session.lstat(full.clone()).await.map_err(map_err)?;
+            let reply = session.lstat(full.clone()).await.map_err(map_err)?;
             entry_from_attrs(base_name(&full), &reply.attrs).ok_or_else(|| {
                 TransportError::not_found(format!("not a regular file or directory: {path}"))
             })
@@ -823,16 +849,17 @@ impl Transport for SftpTransport {
     }
 
     fn open_read(&self, path: &str) -> Result<Box<dyn ReadHandle>> {
+        let session = self.session();
         let full = self.remote(path);
         let handle = runtime()
             .block_on(
-                self.session
+                session
                     .open(full, OpenFlags::READ, FileAttributes::default()),
             )
             .map_err(map_err)?
             .handle;
         Ok(Box::new(SftpReadHandle {
-            session: Arc::clone(&self.session),
+            session: Arc::clone(&session),
             handle: Some(handle),
             offset: 0,
             chunk: self.read_len,
@@ -841,23 +868,23 @@ impl Transport for SftpTransport {
     }
 
     fn open_write(&self, path: &str) -> Result<Box<dyn WriteHandle>> {
+        let session = self.session();
         let full = self.remote(path);
         runtime().block_on(async {
             if let Some(parent) = full.rsplit_once('/').map(|(p, _)| p) {
                 if !parent.is_empty() {
-                    mkdir_p(&self.session, parent).await?;
+                    mkdir_p(&session, parent).await?;
                 }
             }
             // Write-only, create-if-missing, truncate-if-present.
             let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
-            let handle = self
-                .session
+            let handle = session
                 .open(full, flags, FileAttributes::default())
                 .await
                 .map_err(map_err)?
                 .handle;
             Ok(Box::new(SftpWriteHandle {
-                session: Arc::clone(&self.session),
+                session: Arc::clone(&session),
                 handle: Some(handle),
                 offset: 0,
                 chunk: self.write_len,
@@ -866,6 +893,7 @@ impl Transport for SftpTransport {
     }
 
     fn rename(&self, src: &str, dst: &str) -> Result<()> {
+        let session = self.session();
         let src_full = self.remote(src);
         let dst_full = self.remote(dst);
         runtime().block_on(async {
@@ -873,7 +901,7 @@ impl Transport for SftpTransport {
             // ourselves: the engine relies on rename never clobbering data
             // (specs/sync.md, "Rename Compatibility"). posix-rename below
             // would overwrite, which is why this check must come first.
-            if self.session.lstat(dst_full.clone()).await.is_ok() {
+            if session.lstat(dst_full.clone()).await.is_ok() {
                 return Err(TransportError::io(format!("destination exists: {dst}")));
             }
             // Prefer posix-rename: some servers fail the standard rename
@@ -882,7 +910,7 @@ impl Transport for SftpTransport {
             if self.posix_rename(&src_full, &dst_full).await? {
                 return Ok(());
             }
-            self.session
+            session
                 .rename(src_full, dst_full)
                 .await
                 .map(|_| ())
@@ -891,27 +919,31 @@ impl Transport for SftpTransport {
     }
 
     fn delete_file(&self, path: &str) -> Result<()> {
+        let session = self.session();
         let full = self.remote(path);
         runtime()
-            .block_on(self.session.remove(full))
+            .block_on(session.remove(full))
             .map(|_| ())
             .map_err(map_err)
     }
 
     fn create_dir(&self, path: &str) -> Result<()> {
+        let session = self.session();
         let full = self.remote(path);
-        runtime().block_on(mkdir_p(&self.session, &full))
+        runtime().block_on(mkdir_p(&session, &full))
     }
 
     fn delete_dir(&self, path: &str) -> Result<()> {
+        let session = self.session();
         let full = self.remote(path);
         runtime()
-            .block_on(self.session.rmdir(full))
+            .block_on(session.rmdir(full))
             .map(|_| ())
             .map_err(map_err)
     }
 
     fn set_mod_time(&self, path: &str, time: SystemTime) -> Result<()> {
+        let session = self.session();
         let full = self.remote(path);
         let secs = to_epoch_secs(time);
         // SFTP v3 carries access and modification time in one flag, and many
@@ -922,7 +954,7 @@ impl Transport for SftpTransport {
             ..FileAttributes::default()
         };
         runtime()
-            .block_on(self.session.setstat(full, attrs))
+            .block_on(session.setstat(full, attrs))
             .map(|_| ())
             .map_err(map_err)
     }
@@ -932,7 +964,9 @@ impl Drop for SftpTransport {
     fn drop(&mut self) {
         // Best effort: tell the server we are done before the SSH handle goes.
         // `close_session` is synchronous, so it is safe from any thread.
-        let _ = self.session.close_session();
+        for session in &self.sessions {
+            let _ = session.close_session();
+        }
     }
 }
 
