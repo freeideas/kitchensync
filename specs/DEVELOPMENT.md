@@ -59,7 +59,7 @@ cargo build --release --manifest-path code/Cargo.toml
 
 The `CARGO_HOME` line keeps downloaded crates under `./tools/` too, instead of the user's home directory. `code/build.py` runs these steps and copies the result to `./released/` under the right name.
 
-On Windows the SSH library's crypto backend (`aws-lc-sys`, pulled in by `russh`) compiles assembly and needs NASM, plus the MSVC linker from Visual Studio Build Tools. Unzip a NASM release (https://www.nasm.us/pub/nasm/releasebuilds/) so that `./tools/nasm/nasm.exe` exists; `code/build.py` puts that directory on `PATH` for the build. The Rust toolchain itself is the standalone installer from https://static.rust-lang.org/dist/ (the `x86_64-pc-windows-msvc` tarball), installed with `install.sh --prefix=./tools/rust`.
+On Windows the SSH library's crypto backend (`aws-lc-sys`, pulled in by `russh`) compiles assembly and needs NASM, plus the MSVC linker from Visual Studio Build Tools. Unzip a NASM release (https://www.nasm.us/pub/nasm/releasebuilds/) so that `./tools/nasm/nasm.exe` exists; `code/build.py` puts that directory on `PATH` for the build. The Rust toolchain itself is the standalone installer from https://static.rust-lang.org/dist/ (the `x86_64-pc-windows-msvc` tarball), installed with `install.sh --prefix=./tools/rust`. On Windows that script (run through Git's `bash.exe`) crawls and can stall after the docs component; the reliable way is to unpack the tarball with the built-in `tar.exe` and `robocopy` the `rustc`, `rust-std-*`, `cargo`, `rustfmt-preview` and `clippy-preview` component folders into `./tools/rust` (each component's contents merge into the same `bin/`, `lib/` tree; skip `manifest.in`).
 
 ## Tests
 
