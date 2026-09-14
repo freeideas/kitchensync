@@ -26,6 +26,17 @@ impl Verbosity {
 
 static LEVEL: Mutex<Verbosity> = Mutex::new(Verbosity::Info);
 static OUT: Mutex<()> = Mutex::new(());
+/// When the last line was printed, for the "still scanning" heartbeat.
+static LAST_LINE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Seconds of silence after which the walk announces where it is.
+pub const QUIET_SECS: u64 = 30;
+
+/// True when nothing has been printed for `QUIET_SECS`; the caller then
+/// prints an `S <relpath>` line, which resets the clock.
+pub fn quiet_for_a_while() -> bool {
+    LAST_LINE.lock().unwrap().is_some_and(|t| t.elapsed().as_secs() >= QUIET_SECS)
+}
 
 pub fn set_level(v: Verbosity) {
     *LEVEL.lock().unwrap() = v;
@@ -42,6 +53,7 @@ pub fn line(s: &str) {
     let _ = o.write_all(s.as_bytes());
     let _ = o.write_all(b"\n");
     let _ = o.flush();
+    *LAST_LINE.lock().unwrap() = Some(std::time::Instant::now());
 }
 
 /// Print raw text without adding a newline.

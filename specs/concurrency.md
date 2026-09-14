@@ -147,6 +147,11 @@ and a `-` subordinate peer, so it does not change with the peer's role.
   letter.
 - `R<peer> <relpath>` - the path is being restored from BAK/ on that peer
   during a rollback (see sync.md, "Rollback"). One line per path.
+- `S <relpath>` - the walk is still scanning and has had nothing else to say
+  for 30 seconds; `<relpath>` is the directory whose listing is starting at
+  that moment (`.` for the sync root). It exists so a long quiet walk of an
+  unchanged tree does not look hung. It is printed at most once per 30 seconds
+  of silence, and never when other lines are flowing.
 
 A type conflict prints an `X` line for the directory being displaced followed
 by the `C` line for the file replacing it.

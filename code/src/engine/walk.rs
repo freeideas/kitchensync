@@ -107,6 +107,10 @@ impl Walker {
     /// Sync one directory level across `peers`, then recurse. Returns whether
     /// any entry remains live in the directory after this run's decisions.
     pub fn sync_directory(&self, peers: &[PeerRef], dir: &str) -> bool {
+        // A long silence worries the person watching: say where the walk is.
+        if output::quiet_for_a_while() {
+            output::info(&format!("S {}", if dir.is_empty() { "." } else { dir }));
+        }
         // Phase 0/1: recover and list all peers in parallel.
         let listings: Vec<Option<Listed>> = std::thread::scope(|s| {
             let handles: Vec<_> = peers.iter().map(|p| s.spawn(move || self.list_peer(p, dir))).collect();
