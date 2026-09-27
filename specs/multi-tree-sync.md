@@ -287,7 +287,12 @@ itself (never the directory's own mod_time):
     deletion, use the most recent estimate among them.
   - Inside the directory, file rules 4 and 4b remove every entry that is
     older than that deletion estimate, while anything newer survives and
-    propagates by the normal file rules. A directory that was deleted on one
+    propagates by the normal file rules.
+    The deleting peer has no manifest inside the directory (its manifests
+    left with the directory), so its vote is carried down: every entry it
+    lacks inside, at any depth, is treated as tombstoned on that peer with
+    the deletion estimate. Without this, a directory renamed on one peer
+    would be copied back to it under the old name. A directory that was deleted on one
     peer and left untouched on another therefore empties out, and a
     directory that was deleted on one peer while new content arrived on
     another keeps just the new content.

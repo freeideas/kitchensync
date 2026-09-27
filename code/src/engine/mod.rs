@@ -109,7 +109,7 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         for _ in 0..walk::PREFETCH_THREADS {
             s.spawn(|| walker.prefetch_worker());
         }
-        walker.sync_directory(&peers, "");
+        walker.sync_directory(&peers, "", &Default::default());
         walker.prefetch.stop();
     });
     queue.close_and_wait(workers);
@@ -168,7 +168,7 @@ fn connect_peer(cfg: &Config, spec: &PeerSpec, create: bool) -> Option<(String, 
             .map(|t| Arc::new(t) as Arc<dyn Transport>),
         };
         match result {
-            Ok(t) => return Some((url.normalized.clone(), t)),
+            Ok(t) => return Some((url.normalized.clone(), Arc::new(crate::transport::normalize::Normalizing::new(t)))),
             Err(e) => output::error(&format!("peer unreachable: {}: {}", url.normalized, e)),
         }
     }

@@ -3,6 +3,7 @@
 //! See specs/sync.md, section "Peer Transports".
 
 pub mod local;
+pub mod normalize;
 pub mod sftp;
 
 use std::fmt;

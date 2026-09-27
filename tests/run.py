@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-14 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-16 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -186,7 +186,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-14)
+# Scenarios (specs/SCENARIOS.md S-01..S-16)
 # --------------------------------------------------------------------------
 
 
@@ -580,6 +580,48 @@ def s14(tmp: Path) -> None:
     expect(not (peer_b / "sub").exists(), f"{peer_b / 'sub'} should not exist")
 
 
+def s15(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    write_file(peer_a / "old" / "movie.txt", b"movie\n", "2024-01-01_10-00-00_000000Z")
+    write_file(peer_a / "old" / "thumbs" / "1.txt", b"thumb\n", "2024-01-01_10-00-00_000000Z")
+    peer_b.mkdir(parents=True, exist_ok=True)
+
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+
+    (peer_b / "old").rename(peer_b / "new")
+
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+
+    want = {"new/movie.txt": b"movie\n", "new/thumbs/1.txt": b"thumb\n"}
+    for peer in (peer_a, peer_b):
+        got = tree(peer)
+        expect(got == want, f"user files under {peer} mismatch: {sorted(got)}")
+        expect(not (peer / "old").exists(), f"{peer / 'old'} should not exist")
+
+
+def s16(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    nfc = "caf\u00e9.txt"
+    nfd = "cafe\u0301.txt"
+    write_file(peer_a / nfc, b"same\n", "2024-01-01_10-00-00_000000Z")
+    write_file(peer_b / nfd, b"same\n", "2024-01-01_10-00-00_000000Z")
+    if len(os.listdir(peer_b)) != 1 or os.listdir(peer_b)[0] != nfd:
+        return  # this filesystem normalizes names itself; nothing to test
+
+    first = b"first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\n"
+    for expected in (first + b"sync complete\n", b"sync complete\n"):
+        result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+        assert_result(result, expected)
+        for peer, name in ((peer_a, nfc), (peer_b, nfd)):
+            got = tree(peer)
+            expect(got == {name: b"same\n"}, f"user files under {peer} mismatch: {[ascii(n) for n in got]}")
+            expect(not merged_bak_files(peer), f"unexpected BAK files under {peer}: {[ascii(n) for n in merged_bak_files(peer)]}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -595,6 +637,8 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-12", "Root Choice Does Not Matter", s12),
     ("S-13", "Undo Reverts A First-Sync Merge", s13),
     ("S-14", "Exclude Patterns, Ignore Files, And Negation", s14),
+    ("S-15", "Folder Renamed On One Peer Is Not Copied Back", s15),
+    ("S-16", "Names In Different Unicode Forms Are The Same File", s16),
 ]
 
 

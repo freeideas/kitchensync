@@ -266,6 +266,31 @@ not exist. (`.DS_Store` is excluded by the built-ins but re-included by the
 `other.tmp` by that file's own negation; `sub/` is a directory-only pattern
 from the command line.)
 
+## S-15: Folder Renamed On One Peer Is Not Copied Back
+
+Setup:
+
+- `A/old/movie.txt` exists with bytes `movie\n` and `A/old/thumbs/1.txt` with bytes `thumb\n`, both with modification time `2024-01-01_10-00-00_000000Z`.
+- `B/` exists and has no user files.
+- First run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
+- Rename `B/old` to `B/new`.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. The user files under both `A/` and `B/` are exactly `new/movie.txt` with bytes `movie\n` and `new/thumbs/1.txt` with bytes `thumb\n`. Neither `A/old` nor `B/old` exists. (B's deletion of `old` carries into the folder: everything inside is older than the deletion, so it is removed from A rather than copied back to B.)
+
+## S-16: Names In Different Unicode Forms Are The Same File
+
+Setup:
+
+- `A/café.txt` exists with the name in composed form (NFC: `é` is the single character U+00E9), bytes `same\n`, and modification time `2024-01-01_10-00-00_000000Z`.
+- `B/café.txt` exists with the name in decomposed form (NFD: `e` followed by the combining accent U+0301), the same bytes, and the same modification time. (macOS reports names this way.)
+- Neither peer has `.kitchensync/manifest.txt`.
+
+Action: run `released/kitchensync.exe --verbosity error A B` twice.
+
+Outcome: both runs exit 0 with empty stderr. The first run's stdout is the first-sync line (see sync.md, "Startup") followed by `sync complete\n`; the second run's stdout is exactly `sync complete\n`. After each run the user files under `A/` are exactly the composed `café.txt` and under `B/` exactly the decomposed `café.txt`, each with bytes `same\n`. Neither peer has anything under `.kitchensync/BAK/` except archived manifests.
+
 # Properties
 
 ## P-01: Output Channels

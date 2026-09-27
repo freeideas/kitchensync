@@ -49,7 +49,7 @@ fn parse_ts(s: &str) -> Option<Option<i64>> {
 
 /// Parse manifest text. Unparsable lines are ignored.
 pub fn parse(text: &str) -> BTreeMap<String, Line> {
-    let mut map = BTreeMap::new();
+    let mut map: BTreeMap<String, Line> = BTreeMap::new();
     for raw in text.lines() {
         let f: Vec<&str> = raw.split('\t').collect();
         if f.len() < 6 {
@@ -66,7 +66,18 @@ pub fn parse(text: &str) -> BTreeMap<String, Line> {
             continue;
         };
         let placed = f.get(6).and_then(|v| parse_ts(v)).unwrap_or(None);
-        map.insert(dec(f[0]), Line { is_dir, mod_time, byte_size, last_seen, deleted_time, placed });
+        let line = Line { is_dir, mod_time, byte_size, last_seen, deleted_time, placed };
+        // Names are compared in NFC (see transport/normalize.rs). A manifest
+        // written from a Mac holds decomposed names; one that has been through
+        // both kinds of system may hold both forms of a name. Keep the live
+        // line over a tombstone, then the one seen most recently.
+        let name = crate::transport::normalize::nfc(&dec(f[0]));
+        match map.get(&name) {
+            Some(old) if (old.deleted_time.is_none(), old.last_seen) >= (line.deleted_time.is_none(), line.last_seen) => {}
+            _ => {
+                map.insert(name, line);
+            }
+        }
     }
     map
 }
@@ -111,5 +122,18 @@ mod tests {
         assert!(text.starts_with("a%09b.txt\tf\t"));
         // Expired tombstone dropped.
         assert_eq!(parse(&serialize(&m, 4_000_000)).len(), 1);
+    }
+
+    #[test]
+    fn names_are_nfc() {
+        let nfd = "cafe\u{301}.txt";
+        let nfc = "caf\u{e9}.txt";
+        let text = format!(
+            "{nfd}\tf\t2024-01-01_10-00-00_000000Z\t5\t2024-01-02_10-00-00_000000Z\t-\t-\n\
+             {nfc}\tf\t2024-01-01_10-00-00_000000Z\t5\t2024-01-01_10-00-00_000000Z\t2024-01-01_10-00-00_000000Z\t-\n"
+        );
+        let m = parse(&text);
+        assert_eq!(m.len(), 1);
+        assert!(m[nfc].deleted_time.is_none());
     }
 }

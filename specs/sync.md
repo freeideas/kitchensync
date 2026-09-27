@@ -525,6 +525,10 @@ host or external account.
 - **`set_mod_time` failure** (after a completed copy - file is already in place) -> log at error level; the copy is not undone. The destination peer's manifest line already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
 - **Manifest write failure** -> log error at error level and leave whatever manifest the peer already had; the next normal run repairs an interrupted replacement before listing that directory (see manifest.md). Counts toward the failure count in the completion line
 
+## Unicode Normalization
+
+The same visible name can be stored as different bytes. macOS reports an accented letter such as `é` decomposed (NFD: `e` followed by a combining accent), while Linux and Windows usually keep it composed (NFC: one character). KitchenSync compares names after converting them to NFC, so the two forms are one entry, not a file on one peer and a different file on the other. Manifest names are read and written in NFC; a manifest line in another form counts as the NFC name (when two lines collapse to one, the live line is kept over a tombstone, then the one with the later `last_seen`). Nothing is renamed on disk: an entry keeps the form its filesystem stores, and a new entry is created with its NFC name. If one directory holds two entries whose names differ only in Unicode form (possible only on a filesystem that compares bytes), the NFC one is synced, the other is left alone, and an error line names it.
+
 ## Case Sensitivity
 
 Filenames are preserved exactly as the filesystem reports them. Syncing between case-sensitive (Linux) and case-insensitive (Windows/macOS) filesystems may collapse or duplicate files that differ only in case. Deleted files are recoverable from BAK/.

@@ -1,7 +1,7 @@
 //! The combined-tree walk: list, decide, act, recurse.
 //! See specs/multi-tree-sync.md.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::config::Config;
@@ -300,7 +300,10 @@ impl Walker {
         }
     }
 
-    pub fn sync_directory(&self, peers: &[PeerRef], dir: &str) -> bool {
+    /// `inherited` maps a peer index to the deletion estimate that peer voted
+    /// for this directory in its parent (see `PendingDir::deleted`). Inside,
+    /// that vote stands in for the manifest lines the peer no longer has.
+    pub fn sync_directory(&self, peers: &[PeerRef], dir: &str, inherited: &HashMap<usize, i64>) -> bool {
         Self::heartbeat(dir);
         // Phase 0/1: the listings, fetched ahead where the prefetch got to
         // them first (see `Prefetch`).
@@ -345,10 +348,19 @@ impl Walker {
             let rel = join(dir, &name);
             let views: Vec<View> = active
                 .iter()
-                .map(|l| View {
-                    state: Arc::clone(&l.state),
-                    live: l.entries.iter().find(|e| e.name == name).cloned(),
-                    line: if l.state.peer.contributes() { l.state.get(&name) } else { None },
+                .map(|l| {
+                    let live = l.entries.iter().find(|e| e.name == name).cloned();
+                    let line = if !l.state.peer.contributes() {
+                        None
+                    } else {
+                        l.state.get(&name).or_else(|| {
+                            // The peer deleted the directory this entry sits in:
+                            // it votes to delete the entry as of that deletion.
+                            let est = *inherited.get(&l.state.peer.index)?;
+                            live.is_none().then_some(Line { is_dir: false, mod_time: 0, byte_size: -1, last_seen: Some(est), deleted_time: Some(est), placed: None })
+                        })
+                    };
+                    View { state: Arc::clone(&l.state), live, line }
                 })
                 .collect();
             match self.decide(&views) {
@@ -502,12 +514,17 @@ impl Walker {
         if recurse.is_empty() {
             return None;
         }
-        Some(PendingDir { views, rel, name, conflict, recurse })
+        let deleted = views
+            .iter()
+            .filter(|v| v.live.is_none())
+            .filter_map(|v| v.line.as_ref().and_then(|l| l.deleted_time.or(l.last_seen)).map(|est| (v.peer().index, est)))
+            .collect();
+        Some(PendingDir { views, rel, name, conflict, recurse, deleted })
     }
 
     /// Returns whether the directory still exists after this run.
     fn recurse_directory(&self, p: &PendingDir) -> bool {
-        let kept = self.sync_directory(&p.recurse, &p.rel);
+        let kept = self.sync_directory(&p.recurse, &p.rel, &p.deleted);
         if p.conflict && !kept {
             // Everything inside was older than the deletion: the directory goes too.
             let mut tags = String::new();
@@ -583,6 +600,12 @@ struct PendingDir {
     name: String,
     conflict: bool,
     recurse: Vec<PeerRef>,
+    /// Peers that voted to delete this directory, with their deletion
+    /// estimates. The directory is created on them for this run so the walk
+    /// can decide its contents, but it holds no manifest there, so without
+    /// these votes everything inside would look new to them and be copied
+    /// back (a folder renamed on one peer would reappear under its old name).
+    deleted: HashMap<usize, i64>,
 }
 
 enum Decision {
