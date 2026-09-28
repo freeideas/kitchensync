@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-16 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-17 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -186,7 +186,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-16)
+# Scenarios (specs/SCENARIOS.md S-01..S-17)
 # --------------------------------------------------------------------------
 
 
@@ -622,6 +622,27 @@ def s16(tmp: Path) -> None:
             expect(not merged_bak_files(peer), f"unexpected BAK files under {peer}: {[ascii(n) for n in merged_bak_files(peer)]}")
 
 
+def s17(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    when = "2024-01-01_10-00-00_000000Z"
+    write_file(peer_a / "keep.txt", b"keep\n", when)
+    write_file(peer_a / "movie.bin", b"0123456789\n", when)
+    write_file(peer_b / "keep.txt", b"keep\n", when)
+
+    setup = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), "-x", "movie.bin"], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+    write_file(peer_b / ".kitchensync" / "SWAP" / "movie.bin" / "new", b"01234")
+
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b):
+        check_file_bytes(peer / "movie.bin", b"0123456789\n")
+        check_mtime(peer / "movie.bin", when)
+    swap = peer_b / ".kitchensync" / "SWAP"
+    expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -639,6 +660,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-14", "Exclude Patterns, Ignore Files, And Negation", s14),
     ("S-15", "Folder Renamed On One Peer Is Not Copied Back", s15),
     ("S-16", "Names In Different Unicode Forms Are The Same File", s16),
+    ("S-17", "An Interrupted Copy Is Not Put In Place", s17),
 ]
 
 

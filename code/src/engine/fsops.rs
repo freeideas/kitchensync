@@ -75,7 +75,10 @@ pub fn recover_one_swap(t: &dyn Transport, parent: &str, basename: &str) -> Resu
             remove_tree(t, &new)?;
         }
         (false, true, false) => {
-            t.rename(&new, &target)?;
+            // Without `old` there is no sign the transfer into `new` finished:
+            // it may be cut short. Putting it in place would make a partial
+            // file the newest copy. Drop it; the next decision copies again.
+            remove_tree(t, &new)?;
         }
         (false, false, _) => {}
     }

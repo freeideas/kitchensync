@@ -291,6 +291,19 @@ Action: run `released/kitchensync.exe --verbosity error A B` twice.
 
 Outcome: both runs exit 0 with empty stderr. The first run's stdout is the first-sync line (see sync.md, "Startup") followed by `sync complete\n`; the second run's stdout is exactly `sync complete\n`. After each run the user files under `A/` are exactly the composed `café.txt` and under `B/` exactly the decomposed `café.txt`, each with bytes `same\n`. Neither peer has anything under `.kitchensync/BAK/` except archived manifests.
 
+## S-17: An Interrupted Copy Is Not Put In Place
+
+Setup:
+
+- `A/keep.txt` exists with bytes `keep\n` and `A/movie.bin` with bytes `0123456789\n`, both with modification time `2024-01-01_10-00-00_000000Z`.
+- `B/keep.txt` exists with bytes `keep\n` and the same modification time. `B/` has no `movie.bin`.
+- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have manifests and B has never had `movie.bin`.
+- Simulate a copy of `movie.bin` to B that was cut short: create `B/.kitchensync/SWAP/movie.bin/new` with bytes `01234` and the current time as its modification time.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `0123456789\n` with modification time `2024-01-01_10-00-00_000000Z`. `B/.kitchensync/SWAP` is absent or empty.
+
 # Properties
 
 ## P-01: Output Channels

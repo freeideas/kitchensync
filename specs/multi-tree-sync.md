@@ -166,8 +166,14 @@ For target `<basename>`:
   target and remove the empty SWAP directory.
 - `old` is missing, `new` exists, and target exists: delete `new` and remove
   the empty SWAP directory.
-- `old` is missing, `new` exists, and target is missing: rename `new` to target
-  and remove the empty SWAP directory.
+- `old` is missing, `new` exists, and target is missing: delete `new` and
+  remove the empty SWAP directory. Nothing shows that the transfer into `new`
+  finished (a copy moves the existing target to `old` only after the transfer
+  completes, so a copy to a peer that lacked the file never creates `old`).
+  Promoting it could put a partial file in place, and its recent mod_time
+  would make it win over the complete copies elsewhere. The entry is absent
+  on this peer without a confirmed `last_seen`, so the normal rules copy it
+  again.
 
 If recovery for a swap directory fails, treat that peer's listing for the
 current directory as failed. The peer is excluded from this directory subtree
