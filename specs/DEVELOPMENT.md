@@ -43,7 +43,7 @@ The build writes one executable per platform into `./released/`, named so all th
 | macOS    | `released/kitchensync.mac`                                                                            |
 | Linux    | `released/kitchensync.linux` (a normal ELF executable, the format every mainstream distribution runs) |
 
-The macOS file is a plain single-file executable that happens to end in `.app`; it is not an application bundle folder, so run it from a shell rather than double-clicking it in Finder. There is no cross-compiling: each file is built on its own platform with that machine's `./tools/` toolchain, and a machine only rebuilds the file for its own platform. Whichever files exist are committed so that a clone from GitHub includes ready-to-run binaries without needing the toolchain.
+The macOS file is a plain single-file executable that happens to end in `.app`; it is not an application bundle folder, so run it from a shell rather than double-clicking it in Finder. A Mac builds all three (see "Building all three binaries on a Mac" below); a Linux or Windows machine builds only its own. Whichever files exist are committed so that a clone from GitHub includes ready-to-run binaries without needing the toolchain.
 
 Keep them small: build in release mode with symbols stripped (the `[profile.release]` section in `Cargo.toml` does this) and avoid dependencies that bloat the executable. GitHub warns above 50 MB and refuses above 100 MB; the target is a few MB each.
 
@@ -60,6 +60,25 @@ cargo build --release --manifest-path code/Cargo.toml
 The `CARGO_HOME` line keeps downloaded crates under `./tools/` too, instead of the user's home directory. `code/build.py` runs these steps and copies the result to `./released/` under the right name.
 
 On Windows the SSH library's crypto backend (`aws-lc-sys`, pulled in by `russh`) compiles assembly and needs NASM, plus the MSVC linker from Visual Studio Build Tools. Unzip a NASM release (https://www.nasm.us/pub/nasm/releasebuilds/) so that `./tools/nasm/nasm.exe` exists; `code/build.py` puts that directory on `PATH` for the build. The Rust toolchain itself is the standalone installer from https://static.rust-lang.org/dist/ (the `x86_64-pc-windows-msvc` tarball), installed with `install.sh --prefix=./tools/rust`. On Windows that script (run through Git's `bash.exe`) crawls and can stall after the docs component; the reliable way is to unpack the tarball with the built-in `tar.exe` and `robocopy` the `rustc`, `rust-std-*`, `cargo`, `rustfmt-preview` and `clippy-preview` component folders into `./tools/rust` (each component's contents merge into the same `bin/`, `lib/` tree; skip `manifest.in`).
+
+## Building all three binaries on a Mac
+
+A Mac can cross-compile (build a program for a different operating system and processor than the one doing the building) the Linux and Windows binaries at full native speed, with no virtual machine. Zig serves as the C compiler and linker for those targets, because it ships the Linux and Windows C libraries itself, and `cargo-zigbuild` makes cargo use it. Linux and Windows cannot build the macOS binary, since that needs Apple's SDK.
+
+One-time setup, after the Rust toolchain is in `./tools/rust/`:
+
+```
+uv run code/setup-cross-tools.py
+```
+
+It adds the Rust standard library for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu` (matching the installed rustc version), Zig under `./tools/zig/`, and `cargo-zigbuild` under `./tools/bin/`. It skips anything already present, so rerun it after upgrading Rust. Tool versions are pinned at the top of the script.
+
+After that, `uv run code/build.py` on a Mac builds and releases all three binaries in about a minute; `--native` builds only the macOS one. Things worth knowing:
+
+- The Windows binary uses the `x86_64-pc-windows-gnu` target rather than `-msvc`, so no Microsoft tools are needed. It depends only on DLLs built into Windows 10 and later.
+- `aws-lc-sys` (the SSH library's crypto) normally needs NASM for x86_64 Windows. The build sets `AWS_LC_SYS_PREBUILT_NASM=1` so it uses the pre-assembled objects shipped inside the crate instead.
+- The Linux binary links against glibc 2.30 or newer, which covers every mainstream distribution from about 2020 on (Ubuntu 20.04, Debian 11, RHEL 9).
+- `tests/run.py` runs only the current machine's binary, so the cross-built ones are not tested on the Mac. Run the tests on Linux and Windows (a real machine, or a Linux container and Windows 11 ARM virtual machine on the Mac) before relying on a release.
 
 ## Tests
 

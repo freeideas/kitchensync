@@ -3,16 +3,21 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Builds the KitchenSync release binary using the portable toolchain under
-./tools/ and copies it into ./released/ under the right platform name.
+"""Builds the KitchenSync release binaries using the portable toolchain under
+./tools/ and copies them into ./released/ under the right platform names.
 
-Run as: uv run code/build.py [--test]
+Run as: uv run code/build.py [--native] [--test]
+
+On macOS it builds all three binaries: the Mac one natively, and the Linux and
+Windows ones by cross-compiling with Zig (set that up once with
+`uv run code/setup-cross-tools.py`). With --native, or on Linux or Windows, it
+builds only the binary for the machine it runs on.
 
 See specs/DEVELOPMENT.md for the toolchain and released/ layout this script
 assumes.
 
 With --test, also runs the end-to-end test suite (tests/run.py) afterward and
-exits with its status.
+exits with its status. The tests exercise only this machine's own binary.
 """
 
 import os
@@ -42,8 +47,34 @@ def cargo_build_output_name() -> str:
     return "kitchensync.exe" if platform.system() == "Windows" else "kitchensync"
 
 
+# (Rust target, file cargo writes, name under released/) for each foreign
+# binary a Mac cross-compiles.
+CROSS_TARGETS = [
+    ("x86_64-unknown-linux-gnu", "kitchensync", "kitchensync.linux"),
+    ("x86_64-pc-windows-gnu", "kitchensync.exe", "kitchensync.exe"),
+]
+
+
+def release(built: Path, name: str) -> None:
+    if not built.is_file():
+        sys.exit(f"cargo build reported success but no output was found at {built}")
+    released_dir = REPO_ROOT / "released"
+    released_dir.mkdir(parents=True, exist_ok=True)
+    dest = released_dir / name
+    # Replace, never overwrite in place: macOS refuses to run a signed binary
+    # whose bytes changed underneath it, and a running copy keeps working.
+    if dest.exists():
+        dest.unlink()
+    shutil.copy2(built, dest)
+    if not name.endswith(".exe"):
+        dest.chmod(dest.stat().st_mode | 0o111)
+    size_bytes = dest.stat().st_size
+    print(f"{dest} ({size_bytes} bytes, {size_bytes / (1024 * 1024):.2f} MB)")
+
+
 def main(argv: list[str]) -> int:
     run_tests = "--test" in argv
+    cross = platform.system() == "Darwin" and "--native" not in argv
 
     tools_bin = REPO_ROOT / "tools" / "rust" / "bin"
     if not tools_bin.is_dir():
@@ -77,6 +108,17 @@ def main(argv: list[str]) -> int:
         env["PATH"] = f"{nasm_dir}{os.pathsep}{env['PATH']}"
     env["CARGO_HOME"] = str(cargo_home)
 
+    zigbuild = REPO_ROOT / "tools" / "bin" / "cargo-zigbuild"
+    zig_dir = REPO_ROOT / "tools" / "zig"
+    if cross and not (zigbuild.is_file() and (zig_dir / "zig").is_file()):
+        print(
+            "The cross-compiling tools are missing from ./tools/.\n"
+            "Run `uv run code/setup-cross-tools.py` once, or pass --native to "
+            "build only the macOS binary.",
+            file=sys.stderr,
+        )
+        return 1
+
     manifest = REPO_ROOT / "code" / "Cargo.toml"
     build = subprocess.run(
         [str(cargo_exe), "build", "--release", "--manifest-path", str(manifest)],
@@ -86,30 +128,25 @@ def main(argv: list[str]) -> int:
         print(f"cargo build failed with exit code {build.returncode}", file=sys.stderr)
         return build.returncode
 
-    built = REPO_ROOT / "code" / "target" / "release" / cargo_build_output_name()
-    if not built.is_file():
-        print(
-            f"cargo build reported success but no output was found at {built}",
-            file=sys.stderr,
-        )
-        return 1
+    release(REPO_ROOT / "code" / "target" / "release" / cargo_build_output_name(), released_binary_name())
 
-    released_dir = REPO_ROOT / "released"
-    released_dir.mkdir(parents=True, exist_ok=True)
-    dest = released_dir / released_binary_name()
-    # Replace, never overwrite in place: macOS refuses to run a signed binary
-    # whose bytes changed underneath it, and a running copy keeps working.
-    if dest.exists():
-        dest.unlink()
-    shutil.copy2(built, dest)
-
-    if platform.system() != "Windows":
-        mode = dest.stat().st_mode
-        dest.chmod(mode | 0o111)
-
-    size_bytes = dest.stat().st_size
-    size_mb = size_bytes / (1024 * 1024)
-    print(f"{dest} ({size_bytes} bytes, {size_mb:.2f} MB)")
+    if cross:
+        cross_env = env.copy()
+        cross_env["PATH"] = f"{zigbuild.parent}{os.pathsep}{zig_dir}{os.pathsep}{env['PATH']}"
+        # aws-lc-sys (russh's crypto) needs NASM for x86_64 Windows; this makes
+        # it use the pre-assembled objects it ships with instead.
+        cross_env["AWS_LC_SYS_PREBUILT_NASM"] = "1"
+        for target, output, name in CROSS_TARGETS:
+            build = subprocess.run(
+                [str(cargo_exe), "zigbuild", "--release", "--manifest-path", str(manifest),
+                 "--target", target],
+                env=cross_env,
+            )
+            if build.returncode != 0:
+                print(f"cargo zigbuild for {target} failed with exit code {build.returncode}",
+                      file=sys.stderr)
+                return build.returncode
+            release(REPO_ROOT / "code" / "target" / target / "release" / output, name)
 
     if run_tests:
         tests_script = REPO_ROOT / "tests" / "run.py"
