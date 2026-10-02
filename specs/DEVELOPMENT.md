@@ -16,7 +16,7 @@ General advice for anyone (person or agent) working on this project. The other f
 
 - `README.md` is the entry point: what KitchenSync is, how to run it, and the index of specs.
 - `specs/` is the source of truth for behavior. If code and a spec disagree, the spec wins until the spec is changed.
-- `extart/` holds supplied helper artifacts used by tests, such as the ephemeral SFTP server script.
+- `extart/` holds supplied helper artifacts used by tests, such as the ephemeral SFTP server script, and repair helpers such as `exfat-fix-nfd-names.py` (see sync.md, "Unicode Normalization").
 - `released/` holds the shipped binaries, one per platform (see below).
 - `code/` is the Rust program itself: `code/Cargo.toml`, `code/src/`, and Cargo's `code/target/` build output. Keeping it in one folder stops the compiler from scattering files across the repository root.
 - `tests/` holds the end-to-end scenario tests, run with `uv run tests/run.py`.
