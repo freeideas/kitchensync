@@ -677,6 +677,12 @@ impl ReadHandle for SftpReadHandle {
         }
         Ok(filled)
     }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        self.offset = offset;
+        self.eof = false;
+        Ok(())
+    }
 }
 
 impl Drop for SftpReadHandle {

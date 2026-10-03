@@ -17,7 +17,9 @@ file-copy operations.
 Copying is incremental. KitchenSync does not first scan the whole tree and then
 start a copy phase. As soon as traversal finds copy work in an early directory,
 that work may occupy available copy slots while later directories are still
-being scanned.
+being scanned. Copies of files of 1 MiB or more are the exception: they are held
+until the walk ends so that they can reuse a displaced file (see sync.md,
+"Reusing A Displaced File").
 
 There is no per-peer, per-host, or per-connection transfer limit in the user
 interface. Startup keeps the selected peer connection state as the reachable
@@ -165,6 +167,9 @@ and a `-` subordinate peer, so it does not change with the peer's role.
 - `<src>C<dsts> <relpath>` - the file is being copied from peer `<src>` to each
   peer in `<dsts>`, one digit per receiving peer. One line per path, regardless
   of how many peers receive it.
+- `M<peer> <relpath>` - instead of being copied to that peer, the file is
+  being moved into place from a file displaced on the same peer in this run
+  (see sync.md, "Reusing A Displaced File"). One line per receiving peer.
 - `X<peers> <relpath>` - the path is being deleted (displaced to BAK/) on each
   peer in `<peers>`. One line per path. Files and directories use the same
   letter.
@@ -175,6 +180,12 @@ and a `-` subordinate peer, so it does not change with the peer's role.
   that moment (`.` for the sync root). It exists so a long quiet walk of an
   unchanged tree does not look hung. It is printed at most once per 30 seconds
   of silence, and never when other lines are flowing.
+
+A held copy (a file of 1 MiB or more, see "Copy Concurrency") prints nothing
+when the walk decides it. When it starts after the walk, it prints
+`<src>C<dst> <relpath>` for a transfer or `M<dst> <relpath>` for a reuse, one
+line per receiving peer. In a dry run nothing is held: every copy prints its
+`C` line when it is decided.
 
 A type conflict prints an `X` line for the directory being displaced followed
 by the `C` line for the file replacing it.

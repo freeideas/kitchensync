@@ -28,6 +28,9 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
             },
         };
         let r = Rollback { cfg, peer: p, t: target };
+        // Pass 1 must finish first: pass 2 restores from BAK, and a reused
+        // file has to be back there before it can be restored.
+        r.return_reused("");
         r.dir("");
     }
     super::finish("rollback complete")
@@ -67,6 +70,46 @@ impl Rollback<'_> {
     fn fail(&self, what: &str, rel: &str, e: &dyn std::fmt::Display) {
         output::error(&format!("rollback: {} failed for {} on {}: {}", what, rel, self.peer.url, e));
         note_failure();
+    }
+
+    /// Pass 1: move every file placed after T by reusing a displaced file
+    /// back to the BAK path it came from (specs/manifest.md, "Rollback").
+    fn return_reused(&self, dir: &str) {
+        let t: &dyn Transport = self.peer.transport.as_ref();
+        let Ok(live) = t.list_dir(dir) else { return };
+        let mut lines = match peer::read_manifest(t, dir) {
+            Ok(Some(text)) => manifest::parse(&text),
+            _ => BTreeMap::new(),
+        };
+        let mut changed = false;
+        for e in live.iter().filter(|e| !e.is_dir) {
+            let Some(origin) = lines.get(&e.name).filter(|l| l.placed.is_some_and(|p| p > self.t)).and_then(|l| l.origin.clone()) else { continue };
+            if self.cfg.dry_run {
+                continue;
+            }
+            let rel = join(dir, &e.name);
+            if t.stat(&origin).is_ok() {
+                self.fail("return", &rel, &format!("{origin} is occupied"));
+                continue;
+            }
+            let moved = t.create_dir(crate::util::parent_path(&origin)).and_then(|_| t.rename(&rel, &origin));
+            match moved {
+                Ok(()) => {
+                    lines.remove(&e.name);
+                    changed = true;
+                }
+                Err(err) => self.fail("return", &rel, &err),
+            }
+        }
+        if changed {
+            let cutoff = now_micros() - (self.cfg.keep_del_days as i64) * 86_400 * 1_000_000;
+            if let Err(e) = peer::write_manifest(t, dir, &manifest::serialize(&lines, cutoff)) {
+                self.fail("manifest write", dir, &e);
+            }
+        }
+        for e in live.iter().filter(|e| e.is_dir && e.name != ".kitchensync" && e.name != ".git") {
+            self.return_reused(&join(dir, &e.name));
+        }
     }
 
     fn dir(&self, dir: &str) {
@@ -129,7 +172,7 @@ impl Rollback<'_> {
             let _ = t.delete_dir(&join(&bak_root, stamp));
             let is_dir = matches!(t.stat(&rel), Ok(s) if s.is_dir);
             let now = now_micros();
-            lines.insert(name.clone(), Line { is_dir, mod_time: now, byte_size: if is_dir { -1 } else { 0 }, last_seen: Some(now), deleted_time: None, placed: None });
+            lines.insert(name.clone(), Line { is_dir, mod_time: now, byte_size: if is_dir { -1 } else { 0 }, last_seen: Some(now), deleted_time: None, placed: None, origin: None });
             changed = true;
         }
 

@@ -21,8 +21,11 @@ One line per entry. Fields are tab-separated, in this order:
 | `last_seen`    | Timestamp when the entry was last confirmed present on this peer (via listing or a completed copy), or `-` when a copy was decided but has not completed. |
 | `deleted_time` | `-` while the entry exists. A timestamp once the entry has been confirmed absent (a tombstone).             |
 | `placed`       | Timestamp when KitchenSync itself put the current content there - a copy it completed, or a directory it created - or `-` when the content came from the user or is not known. |
+| `origin`       | Optional. Present only when KitchenSync put the content there by reusing a displaced file (see sync.md, "Reusing A Displaced File"): the peer-relative path of the `BAK/` entry it was moved from, percent-encoded like `name`. Absent (or `-`) otherwise. |
 
-Lines are sorted by `name` (byte order). The file ends with a newline. A line that does not parse is ignored and dropped on the next rewrite. Unknown extra fields after `placed` are ignored, so the format can grow. A line from an older manifest with only six fields is read as `placed` `-`.
+Lines are sorted by `name` (byte order). The file ends with a newline. A line that does not parse is ignored and dropped on the next rewrite. Unknown extra fields after `origin` are ignored, so the format can grow. A line from an older manifest with only six fields is read as `placed` `-`. A line without an `origin` field is written with seven fields; `origin` is written only when it is set.
+
+`origin` follows `placed`: it is kept exactly when `placed` is kept, and cleared whenever `placed` is cleared or set by an ordinary copy.
 
 `placed` is what lets a rollback tell KitchenSync's own additions from the user's. It is set to a freshly generated timestamp when a copy into this directory completes or a directory is created here. A later listing that finds the entry unchanged (same mod_time and byte_size as its line) keeps the existing `placed`; a listing that finds a different mod_time or byte_size clears it to `-`, because the user has changed the content since.
 
@@ -91,7 +94,11 @@ A `deleted_time` copied from an existing `last_seen` is not a generator call and
 
 Every change KitchenSync makes leaves the old thing behind in a `BAK/<timestamp>/` directory, and every manifest it replaces is archived there too. Together those two facts let a peer be put back the way it was at any moment inside the `--keep-bak-days` window. sync.md ("Rollback") describes the `--rollback <timestamp>` and `--undo` options that do this.
 
-For one directory and a target time T, working from the peer root down:
+A rollback to target time T makes two passes over the peer, both from the peer root down.
+
+**Pass 1: return reused files.** For every live file whose manifest line has `placed` later than T and an `origin`, move the file back to its `origin` path (creating that path's parent directories if needed) and drop its manifest line, so the file is in `BAK/` again exactly as the displacement left it. This pass prints nothing; pass 2 prints the `R` line when it restores the entry. If the origin path is occupied, leave the file where it is and count a failure. This pass must finish before pass 2, because pass 2 restores entries from `BAK/` and a reused file has to be back there first.
+
+**Pass 2.** For one directory, working from the peer root down:
 
 1. List the directory's live entries, and list every `BAK/<ts>/` directory in it whose `<ts>` is later than T.
 2. **Restore what was taken away.** For each name that appears in one or more of those BAK directories (ignoring `manifest.txt`), the copy in the earliest of them is what the directory held at T. Move any live entry of that name to `BAK/` first, then move the archived copy back into place, and print `R <relpath>`.

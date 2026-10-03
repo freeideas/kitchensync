@@ -84,6 +84,8 @@ pub struct Entry {
 pub trait ReadHandle: Send {
     /// Fill `buf`, returning bytes read; 0 means EOF.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    /// Move the read position to `offset` bytes from the start.
+    fn seek(&mut self, offset: u64) -> Result<()>;
 }
 
 /// Streaming write handle. Dropping without `close` may leave a partial file.

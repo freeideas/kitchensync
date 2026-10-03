@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-18 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-21 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -186,7 +186,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-18)
+# Scenarios (specs/SCENARIOS.md S-01..S-21)
 # --------------------------------------------------------------------------
 
 
@@ -664,6 +664,63 @@ def s18(tmp: Path) -> None:
     expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
 
 
+MOVIE = bytes(range(256)) * 8192  # 2 MiB
+MOVIE_TIME = "2024-01-01_10-00-00_000000Z"
+
+
+def moved_movie_setup(tmp: Path) -> tuple[Path, Path]:
+    """S-19 setup: A and B share movie.bin, then A moves it to shows/film.bin."""
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    write_file(peer_a / "movie.bin", MOVIE, MOVIE_TIME)
+    peer_b.mkdir(parents=True, exist_ok=True)
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+    check_file_bytes(peer_b / "movie.bin", MOVIE)
+    (peer_a / "shows").mkdir()
+    os.rename(peer_a / "movie.bin", peer_a / "shows" / "film.bin")
+    return peer_a, peer_b
+
+
+def check_info_lines(result: subprocess.CompletedProcess, expected: list[str]) -> None:
+    expect(result.returncode == 0, f"exit code: expected 0, got {result.returncode!r}, stderr {result.stderr!r}")
+    expect(result.stderr == b"", f"stderr: expected empty, got {result.stderr!r}")
+    lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+    expect(len(lines) >= 1 and ROLLBACK_HINT_RE.match(lines[0]) is not None, f"first line is not the rollback hint: {lines!r}")
+    expect(lines[1:] == expected, f"stdout after the hint: expected {expected!r}, got {lines[1:]!r}")
+
+
+def s19(tmp: Path) -> None:
+    peer_a, peer_b = moved_movie_setup(tmp)
+    result = run_ks(["--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    check_info_lines(result, ["X2 movie.bin", "M2 shows/film.bin", "sync complete"])
+    expect(tree(peer_b) == {"shows/film.bin": MOVIE}, f"user files under B mismatch: {sorted(tree(peer_b))}")
+    check_mtime(peer_b / "shows" / "film.bin", MOVIE_TIME)
+    leftovers = [k for k in merged_bak_files(peer_b) if k.endswith("movie.bin")]
+    expect(not leftovers, f"movie.bin should have left B's BAK, found {leftovers}")
+
+
+def s20(tmp: Path) -> None:
+    peer_a, peer_b = moved_movie_setup(tmp)
+    changed = bytearray(MOVIE)
+    changed[1_048_576] ^= 0xFF
+    write_file(peer_a / "shows" / "film.bin", bytes(changed), MOVIE_TIME)
+    result = run_ks(["--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    check_info_lines(result, ["X2 movie.bin", "1C2 shows/film.bin", "sync complete"])
+    expect(tree(peer_b) == {"shows/film.bin": bytes(changed)}, f"user files under B mismatch: {sorted(tree(peer_b))}")
+    expect(merged_bak_files(peer_b).get("movie.bin") == MOVIE, "B's BAK should hold the original movie.bin")
+
+
+def s21(tmp: Path) -> None:
+    peer_a, peer_b = moved_movie_setup(tmp)
+    sync = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(sync, b"sync complete\n")
+    result = run_ks(["--verbosity", "error", "--undo", str(peer_b)], tmp)
+    assert_result(result, b"rollback complete\n")
+    expect(tree(peer_b) == {"movie.bin": MOVIE}, f"user files under B after undo: {sorted(tree(peer_b))}")
+    check_mtime(peer_b / "movie.bin", MOVIE_TIME)
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -683,6 +740,9 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-16", "Names In Different Unicode Forms Are The Same File", s16),
     ("S-17", "An Interrupted Copy Is Not Put In Place", s17),
     ("S-18", "Mac Litter In SWAP Does Not Block Cleanup", s18),
+    ("S-19", "A Moved File Is Reused, Not Copied Again", s19),
+    ("S-20", "Same Size And Time But Different Content Is Copied", s20),
+    ("S-21", "Undo Puts A Reused File Back", s21),
 ]
 
 

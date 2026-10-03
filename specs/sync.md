@@ -225,7 +225,7 @@ A subordinate peer's manifests are still read and rewritten during the walk. On 
 
 ## Operation Queue
 
-File copies are enqueued during the combined-tree walk and executed concurrently, subject to the global active-copy limit (see concurrency.md). There is no loading phase that scans the whole tree before copy work begins. As soon as the first scanned directory produces copy work, copy workers may begin reading and copying those files while traversal continues into later directories.
+File copies are enqueued during the combined-tree walk and executed concurrently, subject to the global active-copy limit (see concurrency.md). There is no loading phase that scans the whole tree before copy work begins. As soon as the first scanned directory produces copy work, copy workers may begin reading and copying those files while traversal continues into later directories. The one exception is a copy of a large file, which is held until the walk ends so it can reuse a displaced file instead (see "Reusing A Displaced File").
 
 Each queued copy carries its own try count. `--retries-copy` is the maximum number of total tries for that copy, including the first try. Directory creation and displacement to BAK/ run inline during the walk - both are same-filesystem operations that subsequent steps may depend on.
 
@@ -278,6 +278,20 @@ destination is moved to SWAP `old`, delete the SWAP `new` file/directory for
 that transfer before releasing the copy slot. If the queued copy has not yet reached its
 `--retries-copy` total-try limit, move it to the back of the queue. Otherwise
 mark it failed for this run.
+
+### Reusing A Displaced File
+
+Moving or renaming a file on one peer looks to the walk like a deletion at the old path plus a new file at the new path. Every other peer then displaces its copy at the old path to BAK and receives the file at the new path again. For a reorganized media library that means sending hundreds of gigabytes that the receiving peer already holds. To avoid that, a copy first looks for a file that the walk displaced on the destination peer during this run and that has the same content, and moves that file into place instead of transferring it.
+
+**Held copies.** A copy of a file of at least 1 MiB (1,048,576 bytes) is held until the walk has finished, because the walk may reach the old path after the new one. Smaller files are copied as soon as they are found, as before: sending them is cheap, and small files are more likely to match by accident. When the walk ends, every held copy is released to the copy queue in the order it was found.
+
+**Candidates.** Every displacement during the walk is remembered per peer: for a file, its BAK path, byte size and modification time; for a directory, its BAK path. Before held copies are released, each displaced directory on a peer that has a held copy is listed recursively (skipping `.kitchensync/`), and every file inside becomes a candidate too. A candidate is used at most once.
+
+**Match.** When a held copy for a destination peer reaches a copy slot, it looks for a candidate on that peer whose byte size equals the decision's byte size and whose modification time is within the 5-second tolerance of the decision's mod_time. The name does not matter: renames are the common case. A candidate that passes is checked against the source by content: 64 KiB at the start of the file, 64 KiB in the middle (at offset `(size - 64 KiB) / 2`, rounded down), and the last 64 KiB are read from both and must be byte-for-byte equal. Any read error rules the candidate out. The first candidate that passes is used.
+
+**Reuse.** Step 1 of "File Copy" is skipped. Any existing destination file is moved to SWAP `old` (step 2), then the candidate is renamed from its BAK path straight to the final path (step 3), and steps 4 to 6 follow. The reused file never passes through SWAP `new`, so an interrupted run cannot mistake it for a cut-short transfer and delete it: until the final rename it is still in BAK, and after it the ordinary SWAP `old` recovery applies. If the final rename fails, SWAP `old` is moved back to the target path and the copy is retried as a normal transfer. A successful reuse records the candidate's former BAK path as the destination line's `origin` (see manifest.md), so a rollback can put it back.
+
+Dry runs do not reuse: nothing is displaced, so a dry run prints a `C` line for every copy it would make, including ones a real run may turn into reuses.
 
 ### Displace to BAK
 
@@ -473,6 +487,9 @@ Every transport must support:
   Open a file for streaming read.
 - `read(handle, max_bytes)`:
   Pull the next chunk; returns bytes or EOF.
+- `seek(handle, offset)`:
+  Move the read position to a byte offset, so that the next `read` starts
+  there. Used for the content check in "Reusing A Displaced File".
 - `close_read(handle)`:
   Close a read handle.
 - `open_write(peer, path)` -> handle:

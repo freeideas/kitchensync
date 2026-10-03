@@ -95,6 +95,8 @@ kitchensync c:/appz d:/appz -x "PortablePlatform/PortableApps" -x "*.tmp"
 ```
 This syncs two local folders but leaves the `PortablePlatform/PortableApps` folder (that path, under each peer's root) and every `.tmp` file (anywhere) out of it, in both directions.
 
+**Moves and renames cost almost nothing.** Reorganize a folder on one peer and the other peers move their own copies into place instead of downloading them again (`M` lines in the output). This applies to files of 1 MiB or more whose size, date, and sampled contents match a file the run just set aside.
+
 **Undo.** The first line of every run is the command that puts things back. Displaced files are kept 90 days (`--keep-bak-days`).
 
 ```

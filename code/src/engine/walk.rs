@@ -357,7 +357,7 @@ impl Walker {
                             // The peer deleted the directory this entry sits in:
                             // it votes to delete the entry as of that deletion.
                             let est = *inherited.get(&l.state.peer.index)?;
-                            live.is_none().then_some(Line { is_dir: false, mod_time: 0, byte_size: -1, last_seen: Some(est), deleted_time: Some(est), placed: None })
+                            live.is_none().then_some(Line { is_dir: false, mod_time: 0, byte_size: -1, last_seen: Some(est), deleted_time: Some(est), placed: None, origin: None })
                         })
                     };
                     View { state: Arc::clone(&l.state), live, line }
@@ -474,12 +474,18 @@ impl Walker {
 
     fn displace_view(&self, v: &View, rel: &str, name: &str, tags: &mut String) -> bool {
         tags.push(v.peer().tag());
-        if fsops::displace(v.peer(), rel, self.cfg.dry_run) {
-            v.state.confirm_absent(name);
-            true
-        } else {
-            false
+        let Some(to) = fsops::displace_to(v.peer(), rel, self.cfg.dry_run) else { return false };
+        // Remember it: a copy later in this run may reuse it.
+        if let (Some(to), Some(e)) = (to, &v.live) {
+            let reuse = &self.queue.reuse;
+            if e.is_dir {
+                reuse.note_dir(v.peer().index, to);
+            } else {
+                reuse.note_file(v.peer().index, to, e.byte_size, system_to_micros(e.mod_time));
+            }
         }
+        v.state.confirm_absent(name);
+        true
     }
 
     /// Make the directory exist on every peer that should have it (displacing
@@ -561,8 +567,13 @@ impl Walker {
         if dsts.is_empty() {
             return;
         }
-        let c_tags: String = dsts.iter().map(|v| v.peer().tag()).collect();
-        output::info(&format!("{}C{c_tags} {rel}", src_peer.tag()));
+        // A large file's copy is held until the walk ends and prints its own
+        // line then (see concurrency.md, "Progress Output").
+        let held = !self.cfg.dry_run && byte_size >= super::reuse::HOLD_MIN;
+        if !held {
+            let c_tags: String = dsts.iter().map(|v| v.peer().tag()).collect();
+            output::info(&format!("{}C{c_tags} {rel}", src_peer.tag()));
+        }
         if self.cfg.dry_run {
             return;
         }
@@ -574,6 +585,8 @@ impl Walker {
                 dst_dir: Arc::clone(&v.state),
                 path: rel.to_string(),
                 mod_time,
+                byte_size,
+                held,
                 tries: 0,
             });
         }

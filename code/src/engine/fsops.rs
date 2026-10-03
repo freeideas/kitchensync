@@ -42,10 +42,14 @@ pub fn list_with_retries(t: &dyn Transport, path: &str, tries: u32) -> Result<Ve
 }
 
 /// Move `old` from a SWAP dir into BAK with a fresh timestamp directory.
-fn archive_to_bak(t: &dyn Transport, parent: &str, basename: &str, from: &str) -> Result<()> {
+/// Move `from` to a fresh `<parent>/.kitchensync/BAK/<ts>/<basename>` and
+/// return that path.
+fn archive_to_bak(t: &dyn Transport, parent: &str, basename: &str, from: &str) -> Result<String> {
     let bak = join(&meta_dir(parent), &format!("BAK/{}", now_string()));
     t.create_dir(&bak)?;
-    t.rename(from, &join(&bak, basename))
+    let to = join(&bak, basename);
+    t.rename(from, &to)?;
+    Ok(to)
 }
 
 /// Recover one SWAP directory for `<parent>/<basename>` on a peer.
@@ -146,18 +150,24 @@ pub fn remove_tree(t: &dyn Transport, path: &str) -> Result<()> {
 /// Displace an entry to `<parent>/.kitchensync/BAK/<timestamp>/<basename>`.
 /// In dry-run nothing touches the peer. Returns true on success.
 pub fn displace(peer: &Peer, path: &str, dry_run: bool) -> bool {
+    displace_to(peer, path, dry_run).is_some()
+}
+
+/// `displace`, returning None on failure and otherwise where the entry went
+/// (None in a dry run).
+pub fn displace_to(peer: &Peer, path: &str, dry_run: bool) -> Option<Option<String>> {
     if dry_run {
-        return true;
+        return Some(None);
     }
     let parent = crate::util::parent_path(path);
     let base = crate::util::basename(path);
     let t: &dyn Transport = peer.transport.as_ref();
     match archive_to_bak(t, parent, base, path) {
-        Ok(()) => true,
+        Ok(to) => Some(Some(to)),
         Err(e) => {
             output::error(&format!("displacement failed for {} on {}: {}", path, peer.url, e));
             super::peer::note_failure();
-            false
+            None
         }
     }
 }

@@ -13,6 +13,9 @@ pub struct Line {
     pub deleted_time: Option<i64>,
     /// When KitchenSync itself put the current content here; None if the user did.
     pub placed: Option<i64>,
+    /// The BAK path a reused file was moved from (see "Reusing A Displaced
+    /// File" in specs/sync.md); None for anything else.
+    pub origin: Option<String>,
 }
 
 pub const NAME: &str = "manifest.txt";
@@ -66,7 +69,8 @@ pub fn parse(text: &str) -> BTreeMap<String, Line> {
             continue;
         };
         let placed = f.get(6).and_then(|v| parse_ts(v)).unwrap_or(None);
-        let line = Line { is_dir, mod_time, byte_size, last_seen, deleted_time, placed };
+        let origin = f.get(7).filter(|v| !v.is_empty() && **v != "-").map(|v| dec(v));
+        let line = Line { is_dir, mod_time, byte_size, last_seen, deleted_time, placed, origin };
         // Names are compared in NFC (see transport/normalize.rs). A manifest
         // written from a Mac holds decomposed names; one that has been through
         // both kinds of system may hold both forms of a name. Keep the live
@@ -104,6 +108,10 @@ pub fn serialize(lines: &BTreeMap<String, Line>, tombstone_cutoff: i64) -> Strin
         out.push_str(&ts(l.deleted_time));
         out.push('\t');
         out.push_str(&ts(l.placed));
+        if let Some(o) = &l.origin {
+            out.push('\t');
+            out.push_str(&enc(o));
+        }
         out.push('\n');
     }
     out
@@ -115,8 +123,8 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut m = BTreeMap::new();
-        m.insert("a\tb.txt".to_string(), Line { is_dir: false, mod_time: 1_000_000, byte_size: 5, last_seen: Some(2_000_000), deleted_time: None, placed: None });
-        m.insert("dir".to_string(), Line { is_dir: true, mod_time: 0, byte_size: -1, last_seen: None, deleted_time: Some(3_000_000), placed: Some(1) });
+        m.insert("a\tb.txt".to_string(), Line { is_dir: false, mod_time: 1_000_000, byte_size: 5, last_seen: Some(2_000_000), deleted_time: None, placed: None, origin: None });
+        m.insert("dir".to_string(), Line { is_dir: true, mod_time: 0, byte_size: -1, last_seen: None, deleted_time: Some(3_000_000), placed: Some(1), origin: Some("x/.kitchensync/BAK/t/a\tb".to_string()) });
         let text = serialize(&m, 0);
         assert_eq!(parse(&text), m);
         assert!(text.starts_with("a%09b.txt\tf\t"));

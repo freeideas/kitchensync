@@ -94,27 +94,30 @@ impl DirState {
     /// entry is unchanged since KitchenSync put it there.
     pub fn confirm_present(&self, name: &str, is_dir: bool, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
-        let placed = g.lines.get(name).filter(|l| l.deleted_time.is_none() && (is_dir || ((l.mod_time - mod_time).abs() <= 5_000_000 && l.byte_size == byte_size))).and_then(|l| l.placed);
-        g.lines.insert(name.to_string(), Line { is_dir, mod_time, byte_size, last_seen: Some(now_micros()), deleted_time: None, placed });
+        let kept = g.lines.get(name).filter(|l| l.deleted_time.is_none() && (is_dir || ((l.mod_time - mod_time).abs() <= 5_000_000 && l.byte_size == byte_size)));
+        // `origin` belongs to `placed`: kept with it, dropped with it.
+        let (placed, origin) = kept.map(|l| (l.placed, l.origin.clone().filter(|_| l.placed.is_some()))).unwrap_or((None, None));
+        g.lines.insert(name.to_string(), Line { is_dir, mod_time, byte_size, last_seen: Some(now_micros()), deleted_time: None, placed, origin });
     }
 
     /// A directory KitchenSync just created here.
     pub fn created_dir(&self, name: &str) {
         let mut g = self.inner.lock().unwrap();
         let now = now_micros();
-        g.lines.insert(name.to_string(), Line { is_dir: true, mod_time: now, byte_size: -1, last_seen: Some(now), deleted_time: None, placed: Some(now) });
+        g.lines.insert(name.to_string(), Line { is_dir: true, mod_time: now, byte_size: -1, last_seen: Some(now), deleted_time: None, placed: Some(now), origin: None });
     }
 
     /// Decision "push to this peer": intended state without `last_seen`.
     pub fn intend_push(&self, name: &str, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
         let last_seen = g.lines.get(name).and_then(|l| l.last_seen);
-        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen, deleted_time: None, placed: None });
+        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen, deleted_time: None, placed: None, origin: None });
         g.outstanding += 1;
     }
 
-    /// A queued copy finished (successfully or not).
-    pub fn copy_finished(self: &Arc<Self>, name: &str, ok: bool) {
+    /// A queued copy finished (successfully or not). `origin` is the BAK
+    /// path of a reused file, None for a transfer.
+    pub fn copy_finished(self: &Arc<Self>, name: &str, ok: bool, origin: Option<String>) {
         let write = {
             let mut g = self.inner.lock().unwrap();
             if ok {
@@ -123,6 +126,7 @@ impl DirState {
                     l.last_seen = Some(now);
                     l.deleted_time = None;
                     l.placed = Some(now);
+                    l.origin = origin;
                 }
             }
             g.outstanding -= 1;

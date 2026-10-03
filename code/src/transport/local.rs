@@ -297,6 +297,11 @@ impl ReadHandle for LocalReadHandle {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         Ok(self.file.read(buf)?)
     }
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        use std::io::Seek;
+        self.file.seek(std::io::SeekFrom::Start(offset))?;
+        Ok(())
+    }
 }
 
 struct LocalWriteHandle {

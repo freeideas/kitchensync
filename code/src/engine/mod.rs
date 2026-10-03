@@ -3,6 +3,7 @@
 mod copy;
 mod fsops;
 mod peer;
+mod reuse;
 mod rollback;
 mod walk;
 
@@ -112,6 +113,12 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         walker.sync_directory(&peers, "", &Default::default());
         walker.prefetch.stop();
     });
+    // Every displacement is known now: find the files inside displaced
+    // directories, then let the held copies run.
+    for p in queue.held_peers() {
+        queue.reuse.expand(p.index, p.transport.as_ref());
+    }
+    queue.release_held();
     queue.close_and_wait(workers);
 
     finish("sync complete")

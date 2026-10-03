@@ -318,6 +318,34 @@ Action: run `released/kitchensync.exe --verbosity error A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `new\n`. `B/.kitchensync/SWAP` is absent or empty.
 
+## S-19: A Moved File Is Reused, Not Copied Again
+
+Setup:
+
+- `A/movie.bin` exists with 2 MiB of content: the bytes 0 to 255 in order, repeated 8,192 times. Its modification time is `2024-01-01_10-00-00_000000Z`.
+- First run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0, so `B/movie.bin` exists with the same content and modification time.
+- On A, move `A/movie.bin` to `A/shows/film.bin` (a rename, which keeps its modification time).
+
+Action: run `released/kitchensync.exe --verbosity info A B`.
+
+Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `M2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds the original 2 MiB content with modification time `2024-01-01_10-00-00_000000Z`, and B has no `movie.bin`. Nothing named `movie.bin` remains anywhere under `B/.kitchensync/BAK/`: the displaced file was moved into place rather than kept there.
+
+## S-20: Same Size And Time But Different Content Is Copied
+
+Setup: the same as S-19, except that after the move, `A/shows/film.bin` is rewritten with the same content changed in one byte at offset 1,048,576 (the middle of the file), and its modification time is set back to `2024-01-01_10-00-00_000000Z`.
+
+Action: run `released/kitchensync.exe --verbosity info A B`.
+
+Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `1C2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds A's changed content. `B/.kitchensync/BAK/` holds the original `movie.bin` content.
+
+## S-21: Undo Puts A Reused File Back
+
+Setup: the same as S-19, including its action (run with `--verbosity error` instead of `info`).
+
+Action: run `released/kitchensync.exe --verbosity error --undo B`.
+
+Outcome: the process exits 0. stdout is exactly `rollback complete\n`. stderr is empty. The user files under `B/` are exactly `movie.bin` with the original 2 MiB content and modification time `2024-01-01_10-00-00_000000Z`; there is no `B/shows/film.bin`.
+
 # Properties
 
 ## P-01: Output Channels
