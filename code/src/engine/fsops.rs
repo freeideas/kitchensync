@@ -82,7 +82,7 @@ pub fn recover_one_swap(t: &dyn Transport, parent: &str, basename: &str) -> Resu
         }
         (false, false, _) => {}
     }
-    let _ = t.delete_dir(&swap);
+    let _ = delete_swap_dir(t, &swap);
     Ok(())
 }
 
@@ -103,8 +103,28 @@ pub fn recover_swaps(t: &dyn Transport, dir: &str) -> Result<()> {
         let basename = decode_segment(&e.name);
         recover_one_swap(t, dir, &basename)?;
     }
-    let _ = t.delete_dir(&swap_root);
+    let _ = delete_swap_dir(t, &swap_root);
     Ok(())
+}
+
+/// Remove a SWAP directory that holds nothing but operating-system litter.
+/// macOS writes `._<name>` AppleDouble files beside anything it touches on
+/// exFAT/FAT drives (and Finder drops `.DS_Store`), so a SWAP directory that
+/// a Mac has seen is never truly empty. Litter is deleted first; any other
+/// entry is left alone and the directory delete fails as it would anyway.
+pub fn delete_swap_dir(t: &dyn Transport, path: &str) -> Result<()> {
+    let entries = match t.list_dir(path) {
+        Ok(v) => v,
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let is_litter = |e: &Entry| !e.is_dir && (e.name.starts_with("._") || e.name == ".DS_Store");
+    if entries.iter().all(is_litter) {
+        for e in &entries {
+            t.delete_file(&join(path, &e.name))?;
+        }
+    }
+    t.delete_dir(path)
 }
 
 /// Recursively delete a file or directory tree.

@@ -156,6 +156,9 @@ Before listing a directory for sync decisions in a normal run, check each peer f
 same parent directory. Recover every swap directory before the directory's live
 entries are listed for sync decisions.
 
+"Empty" SWAP directories may still hold operating-system litter; see sync.md,
+"SWAP Directory".
+
 For target `<basename>`:
 
 - `old` exists and target exists: replacement completed; delete `new` if

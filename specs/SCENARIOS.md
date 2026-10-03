@@ -304,6 +304,20 @@ Action: run `released/kitchensync.exe --verbosity error A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `0123456789\n` with modification time `2024-01-01_10-00-00_000000Z`. `B/.kitchensync/SWAP` is absent or empty.
 
+## S-18: Mac Litter In SWAP Does Not Block Cleanup
+
+Setup:
+
+- `A/keep.txt` and `B/keep.txt` exist with bytes `keep\n` and modification time `2024-01-01_10-00-00_000000Z`.
+- `A/movie.bin` exists with bytes `new\n` and modification time `2024-01-02_10-00-00_000000Z`.
+- `B/movie.bin` exists with bytes `old\n` and modification time `2024-01-01_10-00-00_000000Z`.
+- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have manifests.
+- Simulate the files macOS leaves on an exFAT drive after touching an earlier swap: create `B/.kitchensync/SWAP/movie.bin/._new` and `B/.kitchensync/SWAP/._movie.bin`, each with 4096 zero bytes.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `new\n`. `B/.kitchensync/SWAP` is absent or empty.
+
 # Properties
 
 ## P-01: Output Channels

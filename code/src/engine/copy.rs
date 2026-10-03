@@ -227,7 +227,7 @@ fn transfer(job: &CopyJob) -> Outcome {
     }
 
     // 6. Clean up staging.
-    if let Err(e) = dst.delete_dir(&swap) {
+    if let Err(e) = fsops::delete_swap_dir(dst, &swap) {
         fail(job, "cleanup", &e);
     }
     Outcome::Done

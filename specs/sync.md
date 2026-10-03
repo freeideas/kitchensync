@@ -261,7 +261,7 @@ Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires 
 3. **Swap in** - rename SWAP `new` to the final path
 4. **Set mod_time** - set the destination file's modification time to the winning mod_time from the decision (not re-read from the source)
 5. **Archive old** - if SWAP `old` exists, rename it to `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`
-6. **Clean up** empty SWAP directories
+6. **Clean up** empty SWAP directories (see "SWAP Directory" for what counts as empty)
 
 Content is streamed with bounded buffering. Each active transfer uses one or
 more fixed-size buffers whose total size is independent of the file size.
@@ -442,6 +442,12 @@ an interrupted swap. For a target `<parent>/<basename>`, the SWAP paths are:
 used as one path segment on every supported transport. Before starting a
 replacement for a path, KitchenSync must recover or fail any existing SWAP
 directory for that basename.
+
+A SWAP directory counts as empty when it holds only operating-system litter
+files: names starting with `._` (the AppleDouble files macOS writes beside
+anything it touches on exFAT and FAT drives) and `.DS_Store`. KitchenSync
+deletes that litter before removing the directory; any other leftover entry
+keeps the directory in place.
 
 SWAP is for user files only. A directory's manifest is replaced by the
 `.new`/`.old` rule in manifest.md instead.

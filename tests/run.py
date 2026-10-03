@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-17 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-18 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -186,7 +186,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-17)
+# Scenarios (specs/SCENARIOS.md S-01..S-18)
 # --------------------------------------------------------------------------
 
 
@@ -643,6 +643,27 @@ def s17(tmp: Path) -> None:
     expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
 
 
+def s18(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    write_file(peer_a / "keep.txt", b"keep\n", "2024-01-01_10-00-00_000000Z")
+    write_file(peer_b / "keep.txt", b"keep\n", "2024-01-01_10-00-00_000000Z")
+    write_file(peer_a / "movie.bin", b"new\n", "2024-01-02_10-00-00_000000Z")
+    write_file(peer_b / "movie.bin", b"old\n", "2024-01-01_10-00-00_000000Z")
+
+    setup = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), "-x", "movie.bin"], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+    swap = peer_b / ".kitchensync" / "SWAP"
+    write_file(swap / "movie.bin" / "._new", bytes(4096))
+    write_file(swap / "._movie.bin", bytes(4096))
+
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b):
+        check_file_bytes(peer / "movie.bin", b"new\n")
+    expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -661,6 +682,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-15", "Folder Renamed On One Peer Is Not Copied Back", s15),
     ("S-16", "Names In Different Unicode Forms Are The Same File", s16),
     ("S-17", "An Interrupted Copy Is Not Put In Place", s17),
+    ("S-18", "Mac Litter In SWAP Does Not Block Cleanup", s18),
 ]
 
 
