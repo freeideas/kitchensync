@@ -18,7 +18,7 @@ One line per entry. Fields are tab-separated, in this order:
 | `kind`         | `f` for a file, `d` for a directory.                                                                       |
 | `mod_time`     | `YYYY-MM-DD_HH-mm-ss_ffffffZ`: the entry's modification time as last observed on this peer. Recorded for directories but not used in decisions. |
 | `byte_size`    | Bytes for files, `-1` for directories.                                                                     |
-| `last_seen`    | Timestamp when the entry was last confirmed present on this peer (via listing or a completed copy), or `-` when a copy was decided but has not completed. |
+| `last_seen`    | Timestamp when the entry was confirmed present on this peer (via listing or a completed copy), or `-` when a copy was decided but has not completed. It is not refreshed while the entry stays unchanged (see multi-tree-sync.md, "Manifest Updates"), so it is the first confirmation of the entry's current state, never later than the most recent one. |
 | `deleted_time` | `-` while the entry exists. A timestamp once the entry has been confirmed absent (a tombstone).             |
 | `placed`       | Timestamp when KitchenSync itself put the current content there - a copy it completed, or a directory it created - or `-` when the content came from the user or is not known. |
 | `origin`       | Optional. Present only when KitchenSync put the content there by reusing a displaced file (see sync.md, "Reusing A Displaced File"): the peer-relative path of the `BAK/` entry it was moved from, percent-encoded like `name`. Absent (or `-`) otherwise. |

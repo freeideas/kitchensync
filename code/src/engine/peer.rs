@@ -92,8 +92,21 @@ impl DirState {
 
     /// Entry confirmed present by a listing. `placed` survives only when the
     /// entry is unchanged since KitchenSync put it there.
+    ///
+    /// An unchanged entry keeps its line as it is, `last_seen` included, so
+    /// that a directory where nothing changed is not rewritten (see
+    /// multi-tree-sync.md, "Manifest Updates"). `last_seen` is refreshed only
+    /// when it is not already later than the entry's own mod_time.
     pub fn confirm_present(&self, name: &str, is_dir: bool, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
+        if let Some(l) = g.lines.get(name) {
+            let unchanged = l.deleted_time.is_none()
+                && l.is_dir == is_dir
+                && (is_dir || ((l.mod_time - mod_time).abs() <= 5_000_000 && l.byte_size == byte_size && l.last_seen.is_some_and(|ls| ls > mod_time + 5_000_000)));
+            if unchanged {
+                return;
+            }
+        }
         let kept = g.lines.get(name).filter(|l| l.deleted_time.is_none() && (is_dir || ((l.mod_time - mod_time).abs() <= 5_000_000 && l.byte_size == byte_size)));
         // `origin` belongs to `placed`: kept with it, dropped with it.
         let (placed, origin) = kept.map(|l| (l.placed, l.origin.clone().filter(|_| l.placed.is_some()))).unwrap_or((None, None));

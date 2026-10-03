@@ -146,6 +146,10 @@ Excluded by pattern (see sync.md, "Excludes"): the built-in litter patterns,
 each peer's `.kitchensync/ignore`, and `-x` patterns from the command line,
 applied in that order with the last matching pattern winning.
 
+## Reading A Directory
+
+Each peer's directory listing, its manifest, and a listing of its `.kitchensync/` directory are independent reads: issue all three at once (this is a metadata operation, not a sync operation, so the built-in exclude does not apply). The `.kitchensync/` listing decides the rest without further round trips. If it shows `manifest.txt.old`, `manifest.txt.new`, or `SWAP`, repair as described in manifest.md ("Writing") and below, then read the directory listing and manifest again, so decisions are made only on repaired state. If it shows `BAK`, BAK cleanup runs for that directory (see "BAK Cleanup During Traversal"); otherwise there is nothing to clean. If `.kitchensync/` is missing, there is nothing to repair or clean. If it cannot be listed for another reason, repair and cleanup are attempted as if every name were present.
+
 ## SWAP Recovery During Traversal
 
 In `--dry-run`, peer-side SWAP recovery during traversal is skipped.
@@ -186,10 +190,8 @@ rewritten.
 ## BAK Cleanup During Traversal
 
 In normal runs, after processing the union of entry names at each directory
-level, separately check each peer for a `.kitchensync/` directory at the current
-path (using `list_dir` or `stat` directly - this is a metadata operation, not a
-sync operation, so the built-in exclude does not apply). If present, list its
-`BAK/` subdirectories and purge expired entries:
+level, purge expired entries from each peer's `.kitchensync/BAK/` at the current
+path, if it has one:
 
 - `.kitchensync/BAK/<timestamp>/` - remove entries older than `--keep-bak-days` days
 
@@ -335,7 +337,8 @@ Each peer's manifest for a directory is assembled while that directory is being 
   If the operation fails, that peer's existing line is carried forward
   unchanged.
 
-- **Entry confirmed present** on a peer: write a line with the current mod_time, byte_size, `last_seen` set to a freshly generated timestamp, and `deleted_time` `-`. Keep the existing line's `placed` value when the observed mod_time and byte_size match that line; clear `placed` to `-` when either differs, because the user changed the content (see manifest.md, "Format")
+- **Entry confirmed present, unchanged** on a peer: keep the existing line exactly as it is, `last_seen` included. "Unchanged" means the line is not a tombstone and has the same kind; for a file, also the same byte_size, a mod_time within the 5-second tolerance, and a `last_seen` later than that mod_time plus the tolerance. A directory where every entry is unchanged therefore produces the same manifest and is not rewritten, which keeps a run over an unchanged tree to reads only. Refreshing `last_seen` on every run would change no decision except one rare conflict: a file deleted on this peer while a peer that missed the intervening runs edited it. With the older `last_seen`, the edit wins and the file is copied back; the stored value is never later than the truth, so no deletion is ever inferred that a fresh value would not also infer.
+- **Entry confirmed present, otherwise** on a peer: write a line with the current mod_time, byte_size, `last_seen` set to a freshly generated timestamp, and `deleted_time` `-`. Keep the existing line's `placed` value when the observed mod_time and byte_size match that line; clear `placed` to `-` when either differs, because the user changed the content (see manifest.md, "Format")
 - **Entry confirmed absent** on a peer whose line has `deleted_time` `-`: keep the line and set `deleted_time` to the deletion estimate - the line's `last_seen` if it has one, otherwise a freshly generated timestamp (the deletion happened sometime after that point). Do not update `last_seen`.
 - **Entry confirmed absent** on a peer whose line already has `deleted_time` set: no change (tombstone already recorded)
 - **Decision: push to a peer**: write a line for the destination peer with the winning entry's mod_time, byte_size, `deleted_time` `-`, and `placed` `-` until the copy completes. Do **not** set `last_seen` - it is only set when the entry is confirmed present (in a listing or after a completed copy). Until then `last_seen` is `-`.

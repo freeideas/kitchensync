@@ -346,6 +346,18 @@ Action: run `released/kitchensync.exe --verbosity error --undo B`.
 
 Outcome: the process exits 0. stdout is exactly `rollback complete\n`. stderr is empty. The user files under `B/` are exactly `movie.bin` with the original 2 MiB content and modification time `2024-01-01_10-00-00_000000Z`; there is no `B/shows/film.bin`.
 
+## S-22: A Run Over An Unchanged Tree Writes No Manifests
+
+Setup:
+
+- `A/top.txt` and `A/sub/inner.txt` exist with bytes `x\n`, both with modification time `2024-01-01_10-00-00_000000Z`. `B/` exists and is empty.
+- Run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
+- Record the bytes of every file under each peer's `.kitchensync/` directories, at every level.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. On each peer, every file under every `.kitchensync/` directory is byte-for-byte as recorded, except the root's `.kitchensync/runs.txt`, which has one more line; no new `BAK/` directory was created anywhere.
+
 # Properties
 
 ## P-01: Output Channels

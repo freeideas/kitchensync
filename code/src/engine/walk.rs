@@ -127,6 +127,8 @@ fn within(a: i64, b: i64) -> bool {
 pub struct Listed {
     state: Arc<DirState>,
     entries: Vec<Entry>,
+    /// Whether `.kitchensync/BAK/` exists here, so cleanup knows to look.
+    has_bak: bool,
 }
 
 impl Walker {
@@ -136,20 +138,38 @@ impl Walker {
 
     fn list_peer(&self, p: &PeerRef, dir: &str) -> Option<Listed> {
         let t: &dyn Transport = p.transport.as_ref();
-        if !self.cfg.dry_run {
+        // The listing, the manifest read, and the listing of `.kitchensync/`
+        // are independent round trips: issue them together. The last one says
+        // whether an interrupted manifest replacement or swap needs repair and
+        // whether there is a BAK/ to clean, so those cost nothing when absent.
+        let t0 = std::time::Instant::now();
+        let read_all = || {
+            std::thread::scope(|s| {
+                let manifest = s.spawn(|| peer::read_manifest(t, dir));
+                let meta = s.spawn(|| t.list_dir(&fsops::meta_dir(dir)));
+                let entries = fsops::list_with_retries(t, dir, self.cfg.retries_list);
+                let failed = || crate::transport::TransportError::io("listing thread failed".to_string());
+                (entries, manifest.join().unwrap_or_else(|_| Err(failed())), meta.join().unwrap_or_else(|_| Err(failed())))
+            })
+        };
+        let (mut entries, mut text, meta) = read_all();
+        // When `.kitchensync/` cannot be listed, assume everything is there.
+        let meta_names: Option<Vec<String>> = match meta {
+            Ok(v) => Some(v.into_iter().map(|e| e.name).collect()),
+            Err(e) if e.is_not_found() => Some(Vec::new()),
+            Err(_) => None,
+        };
+        let has = |n: &str| meta_names.as_ref().is_none_or(|v| v.iter().any(|x| x == n));
+        let needs_repair = has("manifest.txt.old") || has("manifest.txt.new") || has("SWAP");
+        if needs_repair && !self.cfg.dry_run {
             if let Err(e) = peer::recover_manifest(t, dir).and_then(|_| fsops::recover_swaps(t, dir)) {
                 output::error(&format!("recovery failed for {} at {}: {}", p.url, dir, e));
                 return None;
             }
+            // Repair can move entries and the manifest: read them again.
+            (entries, text, _) = read_all();
         }
-        // The listing and the manifest read are independent round trips:
-        // issue them together.
-        let t0 = std::time::Instant::now();
-        let (entries, text) = std::thread::scope(|s| {
-            let manifest = s.spawn(|| peer::read_manifest(t, dir));
-            let entries = fsops::list_with_retries(t, dir, self.cfg.retries_list);
-            (entries, manifest.join().unwrap_or_else(|_| Err(crate::transport::TransportError::io("manifest read thread failed".to_string()))))
-        });
+        let has_bak = has("BAK");
         let t1 = std::time::Instant::now();
         let entries = match entries {
             Ok(v) => v,
@@ -158,7 +178,7 @@ impl Walker {
             // Only when the directory itself is absent: a "not found" raised by
             // something inside an existing directory is a real listing failure.
             Err(e) if self.cfg.dry_run && e.is_not_found() && t.stat(dir).is_err() => {
-                return Some(Listed { state: DirState::new(Arc::clone(p), dir, None, true, self.cfg.keep_del_days), entries: Vec::new() });
+                return Some(Listed { state: DirState::new(Arc::clone(p), dir, None, true, self.cfg.keep_del_days), entries: Vec::new(), has_bak: false });
             }
             Err(e) => {
                 output::error(&format!("listing failed for {} at {}, excluding from this subtree: {}", p.url, dir, e));
@@ -182,7 +202,7 @@ impl Walker {
                 (t1 - t0).as_millis()
             ));
         }
-        Some(Listed { state: DirState::new(Arc::clone(p), dir, text, self.cfg.dry_run, self.cfg.keep_del_days), entries })
+        Some(Listed { state: DirState::new(Arc::clone(p), dir, text, self.cfg.dry_run, self.cfg.keep_del_days), entries, has_bak })
     }
 
     /// Sync one directory level across `peers`, then recurse. Returns whether
@@ -393,7 +413,7 @@ impl Walker {
 
         // BAK cleanup piggybacks on the traversal.
         if !self.cfg.dry_run {
-            for l in &active {
+            for l in active.iter().filter(|l| l.has_bak) {
                 fsops::cleanup_bak(&l.state.peer, dir, self.cfg.keep_bak_days);
             }
         }

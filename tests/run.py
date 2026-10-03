@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-21 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-22 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -186,7 +186,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-21)
+# Scenarios (specs/SCENARIOS.md S-01..S-22)
 # --------------------------------------------------------------------------
 
 
@@ -721,6 +721,39 @@ def s21(tmp: Path) -> None:
     check_mtime(peer_b / "movie.bin", MOVIE_TIME)
 
 
+def meta_snapshot(peer: Path) -> dict[str, bytes]:
+    """relpath -> bytes for every file under any .kitchensync/ directory, except the root run log."""
+    out: dict[str, bytes] = {}
+    for dirpath, _dirnames, filenames in os.walk(peer):
+        if ".kitchensync" not in Path(dirpath).relative_to(peer).parts:
+            continue
+        for f in filenames:
+            rel = (Path(dirpath) / f).relative_to(peer).as_posix()
+            if rel != ".kitchensync/runs.txt":
+                out[rel] = (Path(dirpath) / f).read_bytes()
+    return out
+
+
+def s22(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    write_file(peer_a / "top.txt", b"x\n", "2024-01-01_10-00-00_000000Z")
+    write_file(peer_a / "sub" / "inner.txt", b"x\n", "2024-01-01_10-00-00_000000Z")
+    peer_b.mkdir(parents=True, exist_ok=True)
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+    before = {p: meta_snapshot(p) for p in (peer_a, peer_b)}
+    runs_before = {p: (p / ".kitchensync" / "runs.txt").read_text().count("\n") for p in (peer_a, peer_b)}
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+    for p in (peer_a, peer_b):
+        after = meta_snapshot(p)
+        changed = sorted(k for k in set(before[p]) | set(after) if before[p].get(k) != after.get(k))
+        expect(not changed, f"{p}: metadata changed on an unchanged run: {changed}")
+        runs = (p / ".kitchensync" / "runs.txt").read_text().count("\n")
+        expect(runs == runs_before[p] + 1, f"{p}: runs.txt should gain one line, had {runs_before[p]}, now {runs}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -743,6 +776,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-19", "A Moved File Is Reused, Not Copied Again", s19),
     ("S-20", "Same Size And Time But Different Content Is Copied", s20),
     ("S-21", "Undo Puts A Reused File Back", s21),
+    ("S-22", "A Run Over An Unchanged Tree Writes No Manifests", s22),
 ]
 
 
