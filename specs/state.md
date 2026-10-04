@@ -28,18 +28,22 @@ One line per entry. Fields are tab-separated, in this order:
 | `last_seen`    | Timestamp when the entry was confirmed present on this peer (via listing or a completed copy), or `-` when a copy was decided but has not completed. It is not refreshed while the entry stays unchanged (see multi-tree-sync.md, "State Updates"), so it is the first confirmation of the entry's current state, never later than the most recent one. |
 | `deleted_time` | `-` while the entry exists. A timestamp once the entry has been confirmed absent (a tombstone). |
 
-The first line is `#`, a tab, and the timestamp at which the file was written. Other lines starting with `#` are ignored, as is any line that does not parse; it is dropped on the next rewrite. Extra fields after `deleted_time` are ignored, so the format can grow. Entry lines are sorted by `path` (byte order) and the file ends with a newline.
+The first line is `#`, a tab, the format version (see "Format version"), a tab, and the timestamp at which the file was written. Other lines starting with `#` are ignored, as is any line that does not parse; it is dropped on the next rewrite. Extra fields after `deleted_time` are ignored, so the format can grow. Entry lines are sorted by `path` (byte order) and the file ends with a newline.
 
 Example:
 
 ```
-#	2024-03-05_08-10-00_000000Z
+#	1	2024-03-05_08-10-00_000000Z
 IMG_0001.jpg	f	2024-03-02_09-15-30_000000Z	4194304	2024-03-05_08-00-01_120394Z	-
 raw	d	2024-02-20_18-30-00_000000Z	-1	2024-03-05_08-00-01_120396Z	-
 raw/notes.txt	f	2024-01-01_12-00-00_000000Z	812	2024-03-05_08-00-01_120395Z	2024-03-05_08-00-01_120395Z
 ```
 
 The lines for a directory's direct children are that directory's history on this peer. A peer "has history" at the sync root when `state.txt` exists there.
+
+### Format version
+
+The state file and every journal declare the format they are written in, currently `1`. A KitchenSync that finds a newer format than it reads does not guess: a sync treats that peer as unreachable, with an error line naming the format; a nested root with a newer format is left out of the run's history and not written; and a rollback skips that peer and counts a failure. A peer in an older layout is converted when a run first meets it, as the per-directory layout is (see "Per-directory manifests").
 
 ### Reading
 
@@ -84,7 +88,7 @@ In a normal run the per-directory folder is then converted, right after it is re
 
 ## Journal
 
-Every normal run writes `<root>/.kitchensync/journal/<run>.txt` on each peer where it changes something; a run that changes nothing on a peer writes no journal there. Each change is appended as soon as it succeeds. One line per change, tab-separated:
+Every normal run writes `<root>/.kitchensync/journal/<run>.txt` on each peer where it changes something; a run that changes nothing on a peer writes no journal there. Its first line is `#`, a tab, and the format version. Each change is appended as soon as it succeeds. One line per change, tab-separated:
 
 ```
 <timestamp>  <op>  <path>  <other>  <byte_size>  <mod_time>

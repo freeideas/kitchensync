@@ -18,7 +18,11 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
         return 1;
     }
     for p in peers {
-        let (lines, newest) = read_journals(p);
+        let Some((lines, newest)) = read_journals(p) else {
+            output::error(&format!("rollback skipped for {}: a journal there has a newer format than this KitchenSync reads", p.url));
+            note_failure();
+            continue;
+        };
         let target = match ts.or_else(|| peer::last_run_start(p.t())).or(newest.map(|t| t - 1)) {
             Some(t) => t,
             None => {
@@ -38,19 +42,23 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
     super::finish("rollback complete")
 }
 
-/// Every journal line on the peer, and the newest journal's start time.
-fn read_journals(p: &Peer) -> (Vec<JLine>, Option<i64>) {
+/// Every journal line on the peer, and the newest journal's start time; None
+/// when a journal has a format this KitchenSync does not read.
+fn read_journals(p: &Peer) -> Option<(Vec<JLine>, Option<i64>)> {
     let dir = meta("journal");
-    let Ok(entries) = p.t().list_dir(&dir) else { return (Vec::new(), None) };
+    let Ok(entries) = p.t().list_dir(&dir) else { return Some((Vec::new(), None)) };
     let mut lines = Vec::new();
     let mut newest = None;
     for e in entries.iter().filter(|e| !e.is_dir) {
         newest = newest.max(parse_time(e.name.strip_suffix(".txt").unwrap_or(&e.name)));
         if let Ok(Some(text)) = peer::read_text(p.t(), &join(&dir, &e.name)) {
+            if state::version(&text) > state::FORMAT {
+                return None;
+            }
             lines.extend(state::parse_journal(&text));
         }
     }
-    (lines, newest)
+    Some((lines, newest))
 }
 
 struct Rollback<'a> {

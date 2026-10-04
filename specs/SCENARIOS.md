@@ -312,6 +312,18 @@ Action: run `released/kitchensync.exe --verbosity error A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n` (both peers have history, so there is no first-sync line). stderr is empty. The user files under both peers are exactly `sub/keep.txt`: B's `gone.txt` is displaced, because A's manifest shows A had it and lost it. Neither `A/sub/.kitchensync` nor `B/sub/.kitchensync` exists. Both peers have `.kitchensync/state.txt`. The files in B's BAK are exactly `sub/old.txt` with bytes `old\n`, in the directory `<T>`, and `sub/gone.txt` with bytes `gone\n`.
 
+## S-26: A Newer State Format Is Left Alone
+
+Setup:
+
+- `A/one.txt` and `B/one.txt` exist with bytes `one\n` and modification time `2024-01-01_10-00-00_000000Z`.
+- `B/.kitchensync/state.txt` holds the single line `#	99	2024-01-02_10-00-00_000000Z` (format 99, newer than any KitchenSync reads).
+- `C/` exists and has no user files.
+
+Action: run `released/kitchensync.exe --verbosity error A B C`.
+
+Outcome: the process exits 0 with empty stderr. stdout is exactly three lines: `peer unreachable: <B>: io_error: state.txt is format 99, newer than this KitchenSync reads (format 1); use a newer KitchenSync`, where `<B>` is B as KitchenSync displays it (`file://` and its absolute path), then the first-sync line (A and C have no history), then `sync complete`. B's `.kitchensync/state.txt` is byte-for-byte unchanged, and B has no other file under `.kitchensync/`. `C/one.txt` holds `one\n`.
+
 # Properties
 
 ## P-01: Output Channels

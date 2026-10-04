@@ -21,6 +21,25 @@ pub type DirLines = BTreeMap<String, Line>;
 pub type Tree = BTreeMap<String, DirLines>;
 
 pub const STATE: &str = "state.txt";
+
+/// The format of the state file and journal this KitchenSync writes, and the
+/// newest it reads (specs/state.md, "Format version").
+pub const FORMAT: u32 = 1;
+
+/// The format version a state file or journal declares on its `#` line.
+pub fn version(text: &str) -> u32 {
+    let Some(first) = text.lines().next() else { return FORMAT };
+    let f: Vec<&str> = first.split('\t').collect();
+    if f[0] != "#" {
+        return FORMAT;
+    }
+    f.get(1).and_then(|v| v.parse().ok()).unwrap_or(FORMAT)
+}
+
+/// The first line of a journal.
+pub fn journal_header() -> String {
+    format!("#\t{FORMAT}\n")
+}
 pub const LEGACY_MANIFEST: &str = "manifest.txt";
 
 /// Percent-encode a name so tab, newline, carriage return and `%` never appear raw.
@@ -92,7 +111,8 @@ pub fn parse_state(text: &str) -> (Option<i64>, Tree) {
         let f: Vec<&str> = raw.split('\t').collect();
         if f[0] == "#" {
             if written.is_none() {
-                written = f.get(1).and_then(|v| parse_time(v));
+                // `#`, the format version, the time written.
+                written = f.get(2).or(f.get(1)).and_then(|v| parse_time(v));
             }
             continue;
         }
@@ -153,7 +173,7 @@ pub fn serialize_body(tree: &Tree, tombstone_cutoff: i64, prefix: &str) -> Strin
 }
 
 pub fn with_header(written: i64, body: &str) -> String {
-    format!("#\t{}\n{}", format_micros(written), body)
+    format!("#\t{FORMAT}\t{}\n{}", format_micros(written), body)
 }
 
 /// Parse a per-directory `manifest.txt` (name, kind, mod_time, byte_size,
@@ -231,7 +251,10 @@ mod tests {
         tree.entry("".into()).or_default().insert("dir".into(), line(true, None));
         tree.entry("dir".into()).or_default().insert("x%y".into(), line(false, Some(3_000_000)));
         let text = with_header(9_000_000, &serialize_body(&tree, 0, ""));
-        assert!(text.starts_with("#\t1970-01-01_00-00-09_000000Z\na%09b.txt\tf\t"));
+        assert!(text.starts_with("#\t1\t1970-01-01_00-00-09_000000Z\na%09b.txt\tf\t"));
+        assert_eq!(version(&text), 1);
+        assert_eq!(version("#\t7\t1970-01-01_00-00-09_000000Z\n"), 7);
+        assert_eq!(version(&journal_header()), FORMAT);
         let (written, back) = parse_state(&text);
         assert_eq!(written, Some(9_000_000));
         assert_eq!(back, tree);

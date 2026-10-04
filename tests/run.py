@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-25 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-26 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -184,7 +184,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-25)
+# Scenarios (specs/SCENARIOS.md S-01..S-26)
 # --------------------------------------------------------------------------
 
 
@@ -812,6 +812,26 @@ def s25(tmp: Path) -> None:
     expect(merged_bak_files(peer_b)["sub/gone.txt"] == b"gone\n", f"B's BAK should hold sub/gone.txt: {bak}")
 
 
+def s26(tmp: Path) -> None:
+    peer_a, peer_b, peer_c = tmp / "A", tmp / "B", tmp / "C"
+    for peer in (peer_a, peer_b):
+        write_file(peer / "one.txt", b"one\n", "2024-01-01_10-00-00_000000Z")
+    newer = b"#\t99\t2024-01-02_10-00-00_000000Z\n"
+    write_file(peer_b / ".kitchensync" / "state.txt", newer)
+    peer_c.mkdir(parents=True, exist_ok=True)
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), str(peer_c)], tmp)
+    expected = (
+        f"peer unreachable: file://{peer_b.as_posix()}: io_error: state.txt is format 99, newer than this "
+        "KitchenSync reads (format 1); use a newer KitchenSync\n"
+        "first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\n"
+        "sync complete\n"
+    )
+    assert_result(result, expected.encode())
+    expect((peer_b / ".kitchensync" / "state.txt").read_bytes() == newer, "B's state.txt changed")
+    expect(sorted(p.name for p in (peer_b / ".kitchensync").iterdir()) == ["state.txt"], "B gained files under .kitchensync")
+    check_file_bytes(peer_c / "one.txt", b"one\n")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -838,6 +858,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-23", "A Move Is Found Before The Walk Reaches The Old Path", s23),
     ("S-24", "A File Displaced In An Earlier Run Is Moved Into Place", s24),
     ("S-25", "Per-Directory Manifests Are Read And Converted", s25),
+    ("S-26", "A Newer State Format Is Left Alone", s26),
 ]
 
 

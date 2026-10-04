@@ -68,7 +68,11 @@ impl Peer {
         let line = JLine { ts: now_micros(), op, path: path.to_string(), other: other.map(str::to_string), byte_size, mod_time }.format();
         let mut g = self.journal.lock().unwrap();
         if g.is_none() {
-            match self.t().open_write(&journal_path(&self.run)) {
+            let opened = self.t().open_write(&journal_path(&self.run)).and_then(|mut w| {
+                w.write_all(state::journal_header().as_bytes())?;
+                Ok(w)
+            });
+            match opened {
                 Ok(w) => *g = Some(w),
                 Err(e) => {
                     output::error(&format!("journal write failed for {}: {}", self.url, e));
@@ -291,6 +295,10 @@ impl History {
     /// A nested sync root at `dir` (specs/state.md, "Nested sync roots"):
     /// use its lines when its file is newer than ours, and keep it current.
     pub fn nested_root(&self, dir: &str, text: &str) {
+        if state::version(text) > state::FORMAT {
+            output::error(&format!("{dir}/.kitchensync/state.txt has a newer format than this KitchenSync reads; its history is not used"));
+            return;
+        }
         let (written, sub) = state::parse_state(text);
         let mut g = self.inner.lock().unwrap();
         if !g.nested.iter().any(|d| d == dir) {

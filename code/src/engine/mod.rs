@@ -69,6 +69,9 @@ fn open_peer(cfg: &Config, index: usize, role: Role, url: String, transport: Arc
             break;
         }
     }
+    if let Some(v) = text.as_deref().map(state::version).filter(|v| *v > state::FORMAT) {
+        return Err(TransportError::io(format!("state.txt is format {v}, newer than this KitchenSync reads (format {}); use a newer KitchenSync", state::FORMAT)));
+    }
     let manifest = match text {
         Some(_) => None,
         None => peer::read_text(t, &meta(state::LEGACY_MANIFEST))?,
