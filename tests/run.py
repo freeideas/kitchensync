@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-26 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-27 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -184,7 +184,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-26)
+# Scenarios (specs/SCENARIOS.md S-01..S-27)
 # --------------------------------------------------------------------------
 
 
@@ -832,6 +832,27 @@ def s26(tmp: Path) -> None:
     check_file_bytes(peer_c / "one.txt", b"one\n")
 
 
+def s27(tmp: Path) -> None:
+    peer_a, peer_b, peer_c = tmp / "A", tmp / "B", tmp / "C"
+    write_file(peer_a / "fresh.txt", b"fresh\n")
+    write_file(peer_a / "edited.txt", b"v1\n")
+    peer_b.mkdir(parents=True, exist_ok=True)
+    peer_c.mkdir(parents=True, exist_ok=True)
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b), str(peer_c)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stdout {setup.stdout!r}")
+    (peer_a / "fresh.txt").unlink()
+    second = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(second, b"sync complete\n")
+    expect(not (peer_b / "fresh.txt").exists(), "B should have lost fresh.txt in the two-peer run")
+    (peer_a / "edited.txt").unlink()
+    future = datetime.now(timezone.utc) + timedelta(minutes=1)
+    write_file(peer_c / "edited.txt", b"v2 edited\n", future.strftime("%Y-%m-%d_%H-%M-%S_%fZ"))
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), str(peer_c)], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b, peer_c):
+        expect(tree(peer) == {"edited.txt": b"v2 edited\n"}, f"user files under {peer}: {tree(peer)}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -859,6 +880,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-24", "A File Displaced In An Earlier Run Is Moved Into Place", s24),
     ("S-25", "Per-Directory Manifests Are Read And Converted", s25),
     ("S-26", "A Newer State Format Is Left Alone", s26),
+    ("S-27", "A Deletion Wins Over The Same Version, Even Right After A Sync", s27),
 ]
 
 

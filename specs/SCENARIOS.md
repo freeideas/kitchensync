@@ -324,6 +324,19 @@ Action: run `released/kitchensync.exe --verbosity error A B C`.
 
 Outcome: the process exits 0 with empty stderr. stdout is exactly three lines: `peer unreachable: <B>: io_error: state.txt is format 99, newer than this KitchenSync reads (format 1); use a newer KitchenSync`, where `<B>` is B as KitchenSync displays it (`file://` and its absolute path), then the first-sync line (A and C have no history), then `sync complete`. B's `.kitchensync/state.txt` is byte-for-byte unchanged, and B has no other file under `.kitchensync/`. `C/one.txt` holds `one\n`.
 
+## S-27: A Deletion Wins Over The Same Version, Even Right After A Sync
+
+Setup, every file written with the current time as its modification time (as a file just created or downloaded would have):
+
+- `A/fresh.txt` exists with bytes `fresh\n`, and `A/edited.txt` with bytes `v1\n`. `B/` and `C/` exist and are empty.
+- Run `released/kitchensync.exe --verbosity error +A B C` and require it to exit 0. All three peers now hold both files.
+- Delete `A/fresh.txt`. Run `released/kitchensync.exe --verbosity error A B` (C is not part of this run) and require it to exit 0.
+- Delete `A/edited.txt`. On C, rewrite `edited.txt` with bytes `v2 edited\n` and a modification time one minute in the future.
+
+Action: run `released/kitchensync.exe --verbosity error A B C`.
+
+Outcome: the process exits 0 with stdout exactly `sync complete\n` and empty stderr. No peer has `fresh.txt`: A deleted it in the earlier run, B lost it then, and C's copy is the version A deleted, so it goes too, although every time involved lies within a few seconds. All three peers hold `edited.txt` with bytes `v2 edited\n`: C edited it after A last saw it, so the edit survives A's deletion.
+
 # Properties
 
 ## P-01: Output Channels

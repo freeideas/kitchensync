@@ -367,11 +367,12 @@ impl DirState {
         self.inner.lock().unwrap().lines.insert(name.to_string(), Line { is_dir: true, mod_time: now, byte_size: -1, last_seen: Some(now), deleted_time: None });
     }
 
-    /// Decision "push to this peer": intended state without `last_seen`.
+    /// Decision "push to this peer": intended state without `last_seen`. The
+    /// peer has not been seen holding this version, so no time is kept: if
+    /// the copy fails, the line can never read as a confirmed deletion.
     pub fn intend_push(&self, name: &str, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
-        let last_seen = g.lines.get(name).and_then(|l| l.last_seen);
-        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen, deleted_time: None });
+        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen: None, deleted_time: None });
         g.outstanding += 1;
     }
 

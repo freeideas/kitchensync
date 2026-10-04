@@ -446,23 +446,27 @@ impl Walker {
         let live: Vec<&View> = contributing.iter().copied().filter(|v| v.live_file().is_some()).collect();
         let max_mt = live.iter().filter_map(|v| v.mt()).max().unwrap();
 
-        // Deletion votes: tombstones, or unconfirmed absences whose last_seen
-        // exceeds the newest live mod_time.
-        let mut estimate: Option<i64> = None;
-        for v in contributing.iter().filter(|v| v.live.is_none()) {
-            let Some(line) = &v.line else { continue };
-            let est = match line.deleted_time {
-                Some(d) => Some(d),
-                None => line.last_seen.filter(|ls| *ls > max_mt + TOL),
-            };
-            if let Some(e) = est {
-                estimate = Some(estimate.map_or(e, |cur: i64| cur.max(e)));
-            }
-        }
-        if let Some(est) = estimate {
-            if est > max_mt + TOL {
-                return Decision::Delete;
-            }
+        // Deletion votes: tombstones, and absences on peers that had confirmed
+        // the entry (rule 4b). A vote removes a live copy when that copy is
+        // the very version the voter last recorded, or when the vote's
+        // deletion estimate is later than the copy's mod_time; the deletion
+        // wins only when it removes every live copy.
+        let votes: Vec<(i64, Option<(i64, i64)>)> = contributing
+            .iter()
+            .filter(|v| v.live.is_none())
+            .filter_map(|v| {
+                let line = v.line.as_ref()?;
+                let est = line.deleted_time.or(line.last_seen)?;
+                let version = (!line.is_dir && line.byte_size >= 0).then_some((line.mod_time, line.byte_size));
+                Some((est, version))
+            })
+            .collect();
+        let removed = |c: &View| {
+            let (mt, size) = (c.mt().unwrap(), c.live_file().unwrap().byte_size);
+            votes.iter().any(|(est, version)| *est > mt + TOL || version.is_some_and(|(vmt, vsize)| vsize == size && within(vmt, mt)))
+        };
+        if !votes.is_empty() && live.iter().all(|c| removed(c)) {
+            return Decision::Delete;
         }
 
         // Existence wins: newest mod_time, larger size breaks ties.
