@@ -43,7 +43,7 @@ The build writes one executable per platform into `./released/`, named so all th
 | macOS    | `released/kitchensync.mac`                                                                            |
 | Linux    | `released/kitchensync.linux` (a normal ELF executable, the format every mainstream distribution runs) |
 
-The macOS file is a plain single-file executable that happens to end in `.app`; it is not an application bundle folder, so run it from a shell rather than double-clicking it in Finder. A Mac builds all three (see "Building all three binaries on a Mac" below); a Linux or Windows machine builds only its own. Whichever files exist are committed so that a clone from GitHub includes ready-to-run binaries without needing the toolchain.
+The macOS file is a plain single-file executable that ends in `.mac`; it is not an application bundle folder, so run it from a shell rather than double-clicking it in Finder. A Mac builds all three (see "Building all three binaries on a Mac" below); a Linux or Windows machine builds only its own. Whichever files exist are committed so that a clone from GitHub includes ready-to-run binaries without needing the toolchain.
 
 Keep them small: build in release mode with symbols stripped (the `[profile.release]` section in `Cargo.toml` does this) and avoid dependencies that bloat the executable. GitHub warns above 50 MB and refuses above 100 MB; the target is a few MB each.
 

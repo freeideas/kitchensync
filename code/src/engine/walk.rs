@@ -33,7 +33,7 @@ pub struct Walker {
 /// last-in-first-out so that the workers stay just ahead of the depth-first
 /// walk, and the number of ready-but-unconsumed listings is capped so they
 /// never run far ahead (a listing goes stale if it waits too long). Nothing
-/// but listing and manifest reading runs ahead; decisions, copies and
+/// but listing (and the repair it may call for) runs ahead; decisions, copies and
 /// displacements happen in the walk, in the usual order.
 pub struct Prefetch {
     inner: Mutex<PrefetchState>,
@@ -324,7 +324,7 @@ impl Walker {
 
     /// `inherited` maps a peer index to the deletion estimate that peer voted
     /// for this directory in its parent (see `PendingDir::deleted`). Inside,
-    /// that vote stands in for the manifest lines the peer no longer has.
+    /// that vote stands in for state lines the peer may no longer have.
     pub fn sync_directory(&self, peers: &[PeerRef], dir: &str, inherited: &HashMap<usize, i64>) -> bool {
         Self::heartbeat(dir);
         // Phase 0/1: the listings, fetched ahead where the prefetch got to
@@ -663,7 +663,7 @@ struct PendingDir {
     recurse: Vec<PeerRef>,
     /// Peers that voted to delete this directory, with their deletion
     /// estimates. The directory is created on them for this run so the walk
-    /// can decide its contents, but it holds no manifest there, so without
+    /// can decide its contents, but it may hold no state lines there, so without
     /// these votes everything inside would look new to them and be copied
     /// back (a folder renamed on one peer would reappear under its old name).
     deleted: HashMap<usize, i64>,

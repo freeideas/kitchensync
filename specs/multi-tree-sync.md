@@ -102,19 +102,11 @@ function sync_directory(peers, path):
 
 If listing still fails after all allowed tries, that peer is excluded from decisions for that directory and its entire subtree (equivalent to an offline peer for that path). The error is logged at `error` level. The peer's state lines for that subtree are carried forward unchanged - no `last_seen` is refreshed and no tombstone is added, so no false deletions are inferred. No files or directories are created, deleted, displaced, or copied on that peer under the failed subtree during this run.
 
-If the failed listing is for the canon peer (`+`), skip decisions for that
-directory and its entire subtree for all peers. No other peer can supply
-authoritative state for that path while canon is unavailable, so no peer files
-and no state lines are changed under that subtree during this run.
+If the failed listing is for the canon peer (`+`), skip decisions for that directory and its entire subtree for all peers. No other peer can supply authoritative state for that path while canon is unavailable, so no peer files and no state lines are changed under that subtree during this run.
 
 If all contributing peers fail listing for a directory (none of the contributing peers remain in `active_peers` for that level), skip decisions for that directory and its entire subtree - no entries are processed and no subordinate peer files are displaced. On the next run, the failed peer participates normally again if listing succeeds.
 
-**Excludes:** Built-in excludes and paths supplied with `-x` are removed from
-the entry union before decisions are made. A matching directory is not recursed
-into. A matching file is not copied or deleted. Excluded paths do not consult
-state lines during the run, and existing entries on any peer are left in
-place; an existing state line for an excluded path is carried forward
-unchanged.
+**Excludes:** Built-in excludes and paths supplied with `-x` are removed from the entry union before decisions are made. A matching directory is not recursed into. A matching file is not copied or deleted. Excluded paths do not consult state lines during the run, and existing entries on any peer are left in place; an existing state line for an excluded path is carried forward unchanged.
 
 ## Subordinate Peers
 
@@ -135,9 +127,7 @@ Always excluded from listings (never synced):
 - Symbolic links (files and directories) - following symlinks could escape the sync root or create loops
 - Special files (devices, FIFOs, sockets)
 
-Excluded by pattern (see sync.md, "Excludes"): the built-in litter patterns,
-each peer's `.kitchensync/ignore`, and `-x` patterns from the command line,
-applied in that order with the last matching pattern winning.
+Excluded by pattern (see sync.md, "Excludes"): the built-in litter patterns, each peer's `.kitchensync/ignore`, and `-x` patterns from the command line, applied in that order with the last matching pattern winning.
 
 ## Reading A Directory
 
@@ -157,44 +147,23 @@ If the `.kitchensync` folder cannot be listed, the peer's listing for the direct
 
 In `--dry-run`, peer-side SWAP recovery during traversal is skipped.
 
-Each direct child of `<dir>/.kitchensync/SWAP/` is one `<encoded-basename>` swap
-directory for the corresponding user entry in the same parent directory. Recover
-every swap directory before the directory's entries are decided.
+Each direct child of `<dir>/.kitchensync/SWAP/` is one `<encoded-basename>` swap directory for the corresponding user entry in the same parent directory. Recover every swap directory before the directory's entries are decided.
 
-"Empty" SWAP directories may still hold operating-system litter; see sync.md,
-"SWAP Directory".
+"Empty" SWAP directories may still hold operating-system litter; see sync.md, "SWAP Directory".
 
 For target `<basename>`:
 
-- `old` exists and target exists: replacement completed; delete `new` if
-  present, move `old` to BAK, and remove the empty SWAP directory.
-- `old` exists, `new` exists, and target is missing: rename `new` to target,
-  move `old` to BAK, and remove the empty SWAP directory.
-- `old` exists, `new` is missing, and target is missing: rename `old` back to
-  target and remove the empty SWAP directory.
-- `old` is missing, `new` exists, and target exists: delete `new` and remove
-  the empty SWAP directory.
-- `old` is missing, `new` exists, and target is missing: delete `new` and
-  remove the empty SWAP directory. Nothing shows that the transfer into `new`
-  finished (a copy moves the existing target to `old` only after the transfer
-  completes, so a copy to a peer that lacked the file never creates `old`).
-  Promoting it could put a partial file in place, and its recent mod_time
-  would make it win over the complete copies elsewhere. The entry is absent
-  on this peer without a confirmed `last_seen`, so the normal rules copy it
-  again.
+- `old` exists and target exists: replacement completed; delete `new` if present, move `old` to BAK, and remove the empty SWAP directory.
+- `old` exists, `new` exists, and target is missing: rename `new` to target, move `old` to BAK, and remove the empty SWAP directory.
+- `old` exists, `new` is missing, and target is missing: rename `old` back to target and remove the empty SWAP directory.
+- `old` is missing, `new` exists, and target exists: delete `new` and remove the empty SWAP directory.
+- `old` is missing, `new` exists, and target is missing: delete `new` and remove the empty SWAP directory. Nothing shows that the transfer into `new` finished (a copy moves the existing target to `old` only after the transfer completes, so a copy to a peer that lacked the file never creates `old`). Promoting it could put a partial file in place, and its recent mod_time would make it win over the complete copies elsewhere. The entry is absent on this peer without a confirmed `last_seen`, so the normal rules copy it again.
 
-Moving `old` to BAK is a displacement of the target path (see sync.md,
-"Displace to BAK"). After recovery, an empty `SWAP/` folder and an empty
-`.kitchensync/` folder below the root are removed.
+Moving `old` to BAK is a displacement of the target path (see sync.md, "Displace to BAK"). After recovery, an empty `SWAP/` folder and an empty `.kitchensync/` folder below the root are removed.
 
-If recovery for a swap directory fails, treat that peer's listing for the
-current directory as failed. The peer is excluded from this directory subtree
-using the normal listing-error rules, and its state lines for the subtree are
-carried forward unchanged.
+If recovery for a swap directory fails, treat that peer's listing for the current directory as failed. The peer is excluded from this directory subtree using the normal listing-error rules, and its state lines for the subtree are carried forward unchanged.
 
-Expired BAK folders and journals are deleted at startup (see state.md, "BAK"),
-and tombstones older than `--keep-del-days` are dropped when the state is
-written, so the walk does no cleanup of its own.
+Expired BAK folders and journals are deleted at startup (see state.md, "BAK"), and tombstones older than `--keep-del-days` are dropped when the state is written, so the walk does no cleanup of its own.
 
 ## Entry Classification
 
@@ -225,23 +194,13 @@ The canonical peer's state wins unconditionally:
 
 Only contributing (non-subordinate) peers participate in decisions:
 
-1. **All contributing peers unchanged and matching** -> the unchanged entry is
-   the group outcome. No copy is needed between contributing peers that already
-   match, but any active peer that lacks the entry or has the wrong type
-   (including subordinate peers) is brought into conformance.
+1. **All contributing peers unchanged and matching** -> the unchanged entry is the group outcome. No copy is needed between contributing peers that already match, but any active peer that lacks the entry or has the wrong type (including subordinate peers) is brought into conformance.
 2. **Modified** -> newest mod_time wins; push to all that don't match
 3. **New** -> newest mod_time wins; push to all peers that lack it (including peers with no state line)
-4. **Deleted + existing** -> compare the deletion estimate against the existing file's mod_time. The deletion estimate is the `last_seen` or `deleted_time` on the absent peer's state line (see 4b for which applies). If multiple peers have deleted the entry, use the most recent estimate among the deleting peers. If the deletion estimate > mod_time, deletion wins (displace the file on all peers that have it). If mod_time >= the deletion estimate, the existing file wins (push to peers that lack it)
-4b. **Absent-unconfirmed** (absent, the peer has a state line for the entry with `deleted_time` `-`) -> compare that line's `last_seen` against the max mod_time of peers that have the entry. If `last_seen` > max mod_time, this is a deletion - the entry was confirmed present on this peer after the latest modification anywhere, and has since been removed. Apply rule 4 using `last_seen` as the deletion estimate. If `last_seen` <= max mod_time (or `last_seen` is `-`), this is a failed copy or the peer has never successfully received the file - re-enqueue the copy, no deletion vote
+4. **Deleted + existing** -> compare the deletion estimate against the existing file's mod_time. The deletion estimate is the `last_seen` or `deleted_time` on the absent peer's state line (see 4b for which applies). If multiple peers have deleted the entry, use the most recent estimate among the deleting peers. If the deletion estimate > mod_time, deletion wins (displace the file on all peers that have it). If mod_time >= the deletion estimate, the existing file wins (push to peers that lack it) 4b. **Absent-unconfirmed** (absent, the peer has a state line for the entry with `deleted_time` `-`) -> compare that line's `last_seen` against the max mod_time of peers that have the entry. If `last_seen` > max mod_time, this is a deletion - the entry was confirmed present on this peer after the latest modification anywhere, and has since been removed. Apply rule 4 using `last_seen` as the deletion estimate. If `last_seen` <= max mod_time (or `last_seen` is `-`), this is a failed copy or the peer has never successfully received the file - re-enqueue the copy, no deletion vote
 5. **Same mod_time, different size** -> larger file wins
 6. **Ties** -> keep data (existence over deletion, larger over smaller)
-7. **Exact tie** (mod_time within tolerance and equal byte_size) -> the entries
-   are treated as identical, even if their bytes differ. No copy is enqueued
-   between the tied peers; each keeps its current content, and only state
-   lines are updated. Content is never read or hashed to break a tie -
-   decisions use only mod_time and byte_size. When another peer needs the
-   entry, any one tied peer may be chosen as the copy source; the recorded
-   winning mod_time and byte_size are the tied values either way.
+7. **Exact tie** (mod_time within tolerance and equal byte_size) -> the entries are treated as identical, even if their bytes differ. No copy is enqueued between the tied peers; each keeps its current content, and only state lines are updated. Content is never read or hashed to break a tie - decisions use only mod_time and byte_size. When another peer needs the entry, any one tied peer may be chosen as the copy source; the recorded winning mod_time and byte_size are the tied values either way.
 
 Peers with no state line for the entry ("never had it") do not vote - they are simply targets for propagation once a winner is decided.
 
@@ -270,40 +229,15 @@ A canon peer (`+`) overrides all of this as usual: canon's contents win whether 
 
 Directories do not use mod_time for decision-making. Directory mod_times are filesystem bookkeeping (they change when children are added or removed) and vary in precision across filesystem types - they do not represent meaningful user intent.
 
-Directory decisions use existence and the state lines for the directory
-itself (never the directory's own mod_time):
+Directory decisions use existence and the state lines for the directory itself (never the directory's own mod_time):
 
-- Canon peer (`+`) overrides as usual: canon has it -> create everywhere;
-  canon lacks it -> delete everywhere.
-- If every contributing peer that votes has the directory live, it should
-  exist on all peers. Create it on active peers that lack it, and recurse.
-- If at least one contributing peer has the directory live and at least one
-  contributing peer votes deletion - absent in the current listing with a
-  state line for the directory - the directory survives for this run: it
-  is created on active peers that lack it, and the walk recurses into it.
-  The decision is then made entry by entry inside, where the real evidence
-  is:
-  - The deletion estimate is the absent peer's line's `deleted_time` if set,
-    else its `last_seen` (rule 4b's estimate). If several peers vote
-    deletion, use the most recent estimate among them.
-  - Inside the directory, file rules 4 and 4b remove every entry that is
-    older than that deletion estimate, while anything newer survives and
-    propagates by the normal file rules.
-    The deleting peer may have no state lines inside the directory (they
-    are dropped when a directory stops existing on a peer), so its vote is
-    carried down: every entry it lacks inside and has no line for, at any
-    depth, is treated as tombstoned on that peer with the deletion estimate. Without this, a directory renamed on one peer
-    would be copied back to it under the old name. A directory that was deleted on one
-    peer and left untouched on another therefore empties out, and a
-    directory that was deleted on one peer while new content arrived on
-    another keeps just the new content.
-  - If, after recursing, no live entry remains in the directory on any peer,
-    the directory itself is displaced to BAK/ (as an empty directory) on
-    every active peer that still has it, and its line is tombstoned on those
-    peers.
-  - Nothing is listed recursively to decide this. The choice to keep the
-    directory for one more level costs at most one extra pass and never
-    risks deleting content that is newer than the deletion.
+- Canon peer (`+`) overrides as usual: canon has it -> create everywhere; canon lacks it -> delete everywhere.
+- If every contributing peer that votes has the directory live, it should exist on all peers. Create it on active peers that lack it, and recurse.
+- If at least one contributing peer has the directory live and at least one contributing peer votes deletion - absent in the current listing with a state line for the directory - the directory survives for this run: it is created on active peers that lack it, and the walk recurses into it. The decision is then made entry by entry inside, where the real evidence is:
+  - The deletion estimate is the absent peer's line's `deleted_time` if set, else its `last_seen` (rule 4b's estimate). If several peers vote deletion, use the most recent estimate among them.
+  - Inside the directory, file rules 4 and 4b remove every entry that is older than that deletion estimate, while anything newer survives and propagates by the normal file rules. The deleting peer may have no state lines inside the directory (they are dropped when a directory stops existing on a peer), so its vote is carried down: every entry it lacks inside and has no line for, at any depth, is treated as tombstoned on that peer with the deletion estimate. Without this, a directory renamed on one peer would be copied back to it under the old name. A directory that was deleted on one peer and left untouched on another therefore empties out, and a directory that was deleted on one peer while new content arrived on another keeps just the new content.
+  - If, after recursing, no live entry remains in the directory on any peer, the directory itself is displaced to BAK/ (as an empty directory) on every active peer that still has it, and its line is tombstoned on those peers.
+  - Nothing is listed recursively to decide this. The choice to keep the directory for one more level costs at most one extra pass and never risks deleting content that is newer than the deletion.
 - If no contributing peer has the directory live in its listing, at least one contributing peer has a state line for the directory, and every contributing peer with a state line for the directory is absent in the current listing, delete it on all remaining peers (displace to BAK/). A line with `deleted_time` set is already a recorded deletion. A line with `deleted_time` `-` becomes a confirmed absence for this run and is tombstoned using the normal state update rule.
 - A contributing peer with no state line for the directory has no opinion: it neither votes deletion nor blocks one - consistent with the file decision rules where peers with no line do not vote. A peer with the directory live votes for existence regardless of lines.
 - If no contributing peer has the directory - neither live in its listing nor as a state line (with or without tombstone) - the directory does not exist in the group's view. Subordinate peers that have it are displaced to BAK/.
@@ -322,10 +256,7 @@ Each peer's lines for a directory are assembled while that directory is being de
 
 - Listed state may be recorded immediately because the entry has already been observed on that peer.
 - Queued file-copy destinations may be recorded as intended state before the copy runs, but their `last_seen` stays `-` until the copy succeeds.
-- Inline filesystem operations such as directory creation and displacement to
-  BAK/ change the affected peer's record only after the operation succeeds.
-  If the operation fails, that peer's existing line is carried forward
-  unchanged.
+- Inline filesystem operations such as directory creation and displacement to BAK/ change the affected peer's record only after the operation succeeds. If the operation fails, that peer's existing line is carried forward unchanged.
 
 - **Entry confirmed present, unchanged** on a peer: keep the existing line exactly as it is, `last_seen` included. "Unchanged" means the line is not a tombstone and has the same kind; for a file, also the same byte_size, a mod_time within the 5-second tolerance, and a `last_seen` later than that mod_time plus the tolerance. A tree where every entry is unchanged therefore produces the same state, which is not rewritten, so a run over an unchanged tree only reads. Refreshing `last_seen` on every run would change no decision except one rare conflict: a file deleted on this peer while a peer that missed the intervening runs edited it. With the older `last_seen`, the edit wins and the file is copied back; the stored value is never later than the truth, so no deletion is ever inferred that a fresh value would not also infer.
 - **Entry confirmed present, otherwise** on a peer: write a line with the current mod_time, byte_size, `last_seen` set to a freshly generated timestamp, and `deleted_time` `-`.

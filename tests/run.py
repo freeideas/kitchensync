@@ -792,6 +792,7 @@ def s25(tmp: Path) -> None:
         )
     write_file(peer_b / "sub" / "gone.txt", b"gone\n", when)
     write_file(peer_b / "sub" / ".kitchensync" / "BAK" / "2024-01-15_10-00-00_000000Z" / "old.txt", b"old\n")
+    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / "2024-01-15_10-00-00_000000Z" / "._old.txt", bytes(4096))
     result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
     assert_result(result, b"sync complete\n")
     for peer in (peer_a, peer_b):
@@ -800,7 +801,8 @@ def s25(tmp: Path) -> None:
         expect((peer / ".kitchensync" / "state.txt").is_file(), f"{peer}: missing .kitchensync/state.txt")
     bak = dict(bak_contents(peer_b))
     expect(bak.get("2024-01-15_10-00-00_000000Z") == {"sub/old.txt": b"old\n"}, f"B's BAK: {bak}")
-    expect(merged_bak_files(peer_b).get("sub/gone.txt") == b"gone\n", f"B's BAK should hold sub/gone.txt: {bak}")
+    expect(sorted(merged_bak_files(peer_b)) == ["sub/gone.txt", "sub/old.txt"], f"files in B's BAK: {bak}")
+    expect(merged_bak_files(peer_b)["sub/gone.txt"] == b"gone\n", f"B's BAK should hold sub/gone.txt: {bak}")
 
 
 SCENARIOS: list[tuple[str, str, "callable"]] = [

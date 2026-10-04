@@ -205,13 +205,15 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
                 }
             };
             let to_dir = super::peer::meta(&format!("BAK/{}/{}", s.name, dir));
-            if !items.is_empty() {
+            if !items.iter().all(is_litter) {
                 if let Err(e) = peer.ensure_dir(&to_dir) {
                     fail("making BAK folder", &e);
                     continue;
                 }
             }
-            for it in &items {
+            // Litter is not moved: macOS carries a `._` file along with its
+            // file on exFAT, and any left behind is deleted with the folder.
+            for it in items.iter().filter(|e| !is_litter(e)) {
                 if let Err(e) = t.rename(&join(&from_dir, &it.name), &join(&to_dir, &it.name)) {
                     fail("moving BAK entry", &e);
                 }

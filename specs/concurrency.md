@@ -2,30 +2,15 @@
 
 ## Copy Concurrency
 
-KitchenSync limits total file-copy work, not connections. By default, at most
-5 file copies may be active at one time across the whole run.
+KitchenSync limits total file-copy work, not connections. By default, at most 5 file copies may be active at one time across the whole run.
 
-`--parallel N` sets the global maximum number of active file copies. A copy counts
-against this limit whether it is `file://` to `file://`, `file://` to `sftp://`,
-`sftp://` to `file://`, or `sftp://` to `sftp://`.
+`--parallel N` sets the global maximum number of active file copies. A copy counts against this limit whether it is `file://` to `file://`, `file://` to `sftp://`, `sftp://` to `file://`, or `sftp://` to `sftp://`.
 
-Directory listing, state and journal writes, directory creation, and BAK/SWAP
-cleanup do not count as file copies. They may still run concurrently where the
-sync algorithm requires it, but they must not allow more than `--parallel` active
-file-copy operations.
+Directory listing, state and journal writes, directory creation, and BAK/SWAP cleanup do not count as file copies. They may still run concurrently where the sync algorithm requires it, but they must not allow more than `--parallel` active file-copy operations.
 
-Copying is incremental. KitchenSync does not first scan the whole tree and then
-start a copy phase. As soon as traversal finds copy work in an early directory,
-that work may occupy available copy slots while later directories are still
-being scanned. No copy waits for the walk to end, including a copy that turns
-out to be a move of a file the destination already holds (see sync.md,
-"Reusing A Displaced File").
+Copying is incremental. KitchenSync does not first scan the whole tree and then start a copy phase. As soon as traversal finds copy work in an early directory, that work may occupy available copy slots while later directories are still being scanned. No copy waits for the walk to end, including a copy that turns out to be a move of a file the destination already holds (see sync.md, "Reusing A Displaced File").
 
-There is no per-peer, per-host, or per-connection transfer limit in the user
-interface. Startup keeps the selected peer connection state as the reachable
-peer handle, including the established SSH/SFTP session and remote root path for
-an `sftp://` peer, but this must not change the externally visible rule:
-`--parallel` means max active file copies for the whole run.
+There is no per-peer, per-host, or per-connection transfer limit in the user interface. Startup keeps the selected peer connection state as the reachable peer handle, including the established SSH/SFTP session and remote root path for an `sftp://` peer, but this must not change the externally visible rule: `--parallel` means max active file copies for the whole run.
 
 | Setting                   | Default | Global flag      |
 | ------------------------- | ------- | ---------------- |
@@ -35,120 +20,63 @@ an `sftp://` peer, but this must not change the externally visible rule:
 | SSH connection timeout    | 30s     | `--timeout-conn` |
 | SFTP idle keep-alive TTL  | 30s     | `--timeout-idle` |
 
-`--timeout-conn` and `--timeout-idle` apply to SFTP connection management
-only. They do not affect local `file://` peers.
+`--timeout-conn` and `--timeout-idle` apply to SFTP connection management only. They do not affect local `file://` peers.
 
 ## Fallback URLs
 
-A peer can have multiple URLs grouped in square brackets on the command line.
-These are fallback network paths to the same data. URLs are tried in order; the
-first that connects wins.
+A peer can have multiple URLs grouped in square brackets on the command line. These are fallback network paths to the same data. URLs are tried in order; the first that connects wins.
 
 ```text
 kitchensync [sftp://192.168.1.50/photos,sftp://nas.vpn/photos] /local/photos
 ```
 
-Per-URL query settings apply only to connection establishment and SFTP
-keep-alive behavior:
+Per-URL query settings apply only to connection establishment and SFTP keep-alive behavior:
 
 ```text
 kitchensync "[sftp://192.168.1.50/photos?timeout-conn=20,sftp://nas.vpn/photos?timeout-conn=60&timeout-idle=10]" /local/photos
 ```
 
-`parallel` is not a per-URL setting. If a URL contains `parallel`,
-argument validation must reject it with a clear error.
+`parallel` is not a per-URL setting. If a URL contains `parallel`, argument validation must reject it with a clear error.
 
 ## Connection Establishment
 
 At startup, each peer selects one winning URL:
 
 1. Try the peer's primary URL first, then each fallback URL in order.
-2. For SFTP URLs, `--timeout-conn` or the URL's `timeout-conn` parameter bounds the SSH handshake.
-   If it expires, try the next URL. After the handshake succeeds, check whether
-   the peer's root path exists on the remote server. In normal runs, if it does
-   not exist, create it and any missing parents via SFTP. In `--dry-run`, do not
-   create it; treat that URL as failed for this run. If creation fails in a
-   normal run, the URL is treated as failed.
-3. For `file://` URLs, the connection is a lightweight local handle. Connection
-   timeout and keep-alive settings do not apply. In normal runs, if the local
-   path does not exist, create it and any missing parents before connecting. In
-   `--dry-run`, do not create missing local paths; treat that URL as failed for
-   this run.
-4. First successful connection wins. The reachable peer handle records that
-   connection and root. Remaining URLs are not tried.
+2. For SFTP URLs, `--timeout-conn` or the URL's `timeout-conn` parameter bounds the SSH handshake. If it expires, try the next URL. After the handshake succeeds, check whether the peer's root path exists on the remote server. In normal runs, if it does not exist, create it and any missing parents via SFTP. In `--dry-run`, do not create it; treat that URL as failed for this run. If creation fails in a normal run, the URL is treated as failed.
+3. For `file://` URLs, the connection is a lightweight local handle. Connection timeout and keep-alive settings do not apply. In normal runs, if the local path does not exist, create it and any missing parents before connecting. In `--dry-run`, do not create missing local paths; treat that URL as failed for this run.
+4. First successful connection wins. The reachable peer handle records that connection and root. Remaining URLs are not tried.
 5. If all URLs fail, the peer is unreachable for the run.
 
-After startup, all operations for a reachable peer use that peer's winning URL
-for the remainder of the run. Fallback URLs are not retried again during the
-same run after a winner is selected. A later directory-listing failure is
-retried as described in `multi-tree-sync.md`; if it still fails, it becomes a
-listing error for that subtree. A later transfer failure is a transfer failure.
+After startup, all operations for a reachable peer use that peer's winning URL for the remainder of the run. Fallback URLs are not retried again during the same run after a winner is selected. A later directory-listing failure is retried as described in `multi-tree-sync.md`; if it still fails, it becomes a listing error for that subtree. A later transfer failure is a transfer failure.
 
 ## Directory Listing
 
-During multi-tree traversal, directory listings for all reachable peers at each
-directory level must be issued concurrently, not sequentially. The
-implementation starts listing operations for every reachable peer at that
-directory level before awaiting any listing result.
+During multi-tree traversal, directory listings for all reachable peers at each directory level must be issued concurrently, not sequentially. The implementation starts listing operations for every reachable peer at that directory level before awaiting any listing result.
 
-Listings are also fetched ahead of the walk. A small pool of listing threads
-(8) works through the directories the walk has not reached yet, in the walk's
-own order, and keeps a bounded number of finished listings (64) ready for it.
-As soon as a listing lands, the subdirectories it shows are queued too, on the
-peers that list them, so even a deep chain of single subdirectories is fetched
-ahead. A listing is mostly waiting on round trips, so overlapping them hides
-latency, which matters most on a tree of many small directories over SFTP.
-Listing makes no decisions, so running it ahead of the walk is safe (the SWAP
-recovery and per-directory conversion it may do touch only what an earlier
-run left behind, see multi-tree-sync.md, "Reading A Directory"); the walk uses a
-ready listing only
-if it was taken on exactly the peers the walk wants for that directory, and
-lists the directory itself otherwise (a directory the walk created on a peer,
-or a peer it dropped after a failure). Anything fetched for a directory the
-walk has passed is discarded. The order in which entries are decided and acted
-on, and the order of the progress lines, are unchanged: only listing runs
-ahead, never decisions, copies, or displacements.
+Listings are also fetched ahead of the walk. A small pool of listing threads (8) works through the directories the walk has not reached yet, in the walk's own order, and keeps a bounded number of finished listings (64) ready for it. As soon as a listing lands, the subdirectories it shows are queued too, on the peers that list them, so even a deep chain of single subdirectories is fetched ahead. A listing is mostly waiting on round trips, so overlapping them hides latency, which matters most on a tree of many small directories over SFTP. Listing makes no decisions, so running it ahead of the walk is safe (the SWAP recovery and per-directory conversion it may do touch only what an earlier run left behind, see multi-tree-sync.md, "Reading A Directory"); the walk uses a ready listing only if it was taken on exactly the peers the walk wants for that directory, and lists the directory itself otherwise (a directory the walk created on a peer, or a peer it dropped after a failure). Anything fetched for a directory the walk has passed is discarded. The order in which entries are decided and acted on, and the order of the progress lines, are unchanged: only listing runs ahead, never decisions, copies, or displacements.
 
-An `sftp://` peer is served over several SFTP channels (4) on its one SSH
-connection, because OpenSSH answers each channel from its own single-threaded
-`sftp-server` process, so requests on one channel wait for each other. Each
-operation picks a channel and completes on it; a file handle stays on the
-channel that opened it. Extra channels the server refuses are simply not used.
+An `sftp://` peer is served over several SFTP channels (4) on its one SSH connection, because OpenSSH answers each channel from its own single-threaded `sftp-server` process, so requests on one channel wait for each other. Each operation picks a channel and completes on it; a file handle stays on the channel that opened it. Extra channels the server refuses are simply not used.
 
 ## Copy Queue Tries
 
-Queued file-copy work carries its own try count. The queue implementation is
-not specified: it may be in memory, on disk, or a mix. The required behavior is
-that each queued copy remembers how many times it has already been tried.
+Queued file-copy work carries its own try count. The queue implementation is not specified: it may be in memory, on disk, or a mix. The required behavior is that each queued copy remembers how many times it has already been tried.
 
-`--retries-copy` is the maximum number of total tries for a queued copy,
-including the first try. When a copy try fails, KitchenSync increments that
-queued copy's try count. If the try count has not reached `--retries-copy`, the
-copy is moved to the back of the queue and other queued work continues. If the
-try count has reached `--retries-copy`, the copy is marked failed for this run
-and is not requeued.
+`--retries-copy` is the maximum number of total tries for a queued copy, including the first try. When a copy try fails, KitchenSync increments that queued copy's try count. If the try count has not reached `--retries-copy`, the copy is moved to the back of the queue and other queued work continues. If the try count has reached `--retries-copy`, the copy is marked failed for this run and is not requeued.
 
-Try limits are global behavior. They apply the same way to local copies, SFTP
-copies, and mixed-scheme copies.
+Try limits are global behavior. They apply the same way to local copies, SFTP copies, and mixed-scheme copies.
 
 ## Progress Output
 
-At `info`, `debug`, and `trace` verbosity, KitchenSync emits one plain line per
-action to stdout during sync execution, in the order the actions happen. At
-`error` verbosity, these progress lines are suppressed. There is no live status
-screen, progress bar, percentage, scanned-directory indicator, or terminal
-control sequence. Output is identical whether or not stdout is a terminal.
+At `info`, `debug`, and `trace` verbosity, KitchenSync emits one plain line per action to stdout during sync execution, in the order the actions happen. At `error` verbosity, these progress lines are suppressed. There is no live status screen, progress bar, percentage, scanned-directory indicator, or terminal control sequence. Output is identical whether or not stdout is a terminal.
 
-The first progress line of every normal (non-dry-run) run is the rollback hint
-described in sync.md, "Logging". It is printed once, right after startup
-succeeds and before any action line:
+The first progress line of every normal (non-dry-run) run is the rollback hint described in sync.md, "Logging". It is printed once, right after startup succeeds and before any action line:
 
 ```text
 undo later with: kitchensync --rollback 2024-03-05_08-00-01_120394Z /photos sftp://user@host/photos
 ```
 
-Every line after it is an action code, a single space, then the
-slash-separated relative path from the sync root:
+Every line after it is an action code, a single space, then the slash-separated relative path from the sync root:
 
 ```text
 1C2 path/to/file.ext
@@ -158,47 +86,23 @@ X23 path/to/file.ext
 R1 path/to/file.ext
 ```
 
-The digits around the action letter name peers by their position on the
-command line: the first peer is `1`, the second `2`, and so on. Positions past
-`9` continue as lower-case base-36 digits (`a` is the tenth peer, `z` the
-thirty-fifth); anything beyond that prints as `?`. The digit is the peer's
-position among all peers named on the command line, including a `+` canon peer
-and a `-` subordinate peer, so it does not change with the peer's role.
+The digits around the action letter name peers by their position on the command line: the first peer is `1`, the second `2`, and so on. Positions past `9` continue as lower-case base-36 digits (`a` is the tenth peer, `z` the thirty-fifth); anything beyond that prints as `?`. The digit is the peer's position among all peers named on the command line, including a `+` canon peer and a `-` subordinate peer, so it does not change with the peer's role.
 
-- `<src>C<dsts> <relpath>` - the file is being copied from peer `<src>` to each
-  peer in `<dsts>`, one digit per receiving peer. One line per path, regardless
-  of how many peers receive it.
-- `M<peer> <relpath>` - instead of being copied to that peer, the file is
-  being moved into place from elsewhere on the same peer (see sync.md, "Moved
-  Files"). One line per receiving peer.
-- `X<peers> <relpath>` - the path is being deleted (displaced to BAK/) on each
-  peer in `<peers>`. One line per path. Files and directories use the same
-  letter.
-- `R<peer> <relpath>` - the path is being restored from BAK/ on that peer
-  during a rollback (see sync.md, "Rollback"). One line per path.
-- `S <relpath>` - the walk is still scanning and has had nothing else to say
-  for 30 seconds; `<relpath>` is the directory whose listing is starting at
-  that moment (`.` for the sync root). It exists so a long quiet walk of an
-  unchanged tree does not look hung. It is printed at most once per 30 seconds
-  of silence, and never when other lines are flowing.
+- `<src>C<dsts> <relpath>` - the file is being copied from peer `<src>` to each peer in `<dsts>`, one digit per receiving peer. One line per path, regardless of how many peers receive it.
+- `M<peer> <relpath>` - instead of being copied to that peer, the file is being moved into place from elsewhere on the same peer (see sync.md, "Moved Files"). One line per receiving peer.
+- `X<peers> <relpath>` - the path is being deleted (displaced to BAK/) on each peer in `<peers>`. One line per path. Files and directories use the same letter.
+- `R<peer> <relpath>` - the path is being restored from BAK/ on that peer during a rollback (see sync.md, "Rollback"). One line per path.
+- `S <relpath>` - the walk is still scanning and has had nothing else to say for 30 seconds; `<relpath>` is the directory whose listing is starting at that moment (`.` for the sync root). It exists so a long quiet walk of an unchanged tree does not look hung. It is printed at most once per 30 seconds of silence, and never when other lines are flowing.
 
-A copy of a file of 1 MiB or more prints nothing when the walk decides it.
-When it takes its copy slot, it prints `<src>C<dst> <relpath>` for a transfer
-or `M<dst> <relpath>` for a move, one line per receiving peer. In a dry run
-every copy prints its line when it is decided: `M<dst>` for a likely move, and
-`<src>C<dsts>` otherwise.
+A copy of a file of 1 MiB or more prints nothing when the walk decides it. When it takes its copy slot, it prints `<src>C<dst> <relpath>` for a transfer or `M<dst> <relpath>` for a move, one line per receiving peer. In a dry run every copy prints its line when it is decided: `M<dst>` for a likely move, and `<src>C<dsts>` otherwise.
 
-A type conflict prints an `X` line for the directory being displaced followed
-by the `C` line for the file replacing it.
+A type conflict prints an `X` line for the directory being displaced followed by the `C` line for the file replacing it.
 
-No line is emitted for directory creation, listing, state work, or BAK
-cleanup. These lines are `info`-level. Errors and the final `sync complete`
-message are separate output and remain visible.
+No line is emitted for directory creation, listing, state work, or BAK cleanup. These lines are `info`-level. Errors and the final `sync complete` message are separate output and remain visible.
 
 ## Trace Logging
 
-When verbosity level is `trace`, include copy-slot acquire and release events
-in the plain logs:
+When verbosity level is `trace`, include copy-slot acquire and release events in the plain logs:
 
 ```text
 copy-slots active=<n>/<max>
