@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::Role;
 use crate::output;
@@ -18,7 +18,7 @@ use super::moves::Index;
 pub const META: &str = ".kitchensync";
 
 /// How often a long run saves what it has learned so far.
-const CHECKPOINT: Duration = Duration::from_secs(300);
+pub const CHECKPOINT: Duration = Duration::from_secs(300);
 
 pub struct Peer {
     pub index: usize,
@@ -127,8 +127,7 @@ impl Peer {
         let _one = self.history.write_lock.lock().unwrap();
         let cutoff = now_micros() - (self.keep_del_days as i64) * 86_400 * 1_000_000;
         let (body, nested) = {
-            let mut g = self.history.inner.lock().unwrap();
-            g.last_write = Instant::now();
+            let g = self.history.inner.lock().unwrap();
             let body = state::serialize_body(&g.tree, cutoff, "");
             if body == g.written_body {
                 return;
@@ -153,13 +152,6 @@ impl Peer {
         }
     }
 
-    /// Save progress during a long run.
-    fn checkpoint(&self) {
-        let due = self.history.inner.lock().unwrap().last_write.elapsed() >= CHECKPOINT;
-        if due {
-            self.write_state();
-        }
-    }
 }
 
 /// See `Peer::tag`. Positions past 35 all print as `?`.
@@ -209,7 +201,6 @@ struct HistInner {
     written_body: String,
     /// Nested sync roots found during the run, rewritten at the end.
     nested: Vec<String>,
-    last_write: Instant,
 }
 
 fn under(dir: &str, prefix: &str) -> bool {
@@ -221,7 +212,7 @@ impl History {
         let (written, tree) = text.map(state::parse_state).unwrap_or_default();
         let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
         let written_body = if text.is_some() { state::serialize_body(&tree, cutoff, "") } else { String::new() };
-        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), last_write: Instant::now() }), write_lock: Mutex::new(()) }
+        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new() }), write_lock: Mutex::new(()) }
     }
 
     /// The lines for `dir`'s children.
@@ -440,7 +431,6 @@ impl DirState {
             g.lines.clone()
         };
         self.peer.history.settle(&self.dir, lines);
-        self.peer.checkpoint();
     }
 }
 

@@ -156,19 +156,41 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
     let queue = CopyQueue::new(cfg.parallel, cfg.retries_copy, peers.clone());
     let workers = queue.start_workers();
     let walker = walk::Walker { cfg: cfg.clone(), queue: Arc::clone(&queue), ignore: build_ignore(cfg, &peers), prefetch: walk::Prefetch::new() };
+    // Save what the run has learned every few minutes, on a thread of its
+    // own so a slow peer never holds up the walk or a copy.
+    let done = (std::sync::Mutex::new(false), std::sync::Condvar::new());
     std::thread::scope(|s| {
-        for _ in 0..walk::PREFETCH_THREADS {
-            s.spawn(|| walker.prefetch_worker());
-        }
-        walker.sync_directory(&peers, "", &Default::default());
-        walker.prefetch.stop();
+        s.spawn(|| {
+            let mut stop = done.0.lock().unwrap();
+            loop {
+                stop = done.1.wait_timeout(stop, peer::CHECKPOINT).unwrap().0;
+                if *stop {
+                    return;
+                }
+                drop(stop);
+                for p in &peers {
+                    p.write_state();
+                }
+                stop = done.0.lock().unwrap();
+            }
+        });
+        std::thread::scope(|w| {
+            for _ in 0..walk::PREFETCH_THREADS {
+                w.spawn(|| walker.prefetch_worker());
+            }
+            walker.sync_directory(&peers, "", &Default::default());
+            walker.prefetch.stop();
+        });
+        queue.close_and_wait(workers);
+        *done.0.lock().unwrap() = true;
+        done.1.notify_all();
     });
-    queue.close_and_wait(workers);
     for p in &peers {
         p.write_state();
         p.close_journal();
-        if !cfg.dry_run {
-            // The root's own per-directory manifest is now in the state file.
+        // The root's own per-directory manifest is now in the state file,
+        // once that file is there.
+        if !cfg.dry_run && fsops::exists(p.t(), &meta(state::STATE)).unwrap_or(false) {
             for n in ["manifest.txt", "manifest.txt.new", "manifest.txt.old"] {
                 let _ = p.t().delete_file(&meta(n));
             }
