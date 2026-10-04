@@ -78,11 +78,7 @@ fn open_peer(cfg: &Config, index: usize, role: Role, url: String, transport: Arc
         history.settle("", state::parse_manifest(m));
     }
     let had_history = text.is_some() || manifest.is_some();
-    let p = Peer::new(index, role, url, transport, had_history, run.to_string(), cfg.dry_run, cfg.keep_del_days, history);
-    if !cfg.dry_run && cfg.mode == Mode::Sync {
-        fsops::cleanup_root(&p, cfg.keep_bak_days);
-    }
-    Ok(p)
+    Ok(Peer::new(index, role, url, transport, had_history, run.to_string(), cfg.dry_run, cfg.keep_del_days, history))
 }
 
 /// Fill a peer's move index: its large live files, and the files its
@@ -194,6 +190,9 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
             for n in ["manifest.txt", "manifest.txt.new", "manifest.txt.old"] {
                 let _ = p.t().delete_file(&meta(n));
             }
+        }
+        if !cfg.dry_run {
+            fsops::cleanup_root(p, cfg.keep_bak_days);
         }
     }
 

@@ -306,11 +306,11 @@ Setup, writing manifests by hand in the per-directory layout (see state.md, "Per
 
 - `A/sub/keep.txt` and `B/sub/keep.txt` exist with bytes `keep\n`. `B/sub/gone.txt` exists with bytes `gone\n`; A has no `gone.txt`.
 - On both peers, `.kitchensync/manifest.txt` holds the line `sub	d	2024-01-01_10-00-00_000000Z	-1	2024-02-01_10-00-00_000000Z	-	-`, and `sub/.kitchensync/manifest.txt` holds the lines `gone.txt	f	2024-01-01_10-00-00_000000Z	5	2024-02-01_10-00-00_000000Z	-	-` and `keep.txt	f	2024-01-01_10-00-00_000000Z	5	2024-02-01_10-00-00_000000Z	-	-` (fields separated by single tabs).
-- `B/sub/.kitchensync/BAK/2024-01-15_10-00-00_000000Z/old.txt` exists with bytes `old\n`, and beside it `._old.txt` with 4096 zero bytes (the litter macOS leaves on exFAT).
+- `B/sub/.kitchensync/BAK/<T>/old.txt` exists with bytes `old\n`, where `<T>` is a timestamp one day before the run (recent enough not to expire), and beside it `._old.txt` with 4096 zero bytes (the litter macOS leaves on exFAT). `B/sub/.kitchensync/BAK/<T2>/manifest.txt`, with `<T2>` a microsecond after `<T>`, holds the line `keep.txt	f	2024-01-01_10-00-00_000000Z	5	2024-01-02_10-00-00_000000Z	-	-` (an archived manifest).
 
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
-Outcome: the process exits 0. stdout is exactly `sync complete\n` (both peers have history, so there is no first-sync line). stderr is empty. The user files under both peers are exactly `sub/keep.txt`: B's `gone.txt` is displaced, because A's manifest shows A had it and lost it. Neither `A/sub/.kitchensync` nor `B/sub/.kitchensync` exists. Both peers have `.kitchensync/state.txt`. The files in B's BAK are exactly `sub/old.txt` with bytes `old\n`, in the directory `2024-01-15_10-00-00_000000Z`, and `sub/gone.txt` with bytes `gone\n`.
+Outcome: the process exits 0. stdout is exactly `sync complete\n` (both peers have history, so there is no first-sync line). stderr is empty. The user files under both peers are exactly `sub/keep.txt`: B's `gone.txt` is displaced, because A's manifest shows A had it and lost it. Neither `A/sub/.kitchensync` nor `B/sub/.kitchensync` exists. Both peers have `.kitchensync/state.txt`. The files in B's BAK are exactly `sub/old.txt` with bytes `old\n`, in the directory `<T>`, and `sub/gone.txt` with bytes `gone\n`.
 
 # Properties
 

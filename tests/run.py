@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -791,8 +791,15 @@ def s25(tmp: Path) -> None:
             f"gone.txt\tf\t{when}\t5\t{seen}\t-\t-\nkeep.txt\tf\t{when}\t5\t{seen}\t-\t-\n".encode(),
         )
     write_file(peer_b / "sub" / "gone.txt", b"gone\n", when)
-    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / "2024-01-15_10-00-00_000000Z" / "old.txt", b"old\n")
-    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / "2024-01-15_10-00-00_000000Z" / "._old.txt", bytes(4096))
+    day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+    stamp = day_ago.strftime("%Y-%m-%d_%H-%M-%S_%fZ")
+    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / stamp / "old.txt", b"old\n")
+    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / stamp / "._old.txt", bytes(4096))
+    stamp2 = (day_ago + timedelta(microseconds=1)).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
+    write_file(
+        peer_b / "sub" / ".kitchensync" / "BAK" / stamp2 / "manifest.txt",
+        f"keep.txt\tf\t{when}\t5\t2024-01-02_10-00-00_000000Z\t-\t-\n".encode(),
+    )
     result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
     assert_result(result, b"sync complete\n")
     for peer in (peer_a, peer_b):
@@ -800,7 +807,7 @@ def s25(tmp: Path) -> None:
         expect(not (peer / "sub" / ".kitchensync").exists(), f"{peer / 'sub'}/.kitchensync should be gone")
         expect((peer / ".kitchensync" / "state.txt").is_file(), f"{peer}: missing .kitchensync/state.txt")
     bak = dict(bak_contents(peer_b))
-    expect(bak.get("2024-01-15_10-00-00_000000Z") == {"sub/old.txt": b"old\n"}, f"B's BAK: {bak}")
+    expect(bak.get(stamp) == {"sub/old.txt": b"old\n"}, f"B's BAK: {bak}")
     expect(sorted(merged_bak_files(peer_b)) == ["sub/gone.txt", "sub/old.txt"], f"files in B's BAK: {bak}")
     expect(merged_bak_files(peer_b)["sub/gone.txt"] == b"gone\n", f"B's BAK should hold sub/gone.txt: {bak}")
 

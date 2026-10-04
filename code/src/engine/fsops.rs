@@ -204,8 +204,21 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
                     continue;
                 }
             };
+            // A folder holding just an archived manifest is history the state
+            // file now carries: delete it rather than move it.
+            let kept: Vec<&Entry> = items.iter().filter(|e| !is_litter(e)).collect();
+            if let [only] = kept[..] {
+                let path = join(&from_dir, &only.name);
+                if !only.is_dir && only.name == "manifest.txt" && is_manifest(t, &path) {
+                    if let Err(e) = t.delete_file(&path) {
+                        fail("deleting archived manifest", &e);
+                    }
+                    let _ = delete_litter_dir(t, &from_dir);
+                    continue;
+                }
+            }
             let to_dir = super::peer::meta(&format!("BAK/{}/{}", s.name, dir));
-            if !items.iter().all(is_litter) {
+            if !kept.is_empty() {
                 if let Err(e) = peer.ensure_dir(&to_dir) {
                     fail("making BAK folder", &e);
                     continue;
@@ -213,7 +226,7 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
             }
             // Litter is not moved: macOS carries a `._` file along with its
             // file on exFAT, and any left behind is deleted with the folder.
-            for it in items.iter().filter(|e| !is_litter(e)) {
+            for it in kept {
                 if let Err(e) = t.rename(&join(&from_dir, &it.name), &join(&to_dir, &it.name)) {
                     fail("moving BAK entry", &e);
                 }
@@ -231,6 +244,14 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
         }
     }
     let _ = delete_litter_dir(t, &meta);
+}
+
+/// Whether a file reads as a manifest: every line that is not blank parses.
+fn is_manifest(t: &dyn Transport, path: &str) -> bool {
+    match super::peer::read_text(t, path) {
+        Ok(Some(text)) => crate::state::parse_manifest(&text).len() == text.lines().filter(|l| !l.trim().is_empty()).count(),
+        _ => false,
+    }
 }
 
 /// Displace an entry to BAK. In dry-run nothing touches the peer. Returns

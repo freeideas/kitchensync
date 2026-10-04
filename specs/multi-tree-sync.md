@@ -163,7 +163,7 @@ Moving `old` to BAK is a displacement of the target path (see sync.md, "Displace
 
 If recovery for a swap directory fails, treat that peer's listing for the current directory as failed. The peer is excluded from this directory subtree using the normal listing-error rules, and its state lines for the subtree are carried forward unchanged.
 
-Expired BAK folders and journals are deleted at startup (see state.md, "BAK"), and tombstones older than `--keep-del-days` are dropped when the state is written, so the walk does no cleanup of its own.
+Expired BAK folders and journals are deleted at the end of the run (see state.md, "BAK"), and tombstones older than `--keep-del-days` are dropped when the state is written, so the walk does no cleanup of its own.
 
 ## Entry Classification
 

@@ -80,7 +80,7 @@ A folder can be a sync root in one run and part of a larger tree in another: syn
 
 KitchenSync also reads the per-directory layout, where every synced directory held `.kitchensync/manifest.txt` describing its direct children (fields `name`, `kind`, `mod_time`, `byte_size`, `last_seen`, `deleted_time`, then fields that are ignored) and displaced entries sat in `<dir>/.kitchensync/BAK/<ts>/`. A peer whose root has `.kitchensync/manifest.txt` but no `state.txt` has history, and the root's manifest supplies the root's lines. When the walk lists a directory below the root whose `.kitchensync` folder holds `manifest.txt` (or `manifest.txt.new` or `manifest.txt.old`), and the peer's state has no lines for that directory's children, that manifest supplies them.
 
-In a normal run the per-directory folder is then converted, right after it is read: every entry of `<dir>/.kitchensync/BAK/<ts>/` moves to `<root>/.kitchensync/BAK/<ts>/<dir>/`, the manifest files are deleted, any SWAP staging is recovered, and the emptied folders are removed (operating-system litter, as defined in sync.md, "SWAP Directory", does not keep a folder in place). A conversion step that fails is reported at error level and retried on the next run; it never blocks the sync. The root's own `.kitchensync/BAK/<ts>/<name>` entries already have the root layout and stay where they are.
+In a normal run the per-directory folder is then converted, right after it is read: every entry of `<dir>/.kitchensync/BAK/<ts>/` moves to `<root>/.kitchensync/BAK/<ts>/<dir>/`, except that a `BAK/<ts>/` holding only `manifest.txt` whose every line parses as a manifest line is an archived manifest and is deleted (the state file now carries that history), the manifest files are deleted, any SWAP staging is recovered, and the emptied folders are removed (operating-system litter, as defined in sync.md, "SWAP Directory", does not keep a folder in place). A conversion step that fails is reported at error level and retried on the next run; it never blocks the sync. The root's own `.kitchensync/BAK/<ts>/<name>` entries already have the root layout and stay where they are.
 
 ## Journal
 
@@ -100,11 +100,11 @@ Every normal run writes `<root>/.kitchensync/journal/<run>.txt` on each peer whe
 | `D` | KitchenSync created the directory `path`.                                                 |
 | `M` | KitchenSync moved the file at `other` (a live path or a BAK path) to `path`, with the given size and mod_time. |
 
-A replaced file appears as an `X` line for the old content followed by a `C` or `M` line for the new. A line that does not parse (for example one cut short when a run was stopped) is ignored. Journals older than `--keep-bak-days`, by their name, are deleted at startup along with expired BAK folders.
+A replaced file appears as an `X` line for the old content followed by a `C` or `M` line for the new. A line that does not parse (for example one cut short when a run was stopped) is ignored. Journals older than `--keep-bak-days`, by their name, are deleted along with expired BAK folders (see "BAK").
 
 ## BAK
 
-A displaced entry is renamed to `<root>/.kitchensync/BAK/<run>/<relpath>`, creating parent directories as needed. If that path is already taken in this run, a freshly generated timestamp is used instead of `<run>`. A displaced directory moves as one rename with its whole subtree. At startup, in normal runs, `BAK/<ts>/` folders older than `--keep-bak-days` days (by `<ts>`) are deleted.
+A displaced entry is renamed to `<root>/.kitchensync/BAK/<run>/<relpath>`, creating parent directories as needed. If that path is already taken in this run, a freshly generated timestamp is used instead of `<run>`. A displaced directory moves as one rename with its whole subtree. At the end of each normal sync, after the last copy, `BAK/<ts>/` folders older than `--keep-bak-days` days (by `<ts>`) are deleted. Doing it last keeps the cost of listing a large BAK out of the time before the first progress line.
 
 ## Rollback
 
