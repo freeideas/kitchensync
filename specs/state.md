@@ -4,7 +4,8 @@ KitchenSync remembers what each peer had, so that on the next run it can tell a 
 
 ```
 <root>/.kitchensync/
-  state.txt              what this peer held, one line per entry in the whole tree
+  state.txt              names the format of the state (one line)
+  state.gz               what this peer held, one line per entry in the whole tree
   journal/<run>.txt      every change one run made on this peer, for rollback
   BAK/<run>/<relpath>    entries KitchenSync displaced (kept --keep-bak-days days)
   runs.txt               one line per run (see sync.md, "Run Log")
@@ -17,7 +18,7 @@ Keeping everything at the root means a walk reads only the user's own folders: a
 
 ## State file
 
-One line per entry. Fields are tab-separated, in this order:
+The state is a text file, kept compressed with gzip as `state.gz` because it holds one line per entry and is read whole at the start of every run, often over a slow link (for 60,000 entries, about 10 MB of text becomes about 1 MB). `state.txt` holds only the text's first line, which names the format, so that any KitchenSync can tell what it is looking at (see "Format version"). The text has one line per entry. Fields are tab-separated, in this order:
 
 | Field          | Meaning                                                                                  |
 | -------------- | ---------------------------------------------------------------------------------------- |
@@ -28,39 +29,39 @@ One line per entry. Fields are tab-separated, in this order:
 | `last_seen`    | Timestamp when the entry was confirmed present on this peer (via listing or a completed copy), or `-` when a copy was decided but has not completed. It is not refreshed while the entry stays unchanged (see multi-tree-sync.md, "State Updates"), so it is the first confirmation of the entry's current state, never later than the most recent one. |
 | `deleted_time` | `-` while the entry exists. A timestamp once the entry has been confirmed absent (a tombstone). |
 
-The first line is `#`, a tab, the format version (see "Format version"), a tab, and the timestamp at which the file was written. Other lines starting with `#` are ignored, as is any line that does not parse; it is dropped on the next rewrite. Extra fields after `deleted_time` are ignored, so the format can grow. Entry lines are sorted by `path` (byte order) and the file ends with a newline.
+The first line is `#`, a tab, the format version (see "Format version"), a tab, and the timestamp at which the state was written. Other lines starting with `#` are ignored, as is any line that does not parse; it is dropped on the next rewrite. Extra fields after `deleted_time` are ignored, so the format can grow. Entry lines are sorted by `path` (byte order) and the file ends with a newline.
 
 Example:
 
 ```
-#	1	2024-03-05_08-10-00_000000Z
+#	2	2024-03-05_08-10-00_000000Z
 IMG_0001.jpg	f	2024-03-02_09-15-30_000000Z	4194304	2024-03-05_08-00-01_120394Z	-
 raw	d	2024-02-20_18-30-00_000000Z	-1	2024-03-05_08-00-01_120396Z	-
 raw/notes.txt	f	2024-01-01_12-00-00_000000Z	812	2024-03-05_08-00-01_120395Z	2024-03-05_08-00-01_120395Z
 ```
 
-The lines for a directory's direct children are that directory's history on this peer. A peer "has history" at the sync root when `state.txt` exists there.
+The lines for a directory's direct children are that directory's history on this peer. A peer "has history" at the sync root when `state.txt` exists there. The example and every rule below describe the text; on disk it is in `state.gz`.
 
 ### Format version
 
-The state file and every journal declare the format they are written in, currently `1`. A KitchenSync that finds a newer format than it reads does not guess: a sync treats that peer as unreachable, with an error line naming the format; a nested root with a newer format is left out of the run's history and not written; and a rollback skips that peer and counts a failure. A peer in an older layout is converted when a run first meets it, as the per-directory layout is (see "Per-directory manifests").
+The state and every journal declare the format they are written in, currently `2`. Format 1 kept the whole state uncompressed in `state.txt`; it is still read, and the next write replaces it with format 2. A journal's format is unchanged from 1 to 2. A KitchenSync that finds a newer format than it reads does not guess: a sync treats that peer as unreachable, with an error line naming the format; a nested root with a newer format is left out of the run's history and not written; and a rollback skips that peer and counts a failure. A peer in an older layout is converted when a run first meets it, as the per-directory layout is (see "Per-directory manifests").
 
 ### Reading
 
-Each peer's `state.txt` is read once, at startup, and held in memory for the run. A missing file means the peer has no history anywhere in the tree. A read error other than "not found" makes the peer unreachable.
+Each peer's state is read once, at startup, and held in memory for the run. A missing file means the peer has no history anywhere in the tree. A read error other than "not found" makes the peer unreachable.
 
 Names are compared in NFC (see sync.md, "Unicode Normalization"). A path in another form counts as its NFC form; when two lines collapse to one, the live line is kept over a tombstone, then the one with the later `last_seen`.
 
 ### Writing
 
-A directory's lines are settled once every entry in it has been decided and every copy into it on that peer has finished or failed (see multi-tree-sync.md, "State Updates"). Settled lines replace that directory's lines in memory. The file is written:
+A directory's lines are settled once every entry in it has been decided and every copy into it on that peer has finished or failed (see multi-tree-sync.md, "State Updates"). Settled lines replace that directory's lines in memory. The state is written:
 
 - at the end of the run, and
 - during the run, at most every 5 minutes, whenever settled lines have changed since the last write, so that a run that is stopped keeps most of what it learned.
 
-Lines for directories the run did not reach (excluded, skipped after a listing failure, or not visited) are carried forward unchanged. When a directory stops existing on a peer (displaced, or confirmed absent), every line beneath it is dropped from that peer's state. Tombstones older than `--keep-del-days` (by `deleted_time`) are dropped when the file is written. If nothing would change, the file is not written. In `--dry-run` it is never written.
+Lines for directories the run did not reach (excluded, skipped after a listing failure, or not visited) are carried forward unchanged. When a directory stops existing on a peer (displaced, or confirmed absent), every line beneath it is dropped from that peer's state. Tombstones older than `--keep-del-days` (by `deleted_time`) are dropped when the file is written. If nothing would change, it is not written. In `--dry-run` it is never written.
 
-The file is replaced without ever renaming over an existing file, so it works on SFTP servers that reject that: write `state.txt.new` and close it; rename the live `state.txt` to `state.txt.old` if it exists; rename `state.txt.new` to `state.txt`; delete `state.txt.old`. At startup, before reading, an interrupted replacement is repaired:
+Writing replaces `state.gz` first and then `state.txt`, each without ever renaming over an existing file, so it works on SFTP servers that reject that: write `<name>.new` and close it; rename the live file to `<name>.old` if it exists; rename `<name>.new` to `<name>`; delete `<name>.old`. At startup, before reading, an interrupted replacement of either file is repaired (shown for `state.txt`; `state.gz` is the same):
 
 - `.old` exists and `state.txt` exists: delete `.new` if present, then delete `.old`.
 - `.old` exists, `.new` exists, `state.txt` missing: rename `.new` to `state.txt`, then delete `.old`.
@@ -70,7 +71,7 @@ The file is replaced without ever renaming over an existing file, so it works on
 
 `runs.txt` is replaced the same way.
 
-If a run stops before its final write, decisions on the next run still rest on what the peers actually hold. Lines that were not written are older than the truth, and an older `last_seen` errs toward keeping a file rather than deleting it.
+A run stopped between the two replacements leaves the new `state.gz` behind the old `state.txt`: a format-2 `state.txt` names the same format, so the new `state.gz` is read; a format-1 `state.txt` is read as it stands, which is older history and safe. If a run stops before its final write, decisions on the next run still rest on what the peers actually hold. Lines that were not written are older than the truth, and an older `last_seen` errs toward keeping a file rather than deleting it.
 
 ### Tombstones
 
@@ -78,7 +79,7 @@ When an entry is confirmed absent on a peer whose line has `deleted_time` `-`, t
 
 ### Nested sync roots
 
-A folder can be a sync root in one run and part of a larger tree in another: syncing `/X/b/c` one day and `/X/b` the next. When the walk lists a directory below the root and the listing shows a `.kitchensync` folder there holding `state.txt`, that directory is a nested sync root. If its `state.txt` was written later than the outer root's `state.txt`, its lines replace the outer state's lines for that subtree on that peer (with the nested directory's path prefixed). At the end of the run, the outer run writes the nested root's `state.txt` too, with the run's lines for that subtree, so both roots stay current. A nested root's `journal/`, `BAK/` and `runs.txt` belong to it and are left alone.
+A folder can be a sync root in one run and part of a larger tree in another: syncing `/X/b/c` one day and `/X/b` the next. When the walk lists a directory below the root and the listing shows a `.kitchensync` folder there holding `state.txt`, that directory is a nested sync root. If its state was written later than the outer root's, its lines replace the outer state's lines for that subtree on that peer (with the nested directory's path prefixed). At the end of the run, the outer run writes the nested root's state too, with the run's lines for that subtree, so both roots stay current. A nested root's `journal/`, `BAK/` and `runs.txt` belong to it and are left alone.
 
 ### Per-directory manifests
 
@@ -94,7 +95,7 @@ Every normal run writes `<root>/.kitchensync/journal/<run>.txt` on each peer whe
 <timestamp>  <op>  <path>  <other>  <byte_size>  <mod_time>
 ```
 
-`<timestamp>` is a freshly generated timestamp. Paths are relative to the sync root and encoded as in `state.txt`. Fields that do not apply are `-`.
+`<timestamp>` is a freshly generated timestamp. Paths are relative to the sync root and encoded as in the state. Fields that do not apply are `-`.
 
 | Op  | Meaning                                                                                   |
 | --- | ----------------------------------------------------------------------------------------- |

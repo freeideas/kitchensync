@@ -58,17 +58,11 @@ fn open_peer(cfg: &Config, index: usize, role: Role, url: String, transport: Arc
     let t = transport.as_ref();
     if !cfg.dry_run {
         peer::recover_meta_file(t, state::STATE)?;
+        peer::recover_meta_file(t, state::STATE_GZ)?;
         peer::recover_meta_file(t, peer::RUNS)?;
     }
     // A dry run repairs nothing, so it reads what a repair would keep.
-    let names: &[&str] = if cfg.dry_run { &["state.txt", "state.txt.new", "state.txt.old"] } else { &["state.txt"] };
-    let mut text = None;
-    for n in names {
-        text = peer::read_text(t, &meta(n))?;
-        if text.is_some() {
-            break;
-        }
-    }
+    let text = peer::read_state(t, "", cfg.dry_run)?;
     if let Some(v) = text.as_deref().map(state::version).filter(|v| *v > state::FORMAT) {
         return Err(TransportError::io(format!("state.txt is format {v}, newer than this KitchenSync reads (format {}); use a newer KitchenSync", state::FORMAT)));
     }

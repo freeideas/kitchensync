@@ -17,6 +17,7 @@ The binary location can be overridden with the KITCHENSYNC_BIN environment
 variable; otherwise it is looked up under <repo root>/released/.
 """
 
+import gzip
 import os
 import platform
 import re
@@ -488,7 +489,7 @@ def s12(tmp: Path) -> None:
 
     merged = merged_bak_files(peer_b / "b")
     expect(merged == {"c/one.txt": b"one\n"}, f"files in {peer_b / 'b'}'s BAK: {merged}")
-    nested = (peer_b / "b" / "c" / ".kitchensync" / "state.txt").read_text()
+    nested = gzip.decompress((peer_b / "b" / "c" / ".kitchensync" / "state.gz").read_bytes()).decode()
     live = [line for line in nested.splitlines() if line.startswith("one.txt\t") and line.endswith("\t-")]
     expect(not live, f"{peer_b / 'b' / 'c'}'s state still lists one.txt as live: {nested!r}")
 
@@ -823,7 +824,7 @@ def s26(tmp: Path) -> None:
     shown = peer_b.as_posix() if peer_b.as_posix().startswith("/") else "/" + peer_b.as_posix()
     expected = (
         f"peer unreachable: file://{shown}: io_error: state.txt is format 99, newer than this "
-        "KitchenSync reads (format 1); use a newer KitchenSync\n"
+        "KitchenSync reads (format 2); use a newer KitchenSync\n"
         "first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\n"
         "sync complete\n"
     )

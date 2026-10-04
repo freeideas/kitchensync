@@ -178,7 +178,7 @@ impl Walker {
             if !dir.is_empty() {
                 let meta = fsops::meta_dir(dir);
                 if m.state {
-                    match peer::read_text(t, &join(&meta, state::STATE)) {
+                    match peer::read_state(t, dir, self.cfg.dry_run) {
                         Ok(Some(text)) => p.history.nested_root(dir, &text),
                         Ok(None) => {}
                         Err(e) => return failed("state read", &e),

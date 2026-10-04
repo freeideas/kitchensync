@@ -21,10 +21,13 @@ pub type DirLines = BTreeMap<String, Line>;
 pub type Tree = BTreeMap<String, DirLines>;
 
 pub const STATE: &str = "state.txt";
+/// Where format 2 keeps the lines: `state.txt` compressed with gzip.
+/// `state.txt` itself then holds only its first line, which names the format.
+pub const STATE_GZ: &str = "state.gz";
 
 /// The format of the state file and journal this KitchenSync writes, and the
 /// newest it reads (specs/state.md, "Format version").
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// The format version a state file or journal declares on its `#` line.
 pub fn version(text: &str) -> u32 {
@@ -172,6 +175,25 @@ pub fn serialize_body(tree: &Tree, tombstone_cutoff: i64, prefix: &str) -> Strin
     out
 }
 
+/// The marker `state.txt` of format 2: just its first line.
+pub fn marker(written: i64) -> String {
+    format!("#\t{FORMAT}\t{}\n", format_micros(written))
+}
+
+pub fn gzip(text: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(text.as_bytes()).expect("compressing into memory");
+    z.finish().expect("compressing into memory")
+}
+
+pub fn gunzip(bytes: &[u8]) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(bytes).read_to_string(&mut text)?;
+    Ok(text)
+}
+
 pub fn with_header(written: i64, body: &str) -> String {
     format!("#\t{FORMAT}\t{}\n{}", format_micros(written), body)
 }
@@ -251,8 +273,10 @@ mod tests {
         tree.entry("".into()).or_default().insert("dir".into(), line(true, None));
         tree.entry("dir".into()).or_default().insert("x%y".into(), line(false, Some(3_000_000)));
         let text = with_header(9_000_000, &serialize_body(&tree, 0, ""));
-        assert!(text.starts_with("#\t1\t1970-01-01_00-00-09_000000Z\na%09b.txt\tf\t"));
-        assert_eq!(version(&text), 1);
+        assert!(text.starts_with("#\t2\t1970-01-01_00-00-09_000000Z\na%09b.txt\tf\t"));
+        assert_eq!(version(&text), 2);
+        assert_eq!(gunzip(&gzip(&text)).unwrap(), text);
+        assert_eq!(version(&marker(1)), 2);
         assert_eq!(version("#\t7\t1970-01-01_00-00-09_000000Z\n"), 7);
         assert_eq!(version(&journal_header()), FORMAT);
         let (written, back) = parse_state(&text);

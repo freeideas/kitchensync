@@ -5,6 +5,7 @@
 pub mod local;
 pub mod normalize;
 pub mod sftp;
+pub mod snapshot;
 
 use std::fmt;
 use std::time::SystemTime;

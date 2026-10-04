@@ -1,12 +1,18 @@
 # Lists a whole tree for KitchenSync in one pass (specs/sync.md, "Listing A
 # Whole Tree"). Run as `perl - <root>` with this script on standard input.
-# Prints one record per regular file or directory, each ended by a NUL byte:
-# kind (f or d), a tab, size in bytes (-1 for a directory), a tab, the
-# modification time in seconds, a tab, and the path relative to the root.
-# .kitchensync and .git are listed but not entered. Exits 2 if any directory
-# could not be read, so a partial listing is never mistaken for a full one.
+# For each directory, in the order the sync walk visits them (a directory's
+# entries, then its subdirectories, names sorted case-insensitively with the
+# exact name breaking ties), prints one record per regular file or
+# subdirectory and then an end record, each ended by a NUL byte:
+#   f<TAB>size<TAB>mtime<TAB>path     a file
+#   d<TAB>-1<TAB>mtime<TAB>path       a directory
+#   e<TAB>-<TAB>-<TAB>dir             the end of dir's listing ("" is the root)
+# mtime is in seconds; paths are relative to the root. .kitchensync and .git
+# are listed but not entered. A directory that cannot be read gets no end
+# record, and the program then exits 2.
 use strict;
 use warnings;
+use IO::Handle;
 use Time::HiRes ();
 binmode STDOUT;
 my $root = shift;
@@ -20,18 +26,22 @@ sub walk {
         $failed = 1;
         return;
     }
-    my @names = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    my @names = sort { lc($a) cmp lc($b) or $a cmp $b } grep { $_ ne '.' && $_ ne '..' } readdir($dh);
     closedir($dh);
+    my @subdirs;
     for my $name (@names) {
         my @s = Time::HiRes::lstat("$dir/$name") or next;
         my $path = $rel eq '' ? $name : "$rel/$name";
         if (-d _) {
             print "d\t-1\t$s[9]\t$path\0";
-            walk($path) unless $name eq '.kitchensync' || $name eq '.git';
+            push @subdirs, $path unless $name eq '.kitchensync' || $name eq '.git';
         } elsif (-f _) {
             print "f\t$s[7]\t$s[9]\t$path\0";
         }
     }
+    print "e\t-\t-\t$rel\0";
+    STDOUT->flush;
+    walk($_) for @subdirs;
 }
 walk('');
 exit($failed ? 2 : 0);

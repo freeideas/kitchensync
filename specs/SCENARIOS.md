@@ -153,7 +153,7 @@ Setup:
 
 Action: run `released/kitchensync.exe --verbosity error A/b B/b`.
 
-Outcome: the process exits 0. stdout is exactly `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`. stderr is empty. `B/b/two.txt` exists with bytes `two\n`. `B/b/c/one.txt` does not exist: the deletion under `c` was found in `c`'s own state, which the earlier run wrote. The files in `B/b`'s BAK are exactly `c/one.txt` with bytes `one\n`. `B/b/c/.kitchensync/state.txt` no longer lists `one.txt` as live. The notice on the first line appears because the new sync root `b` has no state, even though `c` does.
+Outcome: the process exits 0. stdout is exactly `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`. stderr is empty. `B/b/two.txt` exists with bytes `two\n`. `B/b/c/one.txt` does not exist: the deletion under `c` was found in `c`'s own state, which the earlier run wrote. The files in `B/b`'s BAK are exactly `c/one.txt` with bytes `one\n`. The state at `B/b/c/.kitchensync/` (`state.gz`) no longer lists `one.txt` as live. The notice on the first line appears because the new sync root `b` has no state, even though `c` does.
 
 ## S-13: Undo Reverts A First-Sync Merge
 
@@ -322,7 +322,7 @@ Setup:
 
 Action: run `released/kitchensync.exe --verbosity error A B C`.
 
-Outcome: the process exits 0 with empty stderr. stdout is exactly three lines: `peer unreachable: <B>: io_error: state.txt is format 99, newer than this KitchenSync reads (format 1); use a newer KitchenSync`, where `<B>` is B as KitchenSync displays it (`file://` and its absolute path), then the first-sync line (A and C have no history), then `sync complete`. B's `.kitchensync/state.txt` is byte-for-byte unchanged, and B has no other file under `.kitchensync/`. `C/one.txt` holds `one\n`.
+Outcome: the process exits 0 with empty stderr. stdout is exactly three lines: `peer unreachable: <B>: io_error: state.txt is format 99, newer than this KitchenSync reads (format 2); use a newer KitchenSync`, where `<B>` is B as KitchenSync displays it (`file://` and its absolute path), then the first-sync line (A and C have no history), then `sync complete`. B's `.kitchensync/state.txt` is byte-for-byte unchanged, and B has no other file under `.kitchensync/`. `C/one.txt` holds `one\n`.
 
 ## S-27: A Deletion Wins Over The Same Version, Even Right After A Sync
 
@@ -353,7 +353,7 @@ At no point may more than `--parallel` file transfers hold active copy slots acr
 
 ## P-04: State Replacement Never Renames Over A Live File
 
-`.kitchensync/state.txt` is replaced only by the sequence in state.md: write `state.txt.new`, move the live `state.txt` aside to `state.txt.old`, rename `state.txt.new` into place, then delete `state.txt.old`. No step ever renames onto an existing path, so the run works on SFTP servers that reject rename-over-existing, and the next normal run repairs any replacement that was interrupted at startup, before it reads the state.
+`.kitchensync/state.gz` and `.kitchensync/state.txt` are replaced only by the sequence in state.md: write `<name>.new`, move the live file aside to `<name>.old`, rename `<name>.new` into place, then delete `<name>.old`. No step ever renames onto an existing path, so the run works on SFTP servers that reject rename-over-existing, and the next normal run repairs any replacement that was interrupted at startup, before it reads the state.
 
 ## P-05: Dry Run Does Not Write Peer State
 

@@ -140,7 +140,7 @@ impl Peer {
             (body, nested)
         };
         let now = now_micros();
-        match replace_meta_file(self.t(), "", state::STATE, &state::with_header(now, &body)) {
+        match write_state_files(self.t(), "", now, &body) {
             Ok(()) => self.history.inner.lock().unwrap().written_body = body,
             Err(e) => {
                 output::error(&format!("state write failed for {}: {}", self.url, e));
@@ -149,7 +149,7 @@ impl Peer {
             }
         }
         for (dir, body) in nested {
-            if let Err(e) = replace_meta_file(self.t(), &dir, state::STATE, &state::with_header(now, &body)) {
+            if let Err(e) = write_state_files(self.t(), &dir, now, &body) {
                 output::error(&format!("state write failed for {} at {}: {}", self.url, dir, e));
                 note_failure();
             }
@@ -454,7 +454,42 @@ pub fn append_run(t: &dyn Transport, line: &str) -> Result<()> {
     let lines: Vec<&str> = text.lines().collect();
     let keep = if lines.len() > 1000 { &lines[lines.len() - 1000..] } else { &lines[..] };
     let text = keep.join("\n") + "\n";
-    replace_meta_file(t, "", RUNS, &text)
+    replace_meta_file(t, "", RUNS, text.as_bytes())
+}
+
+/// Write a state in format 2: the lines to `state.gz`, then the one-line
+/// marker to `state.txt` (specs/state.md, "State file").
+fn write_state_files(t: &dyn Transport, dir: &str, written: i64, body: &str) -> Result<()> {
+    replace_meta_file(t, dir, state::STATE_GZ, &state::gzip(&state::with_header(written, body)))?;
+    replace_meta_file(t, dir, state::STATE, state::marker(written).as_bytes())
+}
+
+/// The state text at `<dir>/.kitchensync/`, or None when there is none.
+/// Format 1 keeps it all in `state.txt`; format 2 keeps it compressed in
+/// `state.gz` behind a one-line `state.txt`. A newer format's `state.txt` is
+/// returned as it is, so the caller can see the version and refuse it.
+/// `fallbacks` adds the `.new`/`.old` names a dry run reads instead of
+/// repairing them.
+pub fn read_state(t: &dyn Transport, dir: &str, fallbacks: bool) -> Result<Option<String>> {
+    let base = join(dir, META);
+    let suffixes: &[&str] = if fallbacks { &["", ".new", ".old"] } else { &[""] };
+    let mut marker = None;
+    for sfx in suffixes {
+        marker = read_text(t, &join(&base, &format!("{}{sfx}", state::STATE)))?;
+        if marker.is_some() {
+            break;
+        }
+    }
+    let Some(marker) = marker else { return Ok(None) };
+    if state::version(&marker) != 2 {
+        return Ok(Some(marker));
+    }
+    for sfx in suffixes {
+        if let Some(bytes) = read_bytes(t, &join(&base, &format!("{}{sfx}", state::STATE_GZ)))? {
+            return state::gunzip(&bytes).map(Some).map_err(|e| crate::transport::TransportError::io(format!("state.gz: {e}")));
+        }
+    }
+    Err(crate::transport::TransportError::io("state.txt names format 2 but state.gz is missing"))
 }
 
 /// Start timestamp of the newest run recorded at the root, if any.
@@ -465,12 +500,12 @@ pub fn last_run_start(t: &dyn Transport) -> Option<i64> {
 
 /// Replace `<dir>/.kitchensync/<name>` without renaming over a live file:
 /// write `.new`, move live to `.old`, rename `.new` in, delete `.old`.
-pub fn replace_meta_file(t: &dyn Transport, dir: &str, name: &str, text: &str) -> Result<()> {
+pub fn replace_meta_file(t: &dyn Transport, dir: &str, name: &str, data: &[u8]) -> Result<()> {
     let live = join(&join(dir, META), name);
     let new = format!("{live}.new");
     let old = format!("{live}.old");
     let mut w = t.open_write(&new)?;
-    w.write_all(text.as_bytes())?;
+    w.write_all(data)?;
     w.close()?;
     let has_live = exists(t, &live)?;
     if has_live {
@@ -529,6 +564,11 @@ pub fn read_ignore(t: &dyn Transport) -> Result<Option<String>> {
 
 /// Read a whole text file, or None when it does not exist.
 pub fn read_text(t: &dyn Transport, path: &str) -> Result<Option<String>> {
+    Ok(read_bytes(t, path)?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// Read a whole file, or None when it does not exist.
+pub fn read_bytes(t: &dyn Transport, path: &str) -> Result<Option<Vec<u8>>> {
     let mut r = match t.open_read(path) {
         Ok(r) => r,
         Err(e) if e.is_not_found() => return Ok(None),
@@ -543,5 +583,5 @@ pub fn read_text(t: &dyn Transport, path: &str) -> Result<Option<String>> {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    Ok(Some(buf))
 }

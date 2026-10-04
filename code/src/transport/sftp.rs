@@ -175,7 +175,7 @@ pub struct SftpTransport {
     ssh: Arc<client::Handle<HostKeyCheck>>,
     /// The whole-tree listing started by `preload`, and the directories
     /// already listed (see `Snapshot`).
-    snap: Arc<Mutex<Snapshot>>,
+    snap: Arc<super::snapshot::Snapshot>,
 }
 
 /// Connect to an SFTP peer using the user's `~/.ssh/known_hosts`.
@@ -345,7 +345,7 @@ pub fn connect_with_known_hosts(
             write_len,
             root,
             ssh: Arc::new(ssh),
-            snap: Arc::new(Mutex::new(Snapshot::default())),
+            snap: Arc::new(super::snapshot::Snapshot::default()),
         })
     })
 }
@@ -836,18 +836,6 @@ impl SftpTransport {
     }
 }
 
-/// A listing of the whole tree taken once by running a small Perl program on
-/// the server (specs/sync.md, "Listing A Whole Tree"). Each directory's
-/// entries are handed out at most once, and only to the first listing of
-/// that directory: anything listed again, or already listed before the
-/// snapshot arrived, is asked of the server, so a directory KitchenSync has
-/// changed is never answered from the snapshot.
-#[derive(Default)]
-struct Snapshot {
-    dirs: Option<std::collections::HashMap<String, Vec<Entry>>>,
-    listed: std::collections::HashSet<String>,
-}
-
 const LISTER: &str = include_str!("lister.pl");
 const LISTER_WINDOWS: &str = include_str!("lister.ps1");
 
@@ -888,57 +876,39 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Parse the lister's records into directory -> entries. Every directory it
-/// entered has a key, empty or not.
-fn parse_listing(out: &[u8]) -> std::collections::HashMap<String, Vec<Entry>> {
-    let mut dirs: std::collections::HashMap<String, Vec<Entry>> = std::collections::HashMap::new();
-    dirs.insert(String::new(), Vec::new());
-    for rec in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let rec = String::from_utf8_lossy(rec);
-        let mut f = rec.splitn(4, '\t');
-        let (Some(kind), Some(size), Some(mtime), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
-        let (Ok(size), Ok(mtime)) = (size.parse::<i64>(), mtime.parse::<f64>()) else { continue };
-        let is_dir = kind == "d";
-        let (parent, name) = match path.rsplit_once('/') {
-            Some((p, n)) => (p.to_string(), n.to_string()),
-            None => (String::new(), path.to_string()),
-        };
-        let name_is_meta = name == ".kitchensync" || name == ".git";
-        if is_dir && !name_is_meta {
-            dirs.entry(path.to_string()).or_default();
-        }
-        let mod_time = UNIX_EPOCH + Duration::from_secs_f64(mtime.max(0.0));
-        dirs.entry(parent).or_default().push(Entry { name, is_dir, mod_time, byte_size: if is_dir { -1 } else { size } });
-    }
-    dirs
-}
-
 impl SftpTransport {
     /// Whether the whole-tree snapshot has arrived and still holds `dir`.
     #[cfg(test)]
     fn snapshot_has(&self, dir: &str) -> bool {
-        self.snap.lock().unwrap().dirs.as_ref().is_some_and(|d| d.contains_key(dir))
+        self.snap.has(dir)
     }
 
-    /// Run the lister and wait for it. None when the server cannot run it
-    /// (no shell access, no Perl, a Windows server) or it reports an error.
-    async fn run_lister(ssh: &client::Handle<HostKeyCheck>, command: String, input: Vec<u8>) -> Option<std::collections::HashMap<String, Vec<Entry>>> {
-        let mut channel = ssh.channel_open_session().await.ok()?;
-        channel.exec(true, command).await.ok()?;
-        if !input.is_empty() {
-            channel.data_bytes(input).await.ok()?;
+    /// Run one lister, feeding its output to the snapshot as it arrives.
+    /// Returns whether the command could run at all.
+    async fn run_lister(ssh: &client::Handle<HostKeyCheck>, snap: &super::snapshot::Snapshot, command: String, input: Vec<u8>) -> bool {
+        let Ok(mut channel) = ssh.channel_open_session().await else { return false };
+        if channel.exec(true, command).await.is_err() {
+            return false;
         }
-        channel.eof().await.ok()?;
-        let mut out = Vec::new();
+        if !input.is_empty() && channel.data_bytes(input).await.is_err() {
+            return false;
+        }
+        if channel.eof().await.is_err() {
+            return false;
+        }
         let mut status = None;
         while let Some(msg) = channel.wait().await {
             match msg {
-                russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                russh::ChannelMsg::Data { data } => snap.feed(&data),
                 russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                // The server refused to run commands (SFTP-only access).
+                russh::ChannelMsg::Failure => return false,
                 _ => {}
             }
         }
-        (status == Some(0)).then(|| parse_listing(&out))
+        // A program that is missing prints nothing; one that ran but met an
+        // unreadable directory has still listed every other one completely.
+        status == Some(0) || snap.received_any()
     }
 }
 
@@ -947,32 +917,26 @@ impl Transport for SftpTransport {
         let root = if self.root.is_empty() { "/".to_string() } else { self.root.clone() };
         let ssh = Arc::clone(&self.ssh);
         let snap = Arc::clone(&self.snap);
+        // From here on, listings wait for the stream rather than race it.
+        snap.start();
         runtime().spawn(async move {
             let started = std::time::Instant::now();
             for (command, input) in lister_commands(&root) {
                 let program = command.split(' ').next().unwrap_or_default().to_string();
-                if let Some(mut dirs) = Self::run_lister(&ssh, command, input).await {
-                    crate::output::trace(&format!("whole-tree listing of {root} by {program}: {} directories in {} ms", dirs.len(), started.elapsed().as_millis()));
-                    let mut g = snap.lock().unwrap();
-                    let listed = std::mem::take(&mut g.listed);
-                    dirs.retain(|d, _| !listed.contains(d));
-                    g.listed = listed;
-                    g.dirs = Some(dirs);
+                if Self::run_lister(&ssh, &snap, command, input).await {
+                    let n = snap.finish();
+                    crate::output::trace(&format!("whole-tree listing of {root} by {program}: {n} directories in {} ms", started.elapsed().as_millis()));
                     return;
                 }
             }
+            snap.finish();
             crate::output::trace(&format!("whole-tree listing of {root} unavailable; listing over SFTP"));
         });
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<Entry>> {
-        {
-            let mut g = self.snap.lock().unwrap();
-            if g.listed.insert(path.to_string()) {
-                if let Some(entries) = g.dirs.as_mut().and_then(|d| d.remove(path)) {
-                    return Ok(entries);
-                }
-            }
+        if let Some(entries) = self.snap.take(path) {
+            return Ok(entries);
         }
         let session = self.session();
         let dir = self.remote(path);
@@ -1525,8 +1489,11 @@ mod tests {
         }
         let out = run(&root);
         assert!(out.status.success());
-        let dirs = super::parse_listing(&out.stdout);
-        assert!(dirs.contains_key("locked/inside"));
+        let snap = crate::transport::snapshot::Snapshot::default();
+        snap.start();
+        snap.feed(&out.stdout);
+        assert!(snap.has("locked/inside"), "every directory ends with an end record");
+        assert_eq!(snap.finish(), 3);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1541,15 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn lister_records_become_directory_listings() {
-        let out = b"d\t-1\t1700000000.5\ta\0f\t5\t1700000001\ta/x\ty.txt\0d\t-1\t1\t.kitchensync\0d\t-1\t2\ta/empty\0";
-        let dirs = super::parse_listing(out);
-        assert_eq!(dirs[""].iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec!["a", ".kitchensync"]);
-        assert!(!dirs.contains_key(".kitchensync"), "metadata folders are not entered");
-        assert_eq!(dirs["a"].len(), 2);
-        assert_eq!(dirs["a"][0].name, "x\ty.txt");
-        assert_eq!(dirs["a"][0].byte_size, 5);
-        assert!(dirs["a/empty"].is_empty());
+    fn lister_commands_quote_and_encode() {
         assert_eq!(super::shell_quote("/it's"), "'/it'\\''s'");
         assert_eq!(super::base64(b"Ma"), "TWE=");
         assert_eq!(super::base64(b"Man!"), "TWFuIQ==");

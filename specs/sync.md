@@ -144,7 +144,7 @@ A subordinate peer's state is still read and written. On future runs (without `-
 2. Connect to all peers in parallel. In normal runs, auto-create the peer's root directory (and any missing parents) if it does not exist - for both `file://` and `sftp://` URLs. In `--dry-run`, do not create missing peer roots or parents; a URL whose root path does not already exist is treated as unreachable for that run. For peers with fallback URLs (bracket syntax), try URLs in order; first that connects wins. A reachable peer carries the connected peer root handle selected at startup: a local root handle for `file://`, or the established SSH/SFTP session plus remote root path for `sftp://`. Skip unreachable peers with an error-level diagnostic. If directory creation fails in a normal run, treat the peer as unreachable (try next fallback URL).
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
-5. Nothing is downloaded at startup. For each reachable peer, check only whether the sync root has history: does `.kitchensync/state.txt` exist there (or, failing that, `.kitchensync/manifest.txt`; see state.md, "Per-directory manifests")? In normal runs, repair an interrupted replacement of `state.txt` and `runs.txt` first (see state.md, "Writing"), so a run that was stopped mid-rewrite is not mistaken for a peer with no history. In `--dry-run`, repair nothing and treat the root as having history if any of `state.txt`, `state.txt.new`, `state.txt.old`, or `manifest.txt` is present. Then read the state into memory. If the check fails with anything other than 'not found' (I/O error, permission denied), treat the peer as unreachable: log an error-level diagnostic and exclude it from the reachable set, then re-evaluate steps 3-4 against the updated set and exit with the corresponding error if either check now fails.
+5. Nothing is downloaded at startup. For each reachable peer, check only whether the sync root has history: does `.kitchensync/state.txt` exist there (or, failing that, `.kitchensync/manifest.txt`; see state.md, "Per-directory manifests")? In normal runs, repair an interrupted replacement of `state.txt`, `state.gz` and `runs.txt` first (see state.md, "Writing"), so a run that was stopped mid-rewrite is not mistaken for a peer with no history. In `--dry-run`, repair nothing and treat the root as having history if any of `state.txt`, `state.txt.new`, `state.txt.old`, or `manifest.txt` is present, and read the state from whichever of those names is there. Then read the state into memory. If the check fails with anything other than 'not found' (I/O error, permission denied), treat the peer as unreachable: log an error-level diagnostic and exclude it from the reachable set, then re-evaluate steps 3-4 against the updated set and exit with the corresponding error if either check now fails.
 6. A reachable peer with no history is automatically treated as subordinate for the run, unless it is the canon peer (`+`), and unless no reachable peer has history at all. If no reachable contributing peer has history and no canon peer (`+`) is designated, nobody is auto-subordinated; print this line to stdout, exactly once, before any progress output and at every verbosity level (after the `dry run` line in a dry run), then continue the run: `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative`
 7. If no contributing (non-subordinate) peer is reachable - for example every reachable peer was marked `-` on the command line and there is no canon peer - exit with error: `No contributing peer reachable - cannot make sync decisions`
 
@@ -174,7 +174,7 @@ User data replacement is a recoverable swap. When a copied file would replace an
 
 If moving the existing destination to SWAP `old` fails, the original destination must remain in place, staged files must be cleaned up when possible, and the copy is skipped for that run.
 
-`state.txt` and `runs.txt` follow the same no-rename-over-existing rule, using their own `.new`/`.old` names inside `.kitchensync/` rather than SWAP; state.md ("Writing") defines the exact sequence and how an interrupted replacement is repaired.
+`state.txt`, `state.gz` and `runs.txt` follow the same no-rename-over-existing rule, using their own `.new`/`.old` names inside `.kitchensync/` rather than SWAP; state.md ("Writing") defines the exact sequence and how an interrupted replacement is repaired.
 
 ### File Copy
 
@@ -327,7 +327,7 @@ A leftover SWAP directory is found by the walk: when a directory's listing shows
 
 A SWAP directory counts as empty when it holds only operating-system litter files: names starting with `._` (the AppleDouble files macOS writes beside anything it touches on exFAT and FAT drives) and `.DS_Store`. KitchenSync deletes that litter before removing the directory; any other leftover entry keeps the directory in place.
 
-SWAP is for user files only. `state.txt` and `runs.txt` are replaced by the `.new`/`.old` rule in state.md instead.
+SWAP is for user files only. `state.txt`, `state.gz` and `runs.txt` are replaced by the `.new`/`.old` rule in state.md instead.
 
 ## BAK Directory
 
@@ -391,7 +391,7 @@ SFTP replacement behavior must be tested against a local SFTP fixture or fake tr
 - **Displacement failure** (cannot rename to BAK/) -> log error and skip the displacement (file remains in place); counts toward the failure count in the completion line
 - **SWAP staging failure** (cannot create staging directory or write staging file) -> treat as transfer failure
 - **`set_mod_time` failure** (after a completed copy - file is already in place) -> log at error level; the copy is not undone. The destination peer's state line already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
-- **State write failure** -> log error at error level and leave whatever `state.txt` the peer already had; the next normal run repairs an interrupted replacement at startup (see state.md). Counts toward the failure count in the completion line
+- **State write failure** -> log error at error level and leave whatever state the peer already had; the next normal run repairs an interrupted replacement at startup (see state.md). Counts toward the failure count in the completion line
 
 ## Unicode Normalization
 

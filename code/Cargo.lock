@@ -874,6 +874,7 @@ name = "kitchensync"
 version = "0.1.0"
 dependencies = [
  "filetime",
+ "flate2",
  "percent-encoding",
  "russh",
  "russh-sftp",
