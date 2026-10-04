@@ -17,6 +17,7 @@ uv run --script extart/ephemeral-sftp-server.py
   - `--password PW`: accept password `PW` (default: any password);
   - `--authorized-key FILE`: accept the OpenSSH public key in `FILE`. With a key and no `--password` the server is **key-only** (rejects passwords) -- the saved-key / Ed25519 case; with both, it accepts **either** (fallback testing);
   - `--host-key FILE`: present a fixed private host key (Ed25519/ECDSA/RSA) instead of a fresh one, so a test can pin it.
+- `--allow-exec` makes the server run commands sent on an exec channel, as an OpenSSH server with shell access would, mapping absolute path arguments into its temp root. Without it, exec requests are refused, like an SFTP-only server. Tests of the whole-tree lister (sync.md, "Listing A Whole Tree") use both modes.
 - The server prints its host public key to stderr as `host key: <type> <base64>`, so a test that exercises host-key verification can build a `known_hosts` entry: `[127.0.0.1]:<port> <type> <base64>`.
 
 ## Symlinks

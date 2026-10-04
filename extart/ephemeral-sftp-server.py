@@ -31,11 +31,18 @@ Server quirks (to reproduce real peers in tests):
                        as macOS 26's fskit SFTP stack does on exFAT; the
                        posix-rename@openssh.com extension still works
   --no-posix-rename    answer posix-rename@openssh.com with "op unsupported"
+  --allow-exec         run commands sent on an exec channel, as an OpenSSH server
+                       with shell access would, after mapping each argument that
+                       is an absolute path into the temp root (the lister that
+                       KitchenSync sends as `perl - <root>`); without it, exec
+                       requests are refused, like a server with SFTP only
 """
 
 from __future__ import annotations
 
 import argparse
+import shlex
+import subprocess
 import atexit
 import base64
 import os
@@ -145,6 +152,16 @@ class _Server(paramiko.ServerInterface):
         if kind == "session":
             return paramiko.OPEN_SUCCEEDED
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    ALLOW_EXEC = False
+
+    def check_channel_exec_request(self, channel, command) -> bool:
+        if not self.ALLOW_EXEC:
+            return False
+        args = shlex.split(command.decode("utf-8", "replace"))
+        args = [_SFTP.ROOT + a if a.startswith("/") else a for a in args]
+        threading.Thread(target=_run_exec, args=(channel, args), daemon=True).start()
+        return True
 
     def _user_ok(self, username: str) -> bool:
         return self._user is None or username == self._user
@@ -300,6 +317,26 @@ class _SFTP(paramiko.SFTPServerInterface):
         return paramiko.SFTP_OK
 
 
+def _run_exec(channel, args: list[str]) -> None:
+    """Feed the channel's input to the command and send back its output."""
+    chunks = []
+    while True:
+        data = channel.recv(65536)
+        if not data:
+            break
+        chunks.append(data)
+    try:
+        done = subprocess.run(args, input=b"".join(chunks), capture_output=True)
+        channel.sendall(done.stdout)
+        channel.sendall_stderr(done.stderr)
+        status = done.returncode
+    except OSError as exc:
+        channel.sendall_stderr(f"{args[0]}: {exc}\n".encode())
+        status = 127
+    channel.send_exit_status(status)
+    channel.close()
+
+
 def _serve(client: socket.socket, host_key: paramiko.PKey, server: _Server) -> None:
     transport = paramiko.Transport(client)
     try:
@@ -342,7 +379,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--no-posix-rename", action="store_true",
                         help="report the posix-rename@openssh.com extension as "
                              "unsupported")
+    parser.add_argument("--allow-exec", action="store_true",
+                        help="run commands sent on an exec channel, with absolute "
+                             "path arguments mapped into the temp root")
     args = parser.parse_args(argv)
+    _Server.ALLOW_EXEC = args.allow_exec
     _SFTP.PLAIN_RENAME_FAILS = args.plain_rename_fails
     _SFTP.NO_POSIX_RENAME = args.no_posix_rename
 

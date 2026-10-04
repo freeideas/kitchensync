@@ -881,6 +881,12 @@ fn parse_listing(out: &[u8]) -> std::collections::HashMap<String, Vec<Entry>> {
 }
 
 impl SftpTransport {
+    /// Whether the whole-tree snapshot has arrived and still holds `dir`.
+    #[cfg(test)]
+    fn snapshot_has(&self, dir: &str) -> bool {
+        self.snap.lock().unwrap().dirs.as_ref().is_some_and(|d| d.contains_key(dir))
+    }
+
     /// Run the lister and wait for it. None when the server cannot run it
     /// (no shell access, no Perl, a Windows server) or it reports an error.
     async fn run_lister(mut channel: russh::Channel<client::Msg>) -> Option<std::collections::HashMap<String, Vec<Entry>>> {
@@ -1410,6 +1416,93 @@ mod tests {
         t.delete_dir("dir1").expect("delete_dir dir1");
         assert!(t.stat("dir1").unwrap_err().is_not_found());
         assert!(t.list_dir("").expect("list root").is_empty());
+    }
+
+    fn have_perl() -> bool {
+        Command::new("perl").arg("-v").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
+    /// Wait up to 60 seconds for the snapshot to hold `dir`.
+    fn wait_for_snapshot(t: &SftpTransport, dir: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if t.snapshot_has(dir) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn names(mut v: Vec<Entry>) -> Vec<(String, bool, i64)> {
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v.into_iter().map(|e| (e.name, e.is_dir, e.byte_size)).collect()
+    }
+
+    #[test]
+    fn whole_tree_listing_answers_first_listings() {
+        if !have_perl() {
+            println!("skipping: `perl` is not on PATH");
+            return;
+        }
+        let Some((t, _dir)) = start_server(&["--allow-exec"]) else { return };
+        t.create_dir("a/empty").unwrap();
+        t.create_dir(".kitchensync").unwrap();
+        for (path, body) in [("top.txt", "top"), ("a/x\ty.txt", "hello"), (".kitchensync/state.txt", "#")] {
+            let mut w = t.open_write(path).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+            w.close().unwrap();
+        }
+        t.preload();
+        assert!(wait_for_snapshot(&t, "a"), "the lister's snapshot never arrived");
+        assert!(!t.snapshot_has(".kitchensync"), "metadata folders are listed, not entered");
+        let first = names(t.list_dir("a").unwrap());
+        assert!(!t.snapshot_has("a"), "a directory is answered from the snapshot once");
+        assert_eq!(first, vec![("empty".to_string(), true, -1), ("x\ty.txt".to_string(), false, 5)]);
+        // Listed again: asked of the server, with the same answer.
+        assert_eq!(names(t.list_dir("a").unwrap()), first);
+        assert_eq!(names(t.list_dir("").unwrap()), vec![(".kitchensync".to_string(), true, -1), ("a".to_string(), true, -1), ("top.txt".to_string(), false, 3)]);
+        assert!(t.list_dir("a/empty").unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lister_fails_rather_than_list_part_of_a_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        if !have_perl() {
+            println!("skipping: `perl` is not on PATH");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kitchensync-lister-{}", std::process::id()));
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("inside")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let run = |dir: &std::path::Path| {
+            let mut child = Command::new("perl").arg("-").arg(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(LISTER.as_bytes()).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let out = run(&root);
+        let readable = std::fs::read_dir(&locked).is_ok(); // true when running as root
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert_eq!(out.status.code(), Some(2), "an unreadable directory must fail the whole listing");
+        }
+        let out = run(&root);
+        assert!(out.status.success());
+        let dirs = super::parse_listing(&out.stdout);
+        assert!(dirs.contains_key("locked/inside"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn without_shell_access_listings_use_sftp() {
+        let Some((t, _dir)) = start_server(&[]) else { return };
+        t.create_dir("a").unwrap();
+        t.preload();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!t.snapshot_has(""), "a server that refuses exec gives no snapshot");
+        assert_eq!(names(t.list_dir("").unwrap()), vec![("a".to_string(), true, -1)]);
     }
 
     #[test]
