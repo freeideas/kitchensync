@@ -353,6 +353,17 @@ Then `released/kitchensync.exe --dry-run --verbosity info --undo B/sub` prints e
 
 Then `released/kitchensync.exe --verbosity info A B` prints exactly the rollback hint and `sync complete`, and changes no user file: the subfolder run wrote its history back into the root's state.
 
+## S-29: An Older State Format Is Read And Upgraded
+
+Setup, every user file with modification time `2024-01-01_10-00-00_000000Z`:
+
+- `A/keep.txt` and `B/keep.txt` exist with bytes `keep`; `B/gone.txt` exists with bytes `gone`.
+- On both peers, `.kitchensync/state.txt` is in format 1 as it was first written, with a first line naming no version: `#`, a tab, `2024-02-01_10-00-00_000000Z`; then the lines `gone.txt	f	2024-01-01_10-00-00_000000Z	4	2024-02-01_10-00-00_000000Z	-` and `keep.txt	f	2024-01-01_10-00-00_000000Z	4	2024-02-01_10-00-00_000000Z	-`.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0 with stdout exactly `sync complete\n` and empty stderr. The user files under both peers are exactly `keep.txt`: A's old state shows A had `gone.txt` and lost it. On both peers `state.txt` is now a single line starting with `#`, a tab, `2`, a tab, and `state.gz` holds the lines, including one for `keep.txt`.
+
 # Properties
 
 ## P-01: Output Channels

@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-28 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-29 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -185,7 +185,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-28)
+# Scenarios (specs/SCENARIOS.md S-01..S-29)
 # --------------------------------------------------------------------------
 
 
@@ -880,6 +880,25 @@ def s28(tmp: Path) -> None:
     expect({p: tree(p) for p in (peer_a, peer_b)} == before, "the full sync changed files the subfolder sync had settled")
 
 
+def s29(tmp: Path) -> None:
+    peer_a, peer_b = tmp / "A", tmp / "B"
+    when, seen = "2024-01-01_10-00-00_000000Z", "2024-02-01_10-00-00_000000Z"
+    write_file(peer_a / "keep.txt", b"keep", when)
+    write_file(peer_b / "keep.txt", b"keep", when)
+    write_file(peer_b / "gone.txt", b"gone", when)
+    old_state = f"#\t{seen}\ngone.txt\tf\t{when}\t4\t{seen}\t-\nkeep.txt\tf\t{when}\t4\t{seen}\t-\n"
+    for peer in (peer_a, peer_b):
+        write_file(peer / ".kitchensync" / "state.txt", old_state.encode())
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b):
+        expect(tree(peer) == {"keep.txt": b"keep"}, f"user files under {peer}: {sorted(tree(peer))}")
+        marker = (peer / ".kitchensync" / "state.txt").read_text()
+        expect(marker.startswith("#\t2\t") and marker.count("\n") == 1, f"{peer}: state.txt should be a format-2 marker: {marker!r}")
+        lines = gzip.decompress((peer / ".kitchensync" / "state.gz").read_bytes()).decode()
+        expect("keep.txt\tf\t" in lines, f"{peer}: state.gz lacks keep.txt: {lines!r}")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -909,6 +928,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-26", "A Newer State Format Is Left Alone", s26),
     ("S-27", "A Deletion Wins Over The Same Version, Even Right After A Sync", s27),
     ("S-28", "Syncing A Subfolder Uses And Updates The Root's History", s28),
+    ("S-29", "An Older State Format Is Read And Upgraded", s29),
 ]
 
 

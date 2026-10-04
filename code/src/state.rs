@@ -30,13 +30,14 @@ pub const STATE_GZ: &str = "state.gz";
 pub const FORMAT: u32 = 2;
 
 /// The format version a state file or journal declares on its `#` line.
+/// A file that names no version is format 1, the first one.
 pub fn version(text: &str) -> u32 {
-    let Some(first) = text.lines().next() else { return FORMAT };
+    let Some(first) = text.lines().next() else { return 1 };
     let f: Vec<&str> = first.split('\t').collect();
     if f[0] != "#" {
-        return FORMAT;
+        return 1;
     }
-    f.get(1).and_then(|v| v.parse().ok()).unwrap_or(FORMAT)
+    f.get(1).and_then(|v| v.parse().ok()).unwrap_or(1)
 }
 
 /// The first line of a journal.
@@ -278,6 +279,8 @@ mod tests {
         assert_eq!(gunzip(&gzip(&text)).unwrap(), text);
         assert_eq!(version(&marker(1)), 2);
         assert_eq!(version("#\t7\t1970-01-01_00-00-09_000000Z\n"), 7);
+        assert_eq!(version("#\t1970-01-01_00-00-09_000000Z\na\tf\n"), 1, "no version named: the first format");
+        assert_eq!(version("a\tf\n"), 1);
         assert_eq!(version(&journal_header()), FORMAT);
         let (written, back) = parse_state(&text);
         assert_eq!(written, Some(9_000_000));
