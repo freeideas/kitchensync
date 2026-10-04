@@ -150,6 +150,7 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
 
     // Run 1-3: walk and wait for copies.
     for p in &peers {
+        p.transport.preload();
         index_moves(p);
     }
     let queue = CopyQueue::new(cfg.parallel, cfg.retries_copy, peers.clone());

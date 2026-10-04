@@ -137,4 +137,8 @@ impl Transport for Normalizing {
     fn set_mod_time(&self, path: &str, time: SystemTime) -> Result<()> {
         self.inner.set_mod_time(&self.resolve(path), time)
     }
+
+    fn preload(&self) {
+        self.inner.preload()
+    }
 }

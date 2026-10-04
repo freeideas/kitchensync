@@ -337,6 +337,12 @@ Displaced entries are recoverable from `<root>/.kitchensync/BAK/<run>/<relpath>`
 
 Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. A directory listing must return each entry's name, type, size and modification time in as few filesystem calls as the platform allows: on macOS that is one bulk attribute call per directory (`getattrlistbulk`), falling back to a per-entry stat only where the call is unavailable. On an external exFAT drive a per-entry stat costs a disk seek and a round trip through the user-space filesystem driver, tens of milliseconds each. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
 
+### Listing A Whole Tree
+
+Listing a remote tree directory by directory over SFTP costs a round trip per directory and, on most servers, a separate lookup per entry. When a sync starts, KitchenSync therefore asks each `sftp://` peer's server, over the same SSH connection, to run `perl - <root>` with a short program (`code/src/transport/lister.pl`) sent on standard input. Nothing is installed or left on the server. Perl is part of macOS and of nearly every Linux system. The program prints every regular file and directory under the root with its kind, size and modification time, lists but does not enter `.kitchensync` and `.git`, and exits with an error if any directory could not be read.
+
+The output becomes a snapshot that answers `list_dir` in place of the server, once per directory: only the first listing of a directory may come from it, and a directory already listed before the snapshot arrived is never answered from it. Anything listed again (for example after SWAP recovery) is asked of the server. If the server cannot run the program (no shell access, no Perl, a Windows server) or the program reports an error, there is no snapshot and every listing goes over SFTP. The walk never waits for the snapshot: a directory reached before it arrives is listed over SFTP.
+
 ### Required Operations
 
 Every transport must support:

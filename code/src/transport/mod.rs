@@ -114,6 +114,11 @@ pub trait Transport: Send + Sync {
     /// Remove an empty directory.
     fn delete_dir(&self, path: &str) -> Result<()>;
     fn set_mod_time(&self, path: &str, time: SystemTime) -> Result<()>;
+    /// Start listing the whole tree in the background, if this transport can
+    /// do that faster than directory by directory. Later `list_dir` calls may
+    /// then be answered from that listing (specs/sync.md, "Listing A Whole
+    /// Tree"). The default does nothing.
+    fn preload(&self) {}
 }
 
 /// Join a relative slash path onto another (either may be empty).
