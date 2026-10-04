@@ -306,12 +306,6 @@ pub fn connect_with_known_hosts(
                 }
                 Ok(r) => r?,
             };
-        // A busy server disk can keep a request waiting for minutes behind
-        // others (a large listing on a spinning drive), and giving up on it
-        // skips a whole directory. A dead connection is caught by the SSH
-        // keep-alive instead, so this limit only catches a server that has
-        // stopped answering requests while the connection stays up.
-        session.set_timeout(REQUEST_TIMEOUT_SECS);
 
         // 4. Prepare the remote root.
         let abs_root = if root.is_empty() { "/" } else { root.as_str() };
@@ -461,6 +455,13 @@ async fn open_sftp(
         .await
         .map_err(|e| TransportError::io(format!("server refused the sftp subsystem: {e}")))?;
     let mut session = RawSftpSession::new(channel.into_stream());
+    // Every channel gets this limit; the library's default is 10 seconds. A
+    // busy server disk can keep a request waiting for minutes behind others
+    // (a large listing on a spinning drive), and giving up on it skips a
+    // whole directory. A dead connection is caught by the SSH keep-alive
+    // instead, so this limit only catches a server that has stopped
+    // answering requests while the connection stays up.
+    session.set_timeout(REQUEST_TIMEOUT_SECS);
     let version = session
         .init()
         .await
@@ -722,6 +723,37 @@ struct SftpWriteHandle {
     handle: Option<String>,
     offset: u64,
     chunk: usize,
+    /// WRITE requests sent and not yet answered, oldest first. They stay in
+    /// flight across `write_all` calls, so the connection never sits idle
+    /// waiting for replies while there is data to send.
+    pending: std::collections::VecDeque<tokio::task::JoinHandle<std::result::Result<(), SftpError>>>,
+}
+
+/// Bytes of WRITE data kept in flight per open file.
+const WRITE_IN_FLIGHT_BYTES: usize = 8 << 20;
+
+impl SftpWriteHandle {
+    /// Wait for the oldest outstanding WRITE.
+    fn settle_one(&mut self) -> Result<()> {
+        let Some(task) = self.pending.pop_front() else { return Ok(()) };
+        match runtime().block_on(task) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(map_err(e)),
+            Err(e) => Err(TransportError::io(format!("sftp write task failed: {e}"))),
+        }
+    }
+
+    fn settle_all(&mut self) -> Result<()> {
+        let mut first = Ok(());
+        while !self.pending.is_empty() {
+            if let Err(e) = self.settle_one() {
+                if first.is_ok() {
+                    first = Err(e);
+                }
+            }
+        }
+        first
+    }
 }
 
 impl WriteHandle for SftpWriteHandle {
@@ -730,48 +762,34 @@ impl WriteHandle for SftpWriteHandle {
             return Err(TransportError::io("write on a closed handle"));
         };
         let chunk = self.chunk.max(1);
-        // Pipeline WRITE requests; every reply is checked before returning,
-        // so a reported success means the server has taken all the bytes.
-        for batch in buf.chunks(chunk * IN_FLIGHT) {
-            let mut tasks = Vec::new();
-            let mut at = 0usize;
-            for piece in batch.chunks(chunk) {
-                let session = Arc::clone(&self.session);
-                let handle = handle.clone();
-                let offset = self.offset + at as u64;
-                let data = piece.to_vec();
-                tasks.push(runtime().spawn(async move { session.write(handle, offset, data).await }));
-                at += piece.len();
+        let window = (WRITE_IN_FLIGHT_BYTES / chunk).max(1);
+        // A sliding pipeline: send each piece as soon as there is room, and
+        // wait only for the oldest reply when the window is full. Every reply
+        // is checked by `close`, so a successful close means the server has
+        // taken all the bytes.
+        for piece in buf.chunks(chunk) {
+            if self.pending.len() >= window {
+                self.settle_one()?;
             }
-            let mut first_err = None;
-            for task in tasks {
-                let outcome = match runtime().block_on(task) {
-                    Ok(Ok(_)) => Ok(()),
-                    Ok(Err(e)) => Err(map_err(e)),
-                    Err(e) => Err(TransportError::io(format!("sftp write task failed: {e}"))),
-                };
-                if let Err(e) = outcome {
-                    first_err.get_or_insert(e);
-                }
-            }
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-            self.offset += batch.len() as u64;
+            let session = Arc::clone(&self.session);
+            let handle = handle.clone();
+            let offset = self.offset;
+            let data = piece.to_vec();
+            self.pending.push_back(runtime().spawn(async move { session.write(handle, offset, data).await.map(|_| ()) }));
+            self.offset += piece.len() as u64;
         }
         Ok(())
     }
 
     fn close(mut self: Box<Self>) -> Result<()> {
+        let written = self.settle_all();
         let Some(handle) = self.handle.take() else {
-            return Ok(());
+            return written;
         };
         // Waits for the server's acknowledgement, so a successful close means
         // the file is complete on the server side.
-        runtime()
-            .block_on(self.session.close(handle))
-            .map(|_| ())
-            .map_err(map_err)
+        let closed = runtime().block_on(self.session.close(handle)).map(|_| ()).map_err(map_err);
+        written.and(closed)
     }
 }
 
@@ -917,6 +935,7 @@ impl Transport for SftpTransport {
                 handle: Some(handle),
                 offset: 0,
                 chunk: self.write_len,
+                pending: std::collections::VecDeque::new(),
             }) as Box<dyn WriteHandle>)
         })
     }
