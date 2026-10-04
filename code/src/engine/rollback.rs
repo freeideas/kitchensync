@@ -8,7 +8,7 @@ use crate::transport::{join, Entry, Transport};
 use crate::util::{now_micros, parse_time, system_to_micros};
 
 use super::fsops::{self, exists, PeerRef};
-use super::peer::{self, in_bak, meta, note_failure, Peer};
+use super::peer::{self, in_bak, note_failure, Peer};
 
 const TOL: i64 = 5_000_000;
 
@@ -23,7 +23,7 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
             note_failure();
             continue;
         };
-        let target = match ts.or_else(|| peer::last_run_start(p.t())).or(newest.map(|t| t - 1)) {
+        let target = match ts.or_else(|| peer::last_run_start(p.t(), &p.up)).or(newest.map(|t| t - 1)) {
             Some(t) => t,
             None => {
                 output::line(&format!("nothing to undo for {}", p.url));
@@ -45,7 +45,7 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
 /// Every journal line on the peer, and the newest journal's start time; None
 /// when a journal has a format this KitchenSync does not read.
 fn read_journals(p: &Peer) -> Option<(Vec<JLine>, Option<i64>)> {
-    let dir = meta("journal");
+    let dir = p.meta_at("journal");
     let Ok(entries) = p.t().list_dir(&dir) else { return Some((Vec::new(), None)) };
     let mut lines = Vec::new();
     let mut newest = None;
@@ -55,7 +55,21 @@ fn read_journals(p: &Peer) -> Option<(Vec<JLine>, Option<i64>)> {
             if state::version(&text) > state::FORMAT {
                 return None;
             }
-            lines.extend(state::parse_journal(&text));
+            // Journal paths are relative to the folder that holds the
+            // state; keep the lines inside this sync root, in its terms.
+            for mut l in state::parse_journal(&text) {
+                let Some(path) = p.from_anchor(&l.path) else { continue };
+                let other = match &l.other {
+                    Some(o) => match p.from_anchor(o) {
+                        Some(o) => Some(o),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                l.path = path;
+                l.other = other;
+                lines.push(l);
+            }
         }
     }
     Some((lines, newest))

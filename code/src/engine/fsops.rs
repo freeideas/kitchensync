@@ -217,7 +217,7 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
                     continue;
                 }
             }
-            let to_dir = super::peer::meta(&format!("BAK/{}/{}", s.name, dir));
+            let to_dir = peer.meta_at(&format!("BAK/{}/{}", s.name, join(&peer.prefix, dir)));
             if !kept.is_empty() {
                 if let Err(e) = peer.ensure_dir(&to_dir) {
                     fail("making BAK folder", &e);
@@ -274,7 +274,7 @@ pub fn displace(peer: &Peer, rel: &str, entry: Option<&Entry>, dry_run: bool) ->
 pub fn cleanup_root(peer: &Peer, keep_bak_days: u64) {
     let t = peer.t();
     let cutoff = crate::util::now_micros() - (keep_bak_days as i64) * 86_400 * 1_000_000;
-    let bak = super::peer::meta("BAK");
+    let bak = peer.meta_at("BAK");
     if let Ok(entries) = t.list_dir(&bak) {
         for e in entries {
             if parse_time(&e.name).is_some_and(|ts| ts < cutoff) {
@@ -284,7 +284,7 @@ pub fn cleanup_root(peer: &Peer, keep_bak_days: u64) {
             }
         }
     }
-    let journals = super::peer::meta("journal");
+    let journals = peer.meta_at("journal");
     if let Ok(entries) = t.list_dir(&journals) {
         for e in entries {
             let stamp = e.name.strip_suffix(".txt").unwrap_or(&e.name);

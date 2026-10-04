@@ -38,11 +38,50 @@ pub struct Peer {
     journal: Mutex<Option<Box<dyn WriteHandle>>>,
     /// Directories this run has already made (BAK parents), to skip the calls.
     made: Mutex<HashSet<String>>,
+    /// Where the state, journal, BAK and run log live, relative to the sync
+    /// root: "" for the root itself, or `..`, `../..` and so on when the
+    /// root has no state and takes it from an ancestor (specs/state.md,
+    /// "Syncing part of a tree").
+    pub up: String,
+    /// The sync root's path relative to that ancestor ("" for the root).
+    /// The state, journal and BAK use paths relative to the ancestor.
+    pub prefix: String,
 }
 
 impl Peer {
     pub fn new(index: usize, role: Role, url: String, transport: Arc<dyn Transport>, had_history: bool, run: String, dry_run: bool, keep_del_days: u64, history: History) -> Peer {
-        Peer { index, role, url, transport, had_history, run, dry_run, keep_del_days, history, moves: Index::default(), journal: Mutex::new(None), made: Mutex::new(HashSet::new()) }
+        Peer { index, role, url, transport, had_history, run, dry_run, keep_del_days, history, moves: Index::default(), journal: Mutex::new(None), made: Mutex::new(HashSet::new()), up: String::new(), prefix: String::new() }
+    }
+
+    /// A path inside the `.kitchensync` folder that holds this peer's state.
+    pub fn meta_at(&self, path: &str) -> String {
+        join(&self.up, &meta(path))
+    }
+
+    /// A path as the state and journal record it: relative to the folder
+    /// that holds the state. `path` is a sync-root path, or a path into that
+    /// folder's BAK as `meta_at` builds it.
+    pub fn to_anchor(&self, path: &str) -> String {
+        if !self.up.is_empty() {
+            if let Some(rest) = path.strip_prefix(&self.up).and_then(|r| r.strip_prefix('/')) {
+                return rest.to_string();
+            }
+        }
+        join(&self.prefix, path)
+    }
+
+    /// The reverse of `to_anchor`; None for a path outside this sync root.
+    pub fn from_anchor(&self, path: &str) -> Option<String> {
+        if path.starts_with(".kitchensync/") {
+            return Some(join(&self.up, path));
+        }
+        if self.prefix.is_empty() {
+            return Some(path.to_string());
+        }
+        if path == self.prefix {
+            return Some(String::new());
+        }
+        path.strip_prefix(&self.prefix).and_then(|r| r.strip_prefix('/')).map(str::to_string)
     }
 
     pub fn is_canon(&self) -> bool {
@@ -65,10 +104,10 @@ impl Peer {
         if self.dry_run {
             return;
         }
-        let line = JLine { ts: now_micros(), op, path: path.to_string(), other: other.map(str::to_string), byte_size, mod_time }.format();
+        let line = JLine { ts: now_micros(), op, path: self.to_anchor(path), other: other.map(|o| self.to_anchor(o)), byte_size, mod_time }.format();
         let mut g = self.journal.lock().unwrap();
         if g.is_none() {
-            let opened = self.t().open_write(&journal_path(&self.run)).and_then(|mut w| {
+            let opened = self.t().open_write(&self.meta_at(&format!("journal/{}.txt", self.run))).and_then(|mut w| {
                 w.write_all(state::journal_header().as_bytes())?;
                 Ok(w)
             });
@@ -106,7 +145,7 @@ impl Peer {
     /// Move `from` to BAK as the entry at `rel` (specs/state.md, "BAK") and
     /// return where it went. Writes no journal line; the caller does.
     pub fn move_to_bak(&self, from: &str, rel: &str) -> Result<String> {
-        let to = bak_path(&self.run, rel);
+        let to = self.meta_at(&format!("BAK/{}/{}", self.run, join(&self.prefix, rel)));
         self.ensure_dir(crate::util::parent_path(&to))?;
         match self.t().rename(from, &to) {
             Ok(()) => Ok(to),
@@ -115,7 +154,7 @@ impl Peer {
                 if self.t().stat(&to).is_err() {
                     return Err(e);
                 }
-                let to = bak_path(&now_string(), rel);
+                let to = self.meta_at(&format!("BAK/{}/{}", now_string(), join(&self.prefix, rel)));
                 self.ensure_dir(crate::util::parent_path(&to))?;
                 self.t().rename(from, &to)?;
                 Ok(to)
@@ -132,7 +171,17 @@ impl Peer {
         let cutoff = now_micros() - (self.keep_del_days as i64) * 86_400 * 1_000_000;
         let (body, nested) = {
             let g = self.history.inner.lock().unwrap();
-            let body = state::serialize_body(&g.tree, cutoff, "");
+            let body = match &g.outer {
+                // Part of a larger tree: our lines replace that subtree's.
+                Some(outer) => {
+                    let mut merged: Tree = outer.iter().filter(|(d, _)| !under(d, &self.prefix)).map(|(d, l)| (d.clone(), l.clone())).collect();
+                    for (d, lines) in &g.tree {
+                        merged.insert(join(&self.prefix, d), lines.clone());
+                    }
+                    state::serialize_body(&merged, cutoff, "")
+                }
+                None => state::serialize_body(&g.tree, cutoff, ""),
+            };
             if body == g.written_body {
                 return;
             }
@@ -140,7 +189,7 @@ impl Peer {
             (body, nested)
         };
         let now = now_micros();
-        match write_state_files(self.t(), "", now, &body) {
+        match write_state_files(self.t(), &self.up, now, &body) {
             Ok(()) => self.history.inner.lock().unwrap().written_body = body,
             Err(e) => {
                 output::error(&format!("state write failed for {}: {}", self.url, e));
@@ -171,17 +220,14 @@ pub fn meta(path: &str) -> String {
     join(META, path)
 }
 
-pub fn bak_path(stamp: &str, rel: &str) -> String {
-    meta(&format!("BAK/{stamp}/{rel}"))
-}
-
-pub fn journal_path(stamp: &str) -> String {
-    meta(&format!("journal/{stamp}.txt"))
-}
-
-/// Whether `path` lies inside the root's BAK.
+/// Whether `path` lies inside the BAK that holds this peer's displaced
+/// entries (at the root, or at the ancestor that holds the state).
 pub fn in_bak(path: &str) -> bool {
-    path.starts_with(".kitchensync/BAK/")
+    let mut p = path;
+    while let Some(rest) = p.strip_prefix("../") {
+        p = rest;
+    }
+    p.starts_with(".kitchensync/BAK/")
 }
 
 /// Global count of failures that turn `sync complete` into exit code 2.
@@ -205,6 +251,9 @@ struct HistInner {
     written_body: String,
     /// Nested sync roots found during the run, rewritten at the end.
     nested: Vec<String>,
+    /// The ancestor's whole tree, when this root takes its history from an
+    /// ancestor; `tree` is then that tree's subtree, rebased here.
+    outer: Option<Tree>,
 }
 
 fn under(dir: &str, prefix: &str) -> bool {
@@ -216,7 +265,21 @@ impl History {
         let (written, tree) = text.map(state::parse_state).unwrap_or_default();
         let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
         let written_body = if text.is_some() { state::serialize_body(&tree, cutoff, "") } else { String::new() };
-        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new() }), write_lock: Mutex::new(()) }
+        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), outer: None }), write_lock: Mutex::new(()) }
+    }
+
+    /// History taken from an ancestor's state: the subtree at `prefix`,
+    /// rebased to this root. The whole tree is kept to write back.
+    pub fn from_ancestor(text: &str, prefix: &str, keep_del_days: u64) -> History {
+        let (written, outer) = state::parse_state(text);
+        let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
+        let written_body = state::serialize_body(&outer, cutoff, "");
+        let mut tree = Tree::new();
+        for (d, lines) in outer.iter().filter(|(d, _)| under(d, prefix)) {
+            let rel = if d == prefix { String::new() } else { d[prefix.len() + 1..].to_string() };
+            tree.insert(rel, lines.clone());
+        }
+        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), outer: Some(outer) }), write_lock: Mutex::new(()) }
     }
 
     /// The lines for `dir`'s children.
@@ -446,15 +509,15 @@ impl DirState {
 pub const RUNS: &str = "runs.txt";
 
 /// Append one line to `<root>/.kitchensync/runs.txt` (kept to the last 1000).
-pub fn append_run(t: &dyn Transport, line: &str) -> Result<()> {
-    let path = meta(RUNS);
+pub fn append_run(t: &dyn Transport, base: &str, line: &str) -> Result<()> {
+    let path = join(base, &meta(RUNS));
     let mut text = read_text(t, &path)?.unwrap_or_default();
     text.push_str(line);
     text.push('\n');
     let lines: Vec<&str> = text.lines().collect();
     let keep = if lines.len() > 1000 { &lines[lines.len() - 1000..] } else { &lines[..] };
     let text = keep.join("\n") + "\n";
-    replace_meta_file(t, "", RUNS, text.as_bytes())
+    replace_meta_file(t, base, RUNS, text.as_bytes())
 }
 
 /// Write a state in format 2: the lines to `state.gz`, then the one-line
@@ -493,8 +556,8 @@ pub fn read_state(t: &dyn Transport, dir: &str, fallbacks: bool) -> Result<Optio
 }
 
 /// Start timestamp of the newest run recorded at the root, if any.
-pub fn last_run_start(t: &dyn Transport) -> Option<i64> {
-    let text = read_text(t, &meta(RUNS)).ok()??;
+pub fn last_run_start(t: &dyn Transport, base: &str) -> Option<i64> {
+    let text = read_text(t, &join(base, &meta(RUNS))).ok()??;
     text.lines().rev().find_map(|l| crate::util::parse_time(l.split('\t').next()?))
 }
 
@@ -528,8 +591,8 @@ fn exists(t: &dyn Transport, p: &str) -> Result<bool> {
 
 /// Repair an interrupted replacement of `<root>/.kitchensync/<name>`
 /// (specs/state.md, "Writing").
-pub fn recover_meta_file(t: &dyn Transport, name: &str) -> Result<()> {
-    let live = meta(name);
+pub fn recover_meta_file(t: &dyn Transport, base: &str, name: &str) -> Result<()> {
+    let live = join(base, &meta(name));
     let new = format!("{live}.new");
     let old = format!("{live}.old");
     let has_old = exists(t, &old)?;

@@ -183,7 +183,8 @@ fn stage_end(peer: &Peer, dir: &str) {
     // Still holding the lock: no other copy can start staging here meanwhile.
     let t = peer.t();
     let meta = meta_dir(dir);
-    if fsops::delete_litter_dir(t, &join(&meta, "SWAP")).is_ok() && !dir.is_empty() {
+    // The root keeps its `.kitchensync` unless the state lives further up.
+    if fsops::delete_litter_dir(t, &join(&meta, "SWAP")).is_ok() && (!dir.is_empty() || !peer.up.is_empty()) {
         let _ = fsops::delete_litter_dir(t, &meta);
     }
 }

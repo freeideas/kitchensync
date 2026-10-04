@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-27 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-28 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -185,7 +185,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-27)
+# Scenarios (specs/SCENARIOS.md S-01..S-28)
 # --------------------------------------------------------------------------
 
 
@@ -855,6 +855,31 @@ def s27(tmp: Path) -> None:
         expect(tree(peer) == {"edited.txt": b"v2 edited\n"}, f"user files under {peer}: {tree(peer)}")
 
 
+def s28(tmp: Path) -> None:
+    peer_a, peer_b = tmp / "A", tmp / "B"
+    when = "2024-01-01_10-00-00_000000Z"
+    for name in ("keep.txt", "gone.txt"):
+        write_file(peer_a / "sub" / name, name.encode(), when)
+    write_file(peer_a / "top.txt", b"top", when)
+    peer_b.mkdir(parents=True, exist_ok=True)
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stdout {setup.stdout!r}")
+    (peer_a / "sub" / "gone.txt").unlink()
+    write_file(peer_b / "sub" / "new.txt", b"new")
+    result = run_ks(["--verbosity", "error", str(peer_a / "sub"), str(peer_b / "sub")], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b):
+        expect(tree(peer) == {"top.txt": b"top", "sub/keep.txt": b"keep.txt", "sub/new.txt": b"new"}, f"user files under {peer}: {sorted(tree(peer))}")
+        expect(not (peer / "sub" / ".kitchensync").exists(), f"{peer / 'sub'} should hold no .kitchensync")
+    expect(merged_bak_files(peer_b) == {"sub/gone.txt": b"gone.txt"}, f"files in B's BAK: {merged_bak_files(peer_b)}")
+    undo = run_ks(["--dry-run", "--verbosity", "info", "--undo", str(peer_b / "sub")], tmp)
+    assert_result(undo, b"dry run\nR1 gone.txt\nrollback complete\n")
+    before = {p: tree(p) for p in (peer_a, peer_b)}
+    full = run_ks(["--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    check_info_lines(full, ["sync complete"])
+    expect({p: tree(p) for p in (peer_a, peer_b)} == before, "the full sync changed files the subfolder sync had settled")
+
+
 SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-01", "Help With No Arguments", s01),
     ("S-02", "First Sync From Canon", s02),
@@ -883,6 +908,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-25", "Per-Directory Manifests Are Read And Converted", s25),
     ("S-26", "A Newer State Format Is Left Alone", s26),
     ("S-27", "A Deletion Wins Over The Same Version, Even Right After A Sync", s27),
+    ("S-28", "Syncing A Subfolder Uses And Updates The Root's History", s28),
 ]
 
 

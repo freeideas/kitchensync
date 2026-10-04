@@ -77,9 +77,20 @@ A run stopped between the two replacements leaves the new `state.gz` behind the 
 
 When an entry is confirmed absent on a peer whose line has `deleted_time` `-`, the line is kept and `deleted_time` is set to a deletion estimate: the line's `last_seen` if present, otherwise a freshly generated timestamp. The estimate says "the deletion happened sometime after this". If `deleted_time` is already set, repeated confirmation of absence leaves it unchanged. Tombstones are dropped when older than `--keep-del-days` (default: 180).
 
+### Syncing part of a tree
+
+A sync can start at a folder inside a tree that is usually synced from higher up: syncing `/X/b/c` on a day when `/X/b` is the usual root. When the sync root has neither a state of its own nor a per-directory manifest, KitchenSync looks upward, one folder at a time, for the nearest ancestor whose `.kitchensync/` holds a state (repairing an interrupted replacement there first, as at the root; a dry run repairs nothing). If it finds one:
+
+- the peer has history, and its history is that state's lines for the subtree, rebased to the sync root;
+- the run writes its lines back into that ancestor's state, replacing the subtree's lines and keeping all others, and writes no state at the sync root;
+- the run's journal, BAK and run log are the ancestor's, with paths relative to the ancestor (`BAK/<run>/c/<path>`, journal paths `c/<path>`), so a later run or rollback from either folder reads the same records;
+- an empty `.kitchensync` folder left at the sync root by SWAP staging is removed, as below the root.
+
+A rollback started at the sync root finds the same ancestor and undoes the journal lines that lie inside its subtree. Exclude patterns come only from the sync root's own `.kitchensync/ignore` and the command line, since an ancestor's patterns are written relative to the ancestor. If no ancestor has a state, the peer has no history.
+
 ### Nested sync roots
 
-A folder can be a sync root in one run and part of a larger tree in another: syncing `/X/b/c` one day and `/X/b` the next. When the walk lists a directory below the root and the listing shows a `.kitchensync` folder there holding `state.txt`, that directory is a nested sync root. If its state was written later than the outer root's, its lines replace the outer state's lines for that subtree on that peer (with the nested directory's path prefixed). At the end of the run, the outer run writes the nested root's state too, with the run's lines for that subtree, so both roots stay current. A nested root's `journal/`, `BAK/` and `runs.txt` belong to it and are left alone.
+A folder that has a state of its own (written when it was synced as a root while no ancestor had one) is a nested sync root. When the walk lists a directory below the root and the listing shows a `.kitchensync` folder there holding `state.txt`, that directory is a nested sync root. If its state was written later than the outer root's, its lines replace the outer state's lines for that subtree on that peer (with the nested directory's path prefixed). At the end of the run, the outer run writes the nested root's state too, with the run's lines for that subtree, so both roots stay current. A nested root's `journal/`, `BAK/` and `runs.txt` belong to it and are left alone.
 
 ### Per-directory manifests
 

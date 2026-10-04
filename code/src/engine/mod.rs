@@ -39,7 +39,8 @@ pub fn run(cfg: Config) -> i32 {
     let mut peers: Vec<PeerRef> = Vec::new();
     for (index, (spec, conn)) in cfg.peers.iter().zip(connected).enumerate() {
         let Some((url, transport)) = conn else { continue };
-        match open_peer(cfg, index, spec.role, url.clone(), transport, &run_start) {
+        let path = spec.urls.iter().find(|u| u.normalized == url).map(|u| u.path.clone()).unwrap_or_default();
+        match open_peer(cfg, index, spec.role, url.clone(), &path, transport, &run_start) {
             Ok(p) => peers.push(Arc::new(p)),
             Err(e) => output::error(&format!("peer unreachable: {}: {}", url, e)),
         }
@@ -54,28 +55,63 @@ pub fn run(cfg: Config) -> i32 {
 
 /// Startup 5 for one peer: repair, then read its history into memory
 /// (specs/sync.md, "Startup"; specs/state.md, "Reading").
-fn open_peer(cfg: &Config, index: usize, role: Role, url: String, transport: Arc<dyn Transport>, run: &str) -> Result<Peer, TransportError> {
+fn open_peer(cfg: &Config, index: usize, role: Role, url: String, root_path: &str, transport: Arc<dyn Transport>, run: &str) -> Result<Peer, TransportError> {
     let t = transport.as_ref();
-    if !cfg.dry_run {
-        peer::recover_meta_file(t, state::STATE)?;
-        peer::recover_meta_file(t, state::STATE_GZ)?;
-        peer::recover_meta_file(t, peer::RUNS)?;
-    }
+    let repair = |base: &str| -> Result<(), TransportError> {
+        if !cfg.dry_run {
+            for name in [state::STATE, state::STATE_GZ, peer::RUNS] {
+                peer::recover_meta_file(t, base, name)?;
+            }
+        }
+        Ok(())
+    };
+    let too_new = |text: &Option<String>| match text.as_deref().map(state::version).filter(|v| *v > state::FORMAT) {
+        Some(v) => Err(TransportError::io(format!("state.txt is format {v}, newer than this KitchenSync reads (format {}); use a newer KitchenSync", state::FORMAT))),
+        None => Ok(()),
+    };
+    repair("")?;
     // A dry run repairs nothing, so it reads what a repair would keep.
     let text = peer::read_state(t, "", cfg.dry_run)?;
-    if let Some(v) = text.as_deref().map(state::version).filter(|v| *v > state::FORMAT) {
-        return Err(TransportError::io(format!("state.txt is format {v}, newer than this KitchenSync reads (format {}); use a newer KitchenSync", state::FORMAT)));
-    }
+    too_new(&text)?;
     let manifest = match text {
         Some(_) => None,
         None => peer::read_text(t, &meta(state::LEGACY_MANIFEST))?,
     };
-    let history = History::new(text.as_deref(), cfg.keep_del_days);
+    // A root with no history of its own takes it from the nearest ancestor
+    // that has some (specs/state.md, "Syncing part of a tree").
+    let mut anchor = None;
+    if text.is_none() && manifest.is_none() {
+        for (up, prefix) in ancestors(root_path) {
+            repair(&up)?;
+            let found = peer::read_state(t, &up, cfg.dry_run)?;
+            if found.is_some() {
+                too_new(&found)?;
+                anchor = found.map(|text| (up, prefix, text));
+                break;
+            }
+        }
+    }
+    let (history, up, prefix) = match &anchor {
+        Some((up, prefix, text)) => (History::from_ancestor(text, prefix, cfg.keep_del_days), up.clone(), prefix.clone()),
+        None => (History::new(text.as_deref(), cfg.keep_del_days), String::new(), String::new()),
+    };
     if let Some(m) = &manifest {
         history.settle("", state::parse_manifest(m));
     }
-    let had_history = text.is_some() || manifest.is_some();
-    Ok(Peer::new(index, role, url, transport, had_history, run.to_string(), cfg.dry_run, cfg.keep_del_days, history))
+    let had_history = text.is_some() || manifest.is_some() || anchor.is_some();
+    let mut p = Peer::new(index, role, url, transport, had_history, run.to_string(), cfg.dry_run, cfg.keep_del_days, history);
+    p.up = up;
+    p.prefix = prefix;
+    Ok(p)
+}
+
+/// The folders above a sync root, nearest first: the relative way up
+/// (`..`, `../..`, ...) and the root's path below each. `path` is the root's
+/// absolute path; a Windows drive letter is as far up as it goes.
+fn ancestors(path: &str) -> Vec<(String, String)> {
+    let comps: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    let top = if comps.first().is_some_and(|c| c.ends_with(':')) { comps.len().saturating_sub(1) } else { comps.len() };
+    (1..=top).map(|d| (vec![".."; d].join("/"), comps[comps.len() - d..].join("/"))).collect()
 }
 
 /// Fill a peer's move index: its large live files, and the files its
@@ -84,7 +120,7 @@ fn index_moves(p: &Peer) {
     for (path, size, mt) in p.history.all_files(moves::MOVE_MIN) {
         p.moves.add(path, size, mt);
     }
-    let dir = meta("journal");
+    let dir = p.meta_at("journal");
     let Ok(entries) = p.t().list_dir(&dir) else { return };
     let mut lines: Vec<state::JLine> = Vec::new();
     for e in entries.iter().filter(|e| !e.is_dir) {
@@ -96,7 +132,9 @@ fn index_moves(p: &Peer) {
     for l in &lines {
         let (Some(other), Some(size), Some(mt)) = (&l.other, l.byte_size, l.mod_time) else { continue };
         if (l.op == 'X' || l.op == 'B') && !moved_out.contains(other.as_str()) {
-            p.moves.add(other.clone(), size, mt);
+            if let Some(here) = p.from_anchor(other) {
+                p.moves.add(here, size, mt);
+            }
         }
     }
 }
@@ -136,7 +174,7 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         output::info(&format!("undo later with: kitchensync --rollback {} {}", run_start, list.join(" ")));
         let line = format!("{}\t{}", run_start, list.join(" "));
         for p in &peers {
-            if let Err(e) = peer::append_run(p.transport.as_ref(), &line) {
+            if let Err(e) = peer::append_run(p.transport.as_ref(), &p.up, &line) {
                 output::error(&format!("run record failed for {}: {}", p.url, e));
             }
         }
@@ -184,7 +222,7 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         p.close_journal();
         // The root's own per-directory manifest is now in the state file,
         // once that file is there.
-        if !cfg.dry_run && fsops::exists(p.t(), &meta(state::STATE)).unwrap_or(false) {
+        if !cfg.dry_run && p.up.is_empty() && fsops::exists(p.t(), &meta(state::STATE)).unwrap_or(false) {
             for n in ["manifest.txt", "manifest.txt.new", "manifest.txt.old"] {
                 let _ = p.t().delete_file(&meta(n));
             }

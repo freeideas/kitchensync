@@ -337,6 +337,22 @@ Action: run `released/kitchensync.exe --verbosity error A B C`.
 
 Outcome: the process exits 0 with stdout exactly `sync complete\n` and empty stderr. No peer has `fresh.txt`: A deleted it in the earlier run, B lost it then, and C's copy is the version A deleted, so it goes too, although every time involved lies within a few seconds. All three peers hold `edited.txt` with bytes `v2 edited\n`: C edited it after A last saw it, so the edit survives A's deletion.
 
+## S-28: Syncing A Subfolder Uses And Updates The Root's History
+
+Setup:
+
+- `A/sub/keep.txt` (bytes `keep.txt`), `A/sub/gone.txt` (bytes `gone.txt`) and `A/top.txt` (bytes `top`) exist, all with modification time `2024-01-01_10-00-00_000000Z`. `B/` exists and is empty.
+- Run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
+- Delete `A/sub/gone.txt`. Create `B/sub/new.txt` with bytes `new`.
+
+Action: run `released/kitchensync.exe --verbosity error A/sub B/sub`.
+
+Outcome: the process exits 0 with stdout exactly `sync complete\n` and empty stderr: neither subfolder has a state of its own, so both take their history from the root, and there is no first-sync line. The user files under both peers are exactly `top.txt`, `sub/keep.txt` and `sub/new.txt`: the deletion reached B, and B's new file reached A (B was not made subordinate). Neither `A/sub` nor `B/sub` holds a `.kitchensync` folder. The files in B's BAK (at `B/.kitchensync/BAK/`) are exactly `sub/gone.txt`.
+
+Then `released/kitchensync.exe --dry-run --verbosity info --undo B/sub` prints exactly `dry run`, `R1 gone.txt`, `rollback complete`: the journal at B's root records the subfolder run in root paths, and the undo reads it in the subfolder's.
+
+Then `released/kitchensync.exe --verbosity info A B` prints exactly the rollback hint and `sync complete`, and changes no user file: the subfolder run wrote its history back into the root's state.
+
 # Properties
 
 ## P-01: Output Channels
