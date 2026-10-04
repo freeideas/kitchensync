@@ -820,8 +820,9 @@ def s26(tmp: Path) -> None:
     write_file(peer_b / ".kitchensync" / "state.txt", newer)
     peer_c.mkdir(parents=True, exist_ok=True)
     result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), str(peer_c)], tmp)
+    shown = peer_b.as_posix() if peer_b.as_posix().startswith("/") else "/" + peer_b.as_posix()
     expected = (
-        f"peer unreachable: file://{peer_b.as_posix()}: io_error: state.txt is format 99, newer than this "
+        f"peer unreachable: file://{shown}: io_error: state.txt is format 99, newer than this "
         "KitchenSync reads (format 1); use a newer KitchenSync\n"
         "first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\n"
         "sync complete\n"

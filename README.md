@@ -97,7 +97,7 @@ This syncs two local folders but leaves the `PortablePlatform/PortableApps` fold
 
 **Moves and renames cost almost nothing.** Reorganize a folder on one peer and the other peers move their own copies into place instead of downloading them again (`M` lines in the output). This applies to files of 1 MiB or more whose size, date, and sampled contents match a file that peer holds elsewhere, or set aside in an earlier run.
 
-**Nothing to install on the other machines.** A remote peer needs only SSH. When its server has Perl (macOS and nearly every Linux do), KitchenSync sends it a short listing program with each run, which scans a remote tree many times faster than asking for one folder at a time; without Perl it simply asks folder by folder.
+**Nothing to install on the other machines.** A remote peer needs only SSH. KitchenSync sends the server a short listing program with each run, in Perl (part of macOS and nearly every Linux) or PowerShell (part of Windows), which scans a remote tree many times faster than asking for one folder at a time; where neither can run, it simply asks folder by folder.
 
 **Undo.** The first line of every run is the command that puts things back. Displaced files are kept 90 days (`--keep-bak-days`).
 

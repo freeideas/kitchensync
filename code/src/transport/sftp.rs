@@ -172,7 +172,7 @@ pub struct SftpTransport {
     root: String,
     /// Held only to keep the SSH session alive; dropping it closes the
     /// connection. Behind a mutex so the transport is `Sync`.
-    _ssh: Mutex<client::Handle<HostKeyCheck>>,
+    ssh: Arc<client::Handle<HostKeyCheck>>,
     /// The whole-tree listing started by `preload`, and the directories
     /// already listed (see `Snapshot`).
     snap: Arc<Mutex<Snapshot>>,
@@ -344,7 +344,7 @@ pub fn connect_with_known_hosts(
             read_len,
             write_len,
             root,
-            _ssh: Mutex::new(ssh),
+            ssh: Arc::new(ssh),
             snap: Arc::new(Mutex::new(Snapshot::default())),
         })
     })
@@ -849,6 +849,39 @@ struct Snapshot {
 }
 
 const LISTER: &str = include_str!("lister.pl");
+const LISTER_WINDOWS: &str = include_str!("lister.ps1");
+
+/// Base64, for PowerShell's -EncodedCommand.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The commands that may list the tree, tried in order: Perl (macOS, Linux
+/// and most other Unix systems), then PowerShell (Windows). Each is a
+/// command line and what to send on its standard input.
+fn lister_commands(root: &str) -> Vec<(String, Vec<u8>)> {
+    // A Windows server reports a drive path as `/C:/...`; PowerShell wants `C:/...`.
+    let b = root.as_bytes();
+    let win_root = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' { &root[1..] } else { root };
+    let script = format!("$root = '{}'\n{}", win_root.replace('\'', "''"), LISTER_WINDOWS);
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    vec![
+        (format!("perl - {}", shell_quote(root)), LISTER.as_bytes().to_vec()),
+        (format!("powershell -NoProfile -NonInteractive -EncodedCommand {}", base64(&utf16)), Vec::new()),
+    ]
+}
 
 /// Quote a path for a POSIX shell.
 fn shell_quote(s: &str) -> String {
@@ -889,8 +922,12 @@ impl SftpTransport {
 
     /// Run the lister and wait for it. None when the server cannot run it
     /// (no shell access, no Perl, a Windows server) or it reports an error.
-    async fn run_lister(mut channel: russh::Channel<client::Msg>) -> Option<std::collections::HashMap<String, Vec<Entry>>> {
-        channel.data_bytes(LISTER.as_bytes().to_vec()).await.ok()?;
+    async fn run_lister(ssh: &client::Handle<HostKeyCheck>, command: String, input: Vec<u8>) -> Option<std::collections::HashMap<String, Vec<Entry>>> {
+        let mut channel = ssh.channel_open_session().await.ok()?;
+        channel.exec(true, command).await.ok()?;
+        if !input.is_empty() {
+            channel.data_bytes(input).await.ok()?;
+        }
         channel.eof().await.ok()?;
         let mut out = Vec::new();
         let mut status = None;
@@ -908,25 +945,23 @@ impl SftpTransport {
 impl Transport for SftpTransport {
     fn preload(&self) {
         let root = if self.root.is_empty() { "/".to_string() } else { self.root.clone() };
-        let command = format!("perl - {}", shell_quote(&root));
-        let opened = {
-            let ssh = self._ssh.lock().unwrap();
-            runtime().block_on(async {
-                let ch = ssh.channel_open_session().await.ok()?;
-                ch.exec(true, command).await.ok()?;
-                Some(ch)
-            })
-        };
-        let Some(channel) = opened else { return };
+        let ssh = Arc::clone(&self.ssh);
         let snap = Arc::clone(&self.snap);
         runtime().spawn(async move {
-            if let Some(mut dirs) = Self::run_lister(channel).await {
-                let mut g = snap.lock().unwrap();
-                let listed = std::mem::take(&mut g.listed);
-                dirs.retain(|d, _| !listed.contains(d));
-                g.listed = listed;
-                g.dirs = Some(dirs);
+            let started = std::time::Instant::now();
+            for (command, input) in lister_commands(&root) {
+                let program = command.split(' ').next().unwrap_or_default().to_string();
+                if let Some(mut dirs) = Self::run_lister(&ssh, command, input).await {
+                    crate::output::trace(&format!("whole-tree listing of {root} by {program}: {} directories in {} ms", dirs.len(), started.elapsed().as_millis()));
+                    let mut g = snap.lock().unwrap();
+                    let listed = std::mem::take(&mut g.listed);
+                    dirs.retain(|d, _| !listed.contains(d));
+                    g.listed = listed;
+                    g.dirs = Some(dirs);
+                    return;
+                }
             }
+            crate::output::trace(&format!("whole-tree listing of {root} unavailable; listing over SFTP"));
         });
     }
 
@@ -1516,6 +1551,11 @@ mod tests {
         assert_eq!(dirs["a"][0].byte_size, 5);
         assert!(dirs["a/empty"].is_empty());
         assert_eq!(super::shell_quote("/it's"), "'/it'\\''s'");
+        assert_eq!(super::base64(b"Ma"), "TWE=");
+        assert_eq!(super::base64(b"Man!"), "TWFuIQ==");
+        let cmds = super::lister_commands("/C:/Users/it's");
+        assert!(cmds[0].0.starts_with("perl - '/C:/Users/it"));
+        assert!(cmds[1].0.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "));
     }
 
     #[test]
