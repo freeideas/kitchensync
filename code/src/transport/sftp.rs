@@ -44,6 +44,9 @@ const POSIX_RENAME: &str = "posix-rename@openssh.com";
 /// Bytes per READ/WRITE request unless the server advertises other limits via
 /// `limits@openssh.com`. 32 KiB is accepted by every known server.
 const DEFAULT_CHUNK: usize = 32 * 1024;
+/// Seconds a single SFTP request may wait for its reply.
+const REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// SFTP channels opened per peer connection (see `SftpTransport::sessions`).
 const SFTP_CHANNELS: usize = 4;
 
@@ -303,7 +306,12 @@ pub fn connect_with_known_hosts(
                 }
                 Ok(r) => r?,
             };
-        session.set_timeout(timeout_idle_secs.max(60));
+        // A busy server disk can keep a request waiting for minutes behind
+        // others (a large listing on a spinning drive), and giving up on it
+        // skips a whole directory. A dead connection is caught by the SSH
+        // keep-alive instead, so this limit only catches a server that has
+        // stopped answering requests while the connection stays up.
+        session.set_timeout(REQUEST_TIMEOUT_SECS);
 
         // 4. Prepare the remote root.
         let abs_root = if root.is_empty() { "/" } else { root.as_str() };
@@ -581,16 +589,32 @@ async fn best_rsa_hashes(ssh: &client::Handle<HostKeyCheck>) -> Vec<Option<HashA
 
 /// Create `abs` and any missing parents. Failing to create a component is
 /// tolerated when it turns out to already be a directory.
+/// Create a directory and any missing parents. Starts at the directory
+/// itself and climbs only as far as parents are missing, so an existing
+/// parent costs one request rather than one per path component.
 async fn mkdir_p(session: &RawSftpSession, abs: &str) -> Result<()> {
-    let mut so_far = String::new();
-    for component in abs.split('/').filter(|c| !c.is_empty()) {
-        so_far.push('/');
-        so_far.push_str(component);
-        if let Err(e) = session
-            .mkdir(so_far.clone(), FileAttributes::default())
-            .await
-        {
-            match session.lstat(so_far.clone()).await {
+    let mut missing: Vec<String> = Vec::new();
+    let mut cur = abs.trim_end_matches('/').to_string();
+    loop {
+        if cur.is_empty() {
+            break;
+        }
+        let err = match session.mkdir(cur.clone(), FileAttributes::default()).await {
+            Ok(_) => break,
+            Err(e) => e,
+        };
+        match session.lstat(cur.clone()).await {
+            Ok(reply) if reply.attrs.file_type() == FileType::Dir => break,
+            Ok(_) => return Err(map_err(err)),
+            Err(_) => match cur.rsplit_once('/').map(|(p, _)| p.to_string()).filter(|p| !p.is_empty()) {
+                Some(parent) => missing.push(std::mem::replace(&mut cur, parent)),
+                None => return Err(map_err(err)),
+            },
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        if let Err(e) = session.mkdir(dir.clone(), FileAttributes::default()).await {
+            match session.lstat(dir).await {
                 Ok(reply) if reply.attrs.file_type() == FileType::Dir => {}
                 _ => return Err(map_err(e)),
             }
@@ -877,18 +901,17 @@ impl Transport for SftpTransport {
         let session = self.session();
         let full = self.remote(path);
         runtime().block_on(async {
-            if let Some(parent) = full.rsplit_once('/').map(|(p, _)| p) {
-                if !parent.is_empty() {
-                    mkdir_p(&session, parent).await?;
-                }
-            }
-            // Write-only, create-if-missing, truncate-if-present.
+            // Write-only, create-if-missing, truncate-if-present. The parent
+            // usually exists; make it only when the open says it does not.
             let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
-            let handle = session
-                .open(full, flags, FileAttributes::default())
-                .await
-                .map_err(map_err)?
-                .handle;
+            let handle = match session.open(full.clone(), flags, FileAttributes::default()).await {
+                Ok(h) => h.handle,
+                Err(e) => {
+                    let Some((parent, _)) = full.rsplit_once('/').filter(|(p, _)| !p.is_empty()) else { return Err(map_err(e)) };
+                    mkdir_p(&session, parent).await?;
+                    session.open(full, flags, FileAttributes::default()).await.map_err(map_err)?.handle
+                }
+            };
             Ok(Box::new(SftpWriteHandle {
                 session: Arc::clone(&session),
                 handle: Some(handle),

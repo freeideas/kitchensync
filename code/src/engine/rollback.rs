@@ -1,15 +1,16 @@
-//! `--rollback <timestamp>` and `--undo`. See specs/manifest.md, "Rollback".
-
-use std::collections::BTreeMap;
+//! `--rollback <timestamp>` and `--undo`: undo journal lines newest first.
+//! See specs/state.md, "Rollback", and specs/sync.md, "Rollback".
 
 use crate::config::Config;
-use crate::manifest::{self, Line};
 use crate::output;
+use crate::state::{self, JLine, Line};
 use crate::transport::{join, Entry, Transport};
-use crate::util::{now_micros, parse_time};
+use crate::util::{now_micros, parse_time, system_to_micros};
 
-use super::fsops::{self, meta_dir, PeerRef};
-use super::peer::{self, note_failure};
+use super::fsops::{self, exists, PeerRef};
+use super::peer::{self, in_bak, meta, note_failure, Peer};
+
+const TOL: i64 = 5_000_000;
 
 pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
     if peers.is_empty() {
@@ -17,223 +18,150 @@ pub fn run(cfg: &Config, peers: &[PeerRef], ts: Option<i64>) -> i32 {
         return 1;
     }
     for p in peers {
-        let target = match ts {
+        let (lines, newest) = read_journals(p);
+        let target = match ts.or_else(|| peer::last_run_start(p.t())).or(newest.map(|t| t - 1)) {
             Some(t) => t,
-            None => match peer::last_run_start(p.transport.as_ref()).or_else(|| newest_bak(p.transport.as_ref(), "").map(|t| t - 1)) {
-                Some(t) => t,
-                None => {
-                    output::line(&format!("nothing to undo for {}", p.url));
-                    continue;
-                }
-            },
+            None => {
+                output::line(&format!("nothing to undo for {}", p.url));
+                continue;
+            }
         };
-        let r = Rollback { cfg, peer: p, t: target };
-        // Pass 1 must finish first: pass 2 restores from BAK, and a reused
-        // file has to be back there before it can be restored.
-        r.return_reused("");
-        r.dir("");
+        let mut todo: Vec<&JLine> = lines.iter().filter(|l| l.ts > target && l.op != 'B').collect();
+        todo.sort_by_key(|l| std::cmp::Reverse(l.ts));
+        let r = Rollback { cfg, peer: p };
+        for l in todo {
+            r.undo(l);
+        }
+        p.write_state();
+        p.close_journal();
     }
     super::finish("rollback complete")
 }
 
-/// Newest evidence of a run anywhere under `dir`: a BAK timestamp or a
-/// manifest `placed` value.
-fn newest_bak(t: &dyn Transport, dir: &str) -> Option<i64> {
+/// Every journal line on the peer, and the newest journal's start time.
+fn read_journals(p: &Peer) -> (Vec<JLine>, Option<i64>) {
+    let dir = meta("journal");
+    let Ok(entries) = p.t().list_dir(&dir) else { return (Vec::new(), None) };
+    let mut lines = Vec::new();
     let mut newest = None;
-    if let Ok(entries) = t.list_dir(&join(&meta_dir(dir), "BAK")) {
-        for e in entries {
-            if let Some(ts) = parse_time(&e.name) {
-                newest = newest.max(Some(ts));
-            }
+    for e in entries.iter().filter(|e| !e.is_dir) {
+        newest = newest.max(parse_time(e.name.strip_suffix(".txt").unwrap_or(&e.name)));
+        if let Ok(Some(text)) = peer::read_text(p.t(), &join(&dir, &e.name)) {
+            lines.extend(state::parse_journal(&text));
         }
     }
-    if let Ok(Some(text)) = peer::read_manifest(t, dir) {
-        for l in manifest::parse(&text).values() {
-            newest = newest.max(l.placed);
-        }
-    }
-    if let Ok(entries) = t.list_dir(dir) {
-        for e in entries.iter().filter(|e| e.is_dir && e.name != ".kitchensync" && e.name != ".git") {
-            newest = newest.max(newest_bak(t, &join(dir, &e.name)));
-        }
-    }
-    newest
+    (lines, newest)
 }
 
 struct Rollback<'a> {
     cfg: &'a Config,
     peer: &'a PeerRef,
-    t: i64,
 }
 
 impl Rollback<'_> {
+    fn t(&self) -> &dyn Transport {
+        self.peer.t()
+    }
+
     fn fail(&self, what: &str, rel: &str, e: &dyn std::fmt::Display) {
         output::error(&format!("rollback: {} failed for {} on {}: {}", what, rel, self.peer.url, e));
         note_failure();
     }
 
-    /// Pass 1: move every file placed after T by reusing a displaced file
-    /// back to the BAK path it came from (specs/manifest.md, "Rollback").
-    fn return_reused(&self, dir: &str) {
-        let t: &dyn Transport = self.peer.transport.as_ref();
-        let Ok(live) = t.list_dir(dir) else { return };
-        let mut lines = match peer::read_manifest(t, dir) {
-            Ok(Some(text)) => manifest::parse(&text),
-            _ => BTreeMap::new(),
-        };
-        let mut changed = false;
-        for e in live.iter().filter(|e| !e.is_dir) {
-            let Some(origin) = lines.get(&e.name).filter(|l| l.placed.is_some_and(|p| p > self.t)).and_then(|l| l.origin.clone()) else { continue };
-            if self.cfg.dry_run {
-                continue;
-            }
-            let rel = join(dir, &e.name);
-            if t.stat(&origin).is_ok() {
-                self.fail("return", &rel, &format!("{origin} is occupied"));
-                continue;
-            }
-            let moved = t.create_dir(crate::util::parent_path(&origin)).and_then(|_| t.rename(&rel, &origin));
-            match moved {
-                Ok(()) => {
-                    lines.remove(&e.name);
-                    changed = true;
-                }
-                Err(err) => self.fail("return", &rel, &err),
-            }
-        }
-        if changed {
-            let cutoff = now_micros() - (self.cfg.keep_del_days as i64) * 86_400 * 1_000_000;
-            if let Err(e) = peer::write_manifest(t, dir, &manifest::serialize(&lines, cutoff)) {
-                self.fail("manifest write", dir, &e);
-            }
-        }
-        for e in live.iter().filter(|e| e.is_dir && e.name != ".kitchensync" && e.name != ".git") {
-            self.return_reused(&join(dir, &e.name));
-        }
+    /// The live entry at `path`, if any.
+    fn live(&self, path: &str) -> Option<Entry> {
+        self.t().stat(path).ok()
     }
 
-    fn dir(&self, dir: &str) {
-        let t: &dyn Transport = self.peer.transport.as_ref();
-        if !self.cfg.dry_run {
-            if let Err(e) = peer::recover_manifest(t, dir).and_then(|_| fsops::recover_swaps(t, dir)) {
-                self.fail("recovery", dir, &e);
-                return;
-            }
-        }
-        let live: Vec<Entry> = match t.list_dir(dir) {
-            Ok(v) => v.into_iter().filter(|e| e.name != ".kitchensync" && e.name != ".git").collect(),
-            Err(e) => {
-                self.fail("listing", dir, &e);
-                return;
-            }
-        };
-        let mut lines: BTreeMap<String, Line> = match peer::read_manifest(t, dir) {
-            Ok(Some(text)) => manifest::parse(&text),
-            Ok(None) => BTreeMap::new(),
-            Err(e) => {
-                self.fail("manifest read", dir, &e);
-                return;
-            }
-        };
+    fn same_file(&self, path: &str, l: &JLine) -> Option<Entry> {
+        self.live(path).filter(|e| !e.is_dir && Some(e.byte_size) == l.byte_size && l.mod_time.is_some_and(|m| (system_to_micros(e.mod_time) - m).abs() <= TOL))
+    }
 
-        // Earliest BAK copy after T of every name (state at T).
-        let bak_root = join(&meta_dir(dir), "BAK");
-        let mut earliest: BTreeMap<String, (i64, String)> = BTreeMap::new();
-        if let Ok(stamps) = t.list_dir(&bak_root) {
-            let mut stamps: Vec<(i64, String)> = stamps.iter().filter_map(|e| parse_time(&e.name).map(|ts| (ts, e.name.clone()))).filter(|(ts, _)| *ts > self.t).collect();
-            stamps.sort();
-            for (ts, name) in stamps {
-                if let Ok(items) = t.list_dir(&join(&bak_root, &name)) {
-                    for it in items {
-                        earliest.entry(it.name).or_insert((ts, name.clone()));
-                    }
+    fn undo(&self, l: &JLine) {
+        let dry = self.cfg.dry_run;
+        let tag = self.peer.tag();
+        match l.op {
+            // Content KitchenSync put in place: take it away, unless the user
+            // has changed it since.
+            'C' | 'D' => {
+                let entry = if l.op == 'C' { self.same_file(&l.path, l) } else { self.live(&l.path).filter(|e| e.is_dir) };
+                let Some(entry) = entry else { return };
+                output::info(&format!("X{tag} {}", l.path));
+                if !dry && fsops::displace(self.peer, &l.path, Some(&entry), false) {
+                    self.peer.history.forget(&l.path);
                 }
             }
-        }
-
-        let archived_manifest = earliest.remove(manifest::NAME);
-        let mut changed = false;
-
-        // Restore entries that were replaced or removed after T.
-        for (name, (_, stamp)) in &earliest {
-            let rel = join(dir, name);
-            let from = join(&join(&bak_root, stamp), name);
-            output::info(&format!("R{} {rel}", self.peer.tag()));
-            if self.cfg.dry_run {
-                continue;
-            }
-            if live.iter().any(|e| &e.name == name) && !fsops::displace(self.peer, &rel, false) {
-                continue;
-            }
-            if let Err(e) = t.rename(&from, &rel) {
-                self.fail("restore", &rel, &e);
-                continue;
-            }
-            let _ = t.delete_dir(&join(&bak_root, stamp));
-            let is_dir = matches!(t.stat(&rel), Ok(s) if s.is_dir);
-            let now = now_micros();
-            lines.insert(name.clone(), Line { is_dir, mod_time: now, byte_size: if is_dir { -1 } else { 0 }, last_seen: Some(now), deleted_time: None, placed: None, origin: None });
-            changed = true;
-        }
-
-        // Remove entries KitchenSync placed after T.
-        for e in live.iter().filter(|e| !earliest.contains_key(&e.name)) {
-            let placed_after = lines.get(&e.name).and_then(|l| l.placed).is_some_and(|p| p > self.t);
-            if placed_after {
-                let rel = join(dir, &e.name);
-                output::info(&format!("X{} {rel}", self.peer.tag()));
-                if !self.cfg.dry_run && fsops::displace(self.peer, &rel, false) {
-                    lines.remove(&e.name);
-                    changed = true;
-                }
-            }
-        }
-
-        // Recurse into every directory that is live now.
-        if let Ok(now_live) = t.list_dir(dir) {
-            for e in now_live.iter().filter(|e| e.is_dir && e.name != ".kitchensync" && e.name != ".git") {
-                self.dir(&join(dir, &e.name));
-            }
-        }
-
-        if self.cfg.dry_run {
-            return;
-        }
-        // Put the manifest back: the earliest archived one after T, else the
-        // live one minus removed entries.
-        if let Some((_, stamp)) = archived_manifest {
-            let from = join(&join(&bak_root, &stamp), manifest::NAME);
-            let text = match read_file(t, &from) {
-                Ok(s) => s,
-                Err(e) => {
-                    self.fail("manifest restore", dir, &e);
+            // A file KitchenSync moved here: send it back.
+            'M' => {
+                let Some(other) = &l.other else { return };
+                if self.same_file(&l.path, l).is_none() {
                     return;
                 }
-            };
-            if let Err(e) = peer::write_manifest(t, dir, &text) {
-                self.fail("manifest write", dir, &e);
+                if !in_bak(other) {
+                    output::info(&format!("R{tag} {other}"));
+                }
+                if dry {
+                    return;
+                }
+                if exists(self.t(), other).unwrap_or(true) {
+                    self.fail("return", &l.path, &format!("{other} is occupied"));
+                    return;
+                }
+                if let Err(e) = self.put(&l.path, other) {
+                    self.fail("return", &l.path, &e);
+                    return;
+                }
+                self.peer.history.forget(&l.path);
+                if !in_bak(other) {
+                    self.restored(other);
+                }
             }
-            let _ = t.delete_file(&from);
-            let _ = t.delete_dir(&join(&bak_root, &stamp));
-        } else if changed {
-            let cutoff = now_micros() - (self.cfg.keep_del_days as i64) * 86_400 * 1_000_000;
-            if let Err(e) = peer::write_manifest(t, dir, &manifest::serialize(&lines, cutoff)) {
-                self.fail("manifest write", dir, &e);
+            // An entry KitchenSync displaced: bring it back.
+            'X' => {
+                let Some(other) = &l.other else { return };
+                output::info(&format!("R{tag} {}", l.path));
+                if dry {
+                    return;
+                }
+                if !exists(self.t(), other).unwrap_or(false) {
+                    self.fail("restore", &l.path, &format!("{other} is gone"));
+                    return;
+                }
+                if let Some(e) = self.live(&l.path) {
+                    if !fsops::displace(self.peer, &l.path, Some(&e), false) {
+                        return;
+                    }
+                }
+                if let Err(e) = self.put(other, &l.path) {
+                    self.fail("restore", &l.path, &e);
+                    return;
+                }
+                self.restored(&l.path);
             }
+            _ => {}
         }
     }
-}
 
-fn read_file(t: &dyn Transport, path: &str) -> crate::transport::Result<String> {
-    let mut r = t.open_read(path)?;
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        let n = r.read(&mut chunk)?;
-        if n == 0 {
-            break;
+    /// Rename `from` to `to` (making `to`'s parents) and journal it.
+    fn put(&self, from: &str, to: &str) -> crate::transport::Result<()> {
+        let parent = crate::util::parent_path(to);
+        if !parent.is_empty() {
+            self.peer.ensure_dir(parent)?;
         }
-        buf.extend_from_slice(&chunk[..n]);
+        self.t().rename(from, to)?;
+        let e = self.live(to);
+        let file = e.filter(|e| !e.is_dir);
+        self.peer.journal('M', to, Some(from), file.as_ref().map(|e| e.byte_size), file.as_ref().map(|e| system_to_micros(e.mod_time)));
+        Ok(())
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+
+    /// A restored entry gets a fresh present line; what was beneath it is
+    /// unknown, so the peer has no opinion there.
+    fn restored(&self, path: &str) {
+        self.peer.history.forget(path);
+        if let Some(e) = self.live(path) {
+            let line = Line { is_dir: e.is_dir, mod_time: system_to_micros(e.mod_time), byte_size: if e.is_dir { -1 } else { e.byte_size }, last_seen: Some(now_micros()), deleted_time: None };
+            self.peer.history.set_line(path, line);
+        }
+    }
 }

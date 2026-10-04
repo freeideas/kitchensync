@@ -5,8 +5,8 @@ General advice for anyone (person or agent) working on this project. The other f
 ## The specs
 
 - `sync.md` defines the command line, startup, run phases, transports, logging, dry-run behavior, and error handling.
-- `multi-tree-sync.md` defines traversal, decisions, excludes, subordinate peers, BAK cleanup, and manifest updates during sync.
-- `manifest.md` defines the per-directory manifest: its format, which directories have one, how it is read and replaced, tombstones, rollback, and the timestamp format used everywhere.
+- `multi-tree-sync.md` defines traversal, decisions, excludes, subordinate peers, SWAP recovery, and state updates during sync.
+- `state.md` defines what each peer keeps at its sync root: the state file (history), the journal, BAK, nested sync roots, reading the per-directory manifest layout, rollback, and the timestamp format used everywhere.
 - `concurrency.md` defines copy concurrency, fallback connection behavior, listing concurrency, progress output, retries, and trace logging.
 - `help.md` defines the exact help screen.
 - `TESTING-GUIDELINES.md` defines constraints for SFTP tests.

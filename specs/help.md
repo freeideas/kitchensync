@@ -55,6 +55,6 @@ Use + to make one peer's contents win instead.
 
 Tip: if ssh user@host and cd /path works, sftp://user@host/path will too.
 
-Displaced files are recoverable from nearby:
-  .kitchensync/BAK/ directories (kept for --keep-bak-days days).
+Displaced files are recoverable from the sync root:
+  .kitchensync/BAK/<timestamp>/ (kept for --keep-bak-days days).
 ```

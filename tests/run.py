@@ -5,7 +5,7 @@
 # ///
 """End-to-end scenario test runner for KitchenSync.
 
-Implements scenarios S-01..S-22 from specs/SCENARIOS.md against the released
+Implements scenarios S-01..S-25 from specs/SCENARIOS.md against the released
 binary for the current platform. See specs/DEVELOPMENT.md for how that binary
 is built (code/build.py).
 
@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Exact contents of the fenced code block in specs/help.md, byte for byte,
 # including its single trailing newline.
-HELP_TEXT = 'Usage: kitchensync [options] <peer> <peer> [<peer>...]\n\nSynchronize file trees across multiple peers.\n\nRunning with no arguments (or --help, -h, /?) prints this help. See the specs for full behavior.\n\nPeers:\n  /path or c:\\path                 Local path (same as file://)\n  sftp://user@host/path            Remote over SSH\n  sftp://user@host:port/path       Non-standard SSH port\n  sftp://host/path                 Remote over SSH, current OS user\n  sftp://user:password@host/path   Inline password (prefer SSH keys)\n\nPrefix modifiers:\n  +<peer>                          Canon - this peer\'s state wins all conflicts\n  -<peer>                          Subordinate - overwritten to match the group\n\nFallback URLs (multiple paths to the same data):\n  [url1,url2,...]                  Try in order, first that connects wins\n  +[url1,url2,...]                 Canon peer with fallbacks\n  -[url1,url2,...]                 Subordinate peer with fallbacks\n\nPer-URL settings (query string, inside quotes):\n  "sftp://host/path?timeout-conn=60"     Connection timeout for this URL\n  "sftp://host/path?timeout-idle=10"     SFTP idle keep-alive TTL for this URL\n  "sftp://host/path?timeout-conn=60&timeout-idle=10"  Combine multiple\n\nOptions:\n  --dry-run          Read-only and plan, but make no peer changes\n  --parallel N       Files copied at the same time (default: 5)\n  --retries-copy N   Give up copying after this many tries (default: 3)\n  --retries-list N   Give up listing after this many tries (default: 3)\n  --timeout-conn N   SSH handshake timeout in seconds (default: 30)\n  --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)\n  --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)\n  --rollback TS      Roll the given peers back to timestamp TS, then exit\n  --undo             Roll the given peers back to just before their newest run\n  -x PATTERN         Exclude like .gitignore (or @file of patterns); repeatable\n  --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)\n  --keep-del-days N  Forget deletion records after N days (default: 180)\n\nQuick start:\n  kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)\n  kitchensync c:/photos sftp://host/photos            Bidirectional\n  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate\n  kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password\n\nWithout + on a first sync, peers are merged both ways and nothing is deleted.\nUse + to make one peer\'s contents win instead.\n\nTip: if ssh user@host and cd /path works, sftp://user@host/path will too.\n\nDisplaced files are recoverable from nearby:\n  .kitchensync/BAK/ directories (kept for --keep-bak-days days).\n'
+HELP_TEXT = 'Usage: kitchensync [options] <peer> <peer> [<peer>...]\n\nSynchronize file trees across multiple peers.\n\nRunning with no arguments (or --help, -h, /?) prints this help. See the specs for full behavior.\n\nPeers:\n  /path or c:\\path                 Local path (same as file://)\n  sftp://user@host/path            Remote over SSH\n  sftp://user@host:port/path       Non-standard SSH port\n  sftp://host/path                 Remote over SSH, current OS user\n  sftp://user:password@host/path   Inline password (prefer SSH keys)\n\nPrefix modifiers:\n  +<peer>                          Canon - this peer\'s state wins all conflicts\n  -<peer>                          Subordinate - overwritten to match the group\n\nFallback URLs (multiple paths to the same data):\n  [url1,url2,...]                  Try in order, first that connects wins\n  +[url1,url2,...]                 Canon peer with fallbacks\n  -[url1,url2,...]                 Subordinate peer with fallbacks\n\nPer-URL settings (query string, inside quotes):\n  "sftp://host/path?timeout-conn=60"     Connection timeout for this URL\n  "sftp://host/path?timeout-idle=10"     SFTP idle keep-alive TTL for this URL\n  "sftp://host/path?timeout-conn=60&timeout-idle=10"  Combine multiple\n\nOptions:\n  --dry-run          Read-only and plan, but make no peer changes\n  --parallel N       Files copied at the same time (default: 5)\n  --retries-copy N   Give up copying after this many tries (default: 3)\n  --retries-list N   Give up listing after this many tries (default: 3)\n  --timeout-conn N   SSH handshake timeout in seconds (default: 30)\n  --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)\n  --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)\n  --rollback TS      Roll the given peers back to timestamp TS, then exit\n  --undo             Roll the given peers back to just before their newest run\n  -x PATTERN         Exclude like .gitignore (or @file of patterns); repeatable\n  --keep-bak-days N  Delete displaced files (BAK/) after N days (default: 90)\n  --keep-del-days N  Forget deletion records after N days (default: 180)\n\nQuick start:\n  kitchensync +c:/photos sftp://user@host/photos      First sync (c: is canon)\n  kitchensync c:/photos sftp://host/photos            Bidirectional\n  kitchensync c:/photos sftp://host/photos -/mnt/usb  Add USB as subordinate\n  kitchensync c:/photos "sftp://user:p%40ss@host/photos"  Inline password\n\nWithout + on a first sync, peers are merged both ways and nothing is deleted.\nUse + to make one peer\'s contents win instead.\n\nTip: if ssh user@host and cd /path works, sftp://user@host/path will too.\n\nDisplaced files are recoverable from the sync root:\n  .kitchensync/BAK/<timestamp>/ (kept for --keep-bak-days days).\n'
 
 BINARY: Path
 
@@ -134,8 +134,6 @@ def bak_contents(peer: Path) -> list[tuple[str, dict[str, bytes]]]:
         for dirpath, dirnames, filenames in os.walk(entry):
             dirnames[:] = [d for d in dirnames if d != ".kitchensync"]
             for filename in filenames:
-                if Path(dirpath) == entry and filename == "manifest.txt":
-                    continue  # archived manifest, not a user file
                 full = Path(dirpath) / filename
                 rel = full.relative_to(entry).as_posix()
                 files[rel] = full.read_bytes()
@@ -186,7 +184,7 @@ def assert_result(
 
 
 # --------------------------------------------------------------------------
-# Scenarios (specs/SCENARIOS.md S-01..S-22)
+# Scenarios (specs/SCENARIOS.md S-01..S-25)
 # --------------------------------------------------------------------------
 
 
@@ -211,22 +209,9 @@ def s02(tmp: Path) -> None:
 
     check_file_bytes(peer_b / "album" / "one.txt", b"canon\n")
     check_mtime(peer_b / "album" / "one.txt", "2024-01-01_12-00-00_000000Z")
-    expect(
-        (peer_a / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_a}: missing .kitchensync/manifest.txt",
-    )
-    expect(
-        (peer_b / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_b}: missing .kitchensync/manifest.txt",
-    )
-    expect(
-        (peer_a / "album" / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_a / 'album'}: missing .kitchensync/manifest.txt",
-    )
-    expect(
-        (peer_b / "album" / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_b / 'album'}: missing .kitchensync/manifest.txt",
-    )
+    for peer in (peer_a, peer_b):
+        expect((peer / ".kitchensync" / "state.txt").is_file(), f"{peer}: missing .kitchensync/state.txt")
+        expect(not (peer / "album" / ".kitchensync").exists(), f"{peer / 'album'}: should have no .kitchensync")
 
 
 def s03(tmp: Path) -> None:
@@ -246,14 +231,8 @@ def s03(tmp: Path) -> None:
     check_file_bytes(peer_b / "readme.txt", b"from A\n")
     check_file_bytes(peer_a / "other.txt", b"from B\n")
     check_file_bytes(peer_b / "other.txt", b"from B\n")
-    expect(
-        (peer_a / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_a}: missing .kitchensync/manifest.txt",
-    )
-    expect(
-        (peer_b / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_b}: missing .kitchensync/manifest.txt",
-    )
+    for peer in (peer_a, peer_b):
+        expect((peer / ".kitchensync" / "state.txt").is_file(), f"{peer}: missing .kitchensync/state.txt")
 
 
 def s04(tmp: Path) -> None:
@@ -430,10 +409,7 @@ def s10(tmp: Path) -> None:
         merged == {"shared.txt": b"wrong\n", "extra.txt": b"extra\n"},
         f"BAK contents mismatch under {peer_c}: {merged}",
     )
-    expect(
-        (peer_c / ".kitchensync" / "manifest.txt").is_file(),
-        f"{peer_c}: missing .kitchensync/manifest.txt",
-    )
+    expect((peer_c / ".kitchensync" / "state.txt").is_file(), f"{peer_c}: missing .kitchensync/state.txt")
 
 
 ROLLBACK_HINT_RE = re.compile(
@@ -510,11 +486,11 @@ def s12(tmp: Path) -> None:
         f"{peer_b / 'b' / 'c' / 'one.txt'} should not exist",
     )
 
-    merged = merged_bak_files(peer_b / "b" / "c")
-    expect(
-        merged.get("one.txt") == b"one\n",
-        f"expected one.txt with bytes b'one\\n' under {peer_b / 'b' / 'c'}/.kitchensync/BAK/*: {merged}",
-    )
+    merged = merged_bak_files(peer_b / "b")
+    expect(merged == {"c/one.txt": b"one\n"}, f"files in {peer_b / 'b'}'s BAK: {merged}")
+    nested = (peer_b / "b" / "c" / ".kitchensync" / "state.txt").read_text()
+    live = [line for line in nested.splitlines() if line.startswith("one.txt\t") and line.endswith("\t-")]
+    expect(not live, f"{peer_b / 'b' / 'c'}'s state still lists one.txt as live: {nested!r}")
 
 
 def s13(tmp: Path) -> None:
@@ -640,7 +616,7 @@ def s17(tmp: Path) -> None:
         check_file_bytes(peer / "movie.bin", b"0123456789\n")
         check_mtime(peer / "movie.bin", when)
     swap = peer_b / ".kitchensync" / "SWAP"
-    expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
+    expect(not swap.exists(), f"{swap} should not exist")
 
 
 def s18(tmp: Path) -> None:
@@ -661,7 +637,7 @@ def s18(tmp: Path) -> None:
     assert_result(result, b"sync complete\n")
     for peer in (peer_a, peer_b):
         check_file_bytes(peer / "movie.bin", b"new\n")
-    expect(not swap.exists() or not any(swap.iterdir()), f"B/.kitchensync/SWAP should be empty: {list(swap.iterdir())}")
+    expect(not swap.exists(), f"{swap} should not exist")
 
 
 MOVIE = bytes(range(256)) * 8192  # 2 MiB
@@ -734,6 +710,19 @@ def meta_snapshot(peer: Path) -> dict[str, bytes]:
     return out
 
 
+def meta_dirs(peer: Path) -> list[str]:
+    """Every .kitchensync directory under peer, other than the root's."""
+    found = []
+    for dirpath, dirnames, _filenames in os.walk(peer):
+        rel = Path(dirpath).relative_to(peer)
+        if ".kitchensync" in rel.parts:
+            dirnames[:] = []
+            continue
+        if ".kitchensync" in dirnames and rel != Path("."):
+            found.append(rel.as_posix())
+    return found
+
+
 def s22(tmp: Path) -> None:
     peer_a = tmp / "A"
     peer_b = tmp / "B"
@@ -752,6 +741,66 @@ def s22(tmp: Path) -> None:
         expect(not changed, f"{p}: metadata changed on an unchanged run: {changed}")
         runs = (p / ".kitchensync" / "runs.txt").read_text().count("\n")
         expect(runs == runs_before[p] + 1, f"{p}: runs.txt should gain one line, had {runs_before[p]}, now {runs}")
+        expect(not meta_dirs(p), f"{p}: .kitchensync below the root: {meta_dirs(p)}")
+
+
+def s23(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    write_file(peer_a / "zz" / "movie.bin", MOVIE, MOVIE_TIME)
+    peer_b.mkdir(parents=True, exist_ok=True)
+    setup = run_ks(["--verbosity", "error", f"+{peer_a}", str(peer_b)], tmp)
+    expect(setup.returncode == 0, f"setup sync failed: exit {setup.returncode}, stderr {setup.stderr!r}")
+    (peer_a / "aa").mkdir()
+    os.rename(peer_a / "zz" / "movie.bin", peer_a / "aa" / "film.bin")
+    before = tree(peer_b)
+    dry = run_ks(["--dry-run", "--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    assert_result(dry, b"dry run\nM2 aa/film.bin\nsync complete\n")
+    expect(tree(peer_b) == before, "the dry run changed B")
+    result = run_ks(["--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    check_info_lines(result, ["M2 aa/film.bin", "sync complete"])
+    expect(tree(peer_b) == {"aa/film.bin": MOVIE}, f"user files under B mismatch: {sorted(tree(peer_b))}")
+    check_mtime(peer_b / "aa" / "film.bin", MOVIE_TIME)
+    expect((peer_b / "zz").is_dir() and not any((peer_b / "zz").iterdir()), "B/zz should be an empty directory")
+    expect(not bak_contents(peer_b), f"B should have no BAK: {bak_contents(peer_b)}")
+
+
+def s24(tmp: Path) -> None:
+    peer_a, peer_b = moved_movie_setup(tmp)
+    first = run_ks(["--verbosity", "error", str(peer_a), str(peer_b), "-x", "shows"], tmp)
+    assert_result(first, b"sync complete\n")
+    expect(merged_bak_files(peer_b).get("movie.bin") == MOVIE, "B's BAK should hold movie.bin after the first run")
+    expect(not (peer_b / "shows").exists(), "B should have no shows yet")
+    result = run_ks(["--verbosity", "info", str(peer_a), str(peer_b)], tmp)
+    check_info_lines(result, ["M2 shows/film.bin", "sync complete"])
+    expect(tree(peer_b) == {"shows/film.bin": MOVIE}, f"user files under B mismatch: {sorted(tree(peer_b))}")
+    check_mtime(peer_b / "shows" / "film.bin", MOVIE_TIME)
+    expect(not merged_bak_files(peer_b), f"B's BAK should hold no file: {sorted(merged_bak_files(peer_b))}")
+
+
+def s25(tmp: Path) -> None:
+    peer_a = tmp / "A"
+    peer_b = tmp / "B"
+    when = "2024-01-01_10-00-00_000000Z"
+    seen = "2024-02-01_10-00-00_000000Z"
+    for peer in (peer_a, peer_b):
+        write_file(peer / "sub" / "keep.txt", b"keep\n", when)
+        write_file(peer / ".kitchensync" / "manifest.txt", f"sub\td\t{when}\t-1\t{seen}\t-\t-\n".encode())
+        write_file(
+            peer / "sub" / ".kitchensync" / "manifest.txt",
+            f"gone.txt\tf\t{when}\t5\t{seen}\t-\t-\nkeep.txt\tf\t{when}\t5\t{seen}\t-\t-\n".encode(),
+        )
+    write_file(peer_b / "sub" / "gone.txt", b"gone\n", when)
+    write_file(peer_b / "sub" / ".kitchensync" / "BAK" / "2024-01-15_10-00-00_000000Z" / "old.txt", b"old\n")
+    result = run_ks(["--verbosity", "error", str(peer_a), str(peer_b)], tmp)
+    assert_result(result, b"sync complete\n")
+    for peer in (peer_a, peer_b):
+        expect(tree(peer) == {"sub/keep.txt": b"keep\n"}, f"user files under {peer}: {sorted(tree(peer))}")
+        expect(not (peer / "sub" / ".kitchensync").exists(), f"{peer / 'sub'}/.kitchensync should be gone")
+        expect((peer / ".kitchensync" / "state.txt").is_file(), f"{peer}: missing .kitchensync/state.txt")
+    bak = dict(bak_contents(peer_b))
+    expect(bak.get("2024-01-15_10-00-00_000000Z") == {"sub/old.txt": b"old\n"}, f"B's BAK: {bak}")
+    expect(merged_bak_files(peer_b).get("sub/gone.txt") == b"gone\n", f"B's BAK should hold sub/gone.txt: {bak}")
 
 
 SCENARIOS: list[tuple[str, str, "callable"]] = [
@@ -764,7 +813,7 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-07", "Command-Line Exclude Leaves Paths Untouched", s07),
     ("S-08", "Dry Run Does Not Change Peers", s08),
     ("S-09", "Canon File Replaces Directory Type Conflict", s09),
-    ("S-10", "New Peer Without A Manifest Is Subordinate", s10),
+    ("S-10", "New Peer Without History Is Subordinate", s10),
     ("S-11", "Info Verbosity Emits The Rollback Hint And Copy Progress", s11),
     ("S-12", "Root Choice Does Not Matter", s12),
     ("S-13", "Undo Reverts A First-Sync Merge", s13),
@@ -773,10 +822,13 @@ SCENARIOS: list[tuple[str, str, "callable"]] = [
     ("S-16", "Names In Different Unicode Forms Are The Same File", s16),
     ("S-17", "An Interrupted Copy Is Not Put In Place", s17),
     ("S-18", "Mac Litter In SWAP Does Not Block Cleanup", s18),
-    ("S-19", "A Moved File Is Reused, Not Copied Again", s19),
+    ("S-19", "A Moved File Is Moved, Not Copied Again", s19),
     ("S-20", "Same Size And Time But Different Content Is Copied", s20),
-    ("S-21", "Undo Puts A Reused File Back", s21),
-    ("S-22", "A Run Over An Unchanged Tree Writes No Manifests", s22),
+    ("S-21", "Undo Puts A Moved File Back", s21),
+    ("S-22", "A Run Over An Unchanged Tree Writes No State", s22),
+    ("S-23", "A Move Is Found Before The Walk Reaches The Old Path", s23),
+    ("S-24", "A File Displaced In An Earlier Run Is Moved Into Place", s24),
+    ("S-25", "Per-Directory Manifests Are Read And Converted", s25),
 ]
 
 

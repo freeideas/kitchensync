@@ -5,12 +5,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::config::Config;
-use crate::manifest::Line;
+use crate::state::{self, Line};
 use crate::output;
 use crate::transport::{join, Entry, Transport};
 use crate::util::system_to_micros;
 
 use super::copy::{CopyJob, CopyQueue};
+use super::moves::MOVE_MIN;
 use super::fsops::{self, PeerRef};
 use super::peer::{self, DirState};
 
@@ -123,12 +124,10 @@ fn within(a: i64, b: i64) -> bool {
     (a - b).abs() <= TOL
 }
 
-/// Listing plus manifest for one peer at one directory.
+/// Listing plus history for one peer at one directory.
 pub struct Listed {
     state: Arc<DirState>,
     entries: Vec<Entry>,
-    /// Whether `.kitchensync/BAK/` exists here, so cleanup knows to look.
-    has_bak: bool,
 }
 
 impl Walker {
@@ -138,71 +137,74 @@ impl Walker {
 
     fn list_peer(&self, p: &PeerRef, dir: &str) -> Option<Listed> {
         let t: &dyn Transport = p.transport.as_ref();
-        // The listing, the manifest read, and the listing of `.kitchensync/`
-        // are independent round trips: issue them together. The last one says
-        // whether an interrupted manifest replacement or swap needs repair and
-        // whether there is a BAK/ to clean, so those cost nothing when absent.
         let t0 = std::time::Instant::now();
-        let read_all = || {
-            std::thread::scope(|s| {
-                let manifest = s.spawn(|| peer::read_manifest(t, dir));
-                let meta = s.spawn(|| t.list_dir(&fsops::meta_dir(dir)));
-                let entries = fsops::list_with_retries(t, dir, self.cfg.retries_list);
-                let failed = || crate::transport::TransportError::io("listing thread failed".to_string());
-                (entries, manifest.join().unwrap_or_else(|_| Err(failed())), meta.join().unwrap_or_else(|_| Err(failed())))
-            })
+        let dry = self.cfg.dry_run;
+        let failed = |what: &str, e: &dyn std::fmt::Display| {
+            output::error(&format!("{what} failed for {} at {}, excluding from this subtree: {}", p.url, dir, e));
+            None
         };
-        let (mut entries, mut text, meta) = read_all();
-        // When `.kitchensync/` cannot be listed, assume everything is there.
-        let meta_names: Option<Vec<String>> = match meta {
-            Ok(v) => Some(v.into_iter().map(|e| e.name).collect()),
-            Err(e) if e.is_not_found() => Some(Vec::new()),
-            Err(_) => None,
-        };
-        let has = |n: &str| meta_names.as_ref().is_none_or(|v| v.iter().any(|x| x == n));
-        let needs_repair = has("manifest.txt.old") || has("manifest.txt.new") || has("SWAP");
-        if needs_repair && !self.cfg.dry_run {
-            if let Err(e) = peer::recover_manifest(t, dir).and_then(|_| fsops::recover_swaps(t, dir)) {
-                output::error(&format!("recovery failed for {} at {}: {}", p.url, dir, e));
-                return None;
-            }
-            // Repair can move entries and the manifest: read them again.
-            (entries, text, _) = read_all();
-        }
-        let has_bak = has("BAK");
-        let t1 = std::time::Instant::now();
-        let entries = match entries {
+        let mut entries = match fsops::list_with_retries(t, dir, self.cfg.retries_list) {
             Ok(v) => v,
             // In a dry run a directory that would have been created does not
             // exist yet; treat it as empty so the copies into it are still planned.
             // Only when the directory itself is absent: a "not found" raised by
             // something inside an existing directory is a real listing failure.
-            Err(e) if self.cfg.dry_run && e.is_not_found() && t.stat(dir).is_err() => {
-                return Some(Listed { state: DirState::new(Arc::clone(p), dir, None, true, self.cfg.keep_del_days), entries: Vec::new(), has_bak: false });
+            Err(e) if dry && e.is_not_found() && t.stat(dir).is_err() => {
+                return Some(Listed { state: DirState::new(Arc::clone(p), dir, p.history.dir_lines(dir), None), entries: Vec::new() });
             }
-            Err(e) => {
-                output::error(&format!("listing failed for {} at {}, excluding from this subtree: {}", p.url, dir, e));
-                return None;
-            }
+            Err(e) => return failed("listing", &e),
         };
-        let text = match text {
-            Ok(v) => v,
-            Err(e) => {
-                output::error(&format!("manifest read failed for {} at {}, excluding from this subtree: {}", p.url, dir, e));
-                return None;
+
+        // A `.kitchensync` folder here is SWAP left by an interrupted copy, a
+        // nested sync root, or the per-directory layout (specs/multi-tree-sync.md,
+        // "Reading A Directory"). Without one there is nothing more to read.
+        let mut legacy: Option<state::DirLines> = None;
+        if entries.iter().any(|e| e.is_dir && e.name == peer::META) {
+            let m = match fsops::inspect_meta(t, dir) {
+                Ok(m) => m,
+                Err(e) => return failed("listing", &e),
+            };
+            if m.swap && !dry {
+                if let Err(e) = fsops::recover_swaps(p, dir) {
+                    output::error(&format!("recovery failed for {} at {}: {}", p.url, dir, e));
+                    return None;
+                }
+                // Recovery can move entries: read the directory again.
+                entries = match fsops::list_with_retries(t, dir, self.cfg.retries_list) {
+                    Ok(v) => v,
+                    Err(e) => return failed("listing", &e),
+                };
             }
-        };
-        if output::level() >= output::Verbosity::Trace {
-            output::trace(&format!(
-                "listed {} on {}: {} entries, manifest {} bytes, in {} ms",
-                if dir.is_empty() { "." } else { dir },
-                p.tag(),
-                entries.len(),
-                text.as_ref().map_or(0, |t| t.len()),
-                (t1 - t0).as_millis()
-            ));
+            if !dir.is_empty() {
+                let meta = fsops::meta_dir(dir);
+                if m.state {
+                    match peer::read_text(t, &join(&meta, state::STATE)) {
+                        Ok(Some(text)) => p.history.nested_root(dir, &text),
+                        Ok(None) => {}
+                        Err(e) => return failed("state read", &e),
+                    }
+                } else if let Some(name) = m.manifest {
+                    if !p.history.has_dir_lines(dir) {
+                        match peer::read_text(t, &join(&meta, name)) {
+                            Ok(text) => legacy = text.map(|s| state::parse_manifest(&s)),
+                            Err(e) => return failed("manifest read", &e),
+                        }
+                    }
+                }
+                if !m.state && !dry {
+                    fsops::convert_meta(p, dir);
+                }
+            }
         }
-        Some(Listed { state: DirState::new(Arc::clone(p), dir, text, self.cfg.dry_run, self.cfg.keep_del_days), entries, has_bak })
+        if output::level() >= output::Verbosity::Trace {
+            output::trace(&format!("listed {} on {}: {} entries in {} ms", if dir.is_empty() { "." } else { dir }, p.tag(), entries.len(), t0.elapsed().as_millis()));
+        }
+        let state = match legacy {
+            // Lines read from a manifest are new to the state: settle them.
+            Some(lines) => DirState::new(Arc::clone(p), dir, lines, Some(state::DirLines::new())),
+            None => DirState::new(Arc::clone(p), dir, p.history.dir_lines(dir), None),
+        };
+        Some(Listed { state, entries })
     }
 
     /// Sync one directory level across `peers`, then recurse. Returns whether
@@ -377,7 +379,7 @@ impl Walker {
                             // The peer deleted the directory this entry sits in:
                             // it votes to delete the entry as of that deletion.
                             let est = *inherited.get(&l.state.peer.index)?;
-                            live.is_none().then_some(Line { is_dir: false, mod_time: 0, byte_size: -1, last_seen: Some(est), deleted_time: Some(est), placed: None, origin: None })
+                            live.is_none().then_some(Line { is_dir: false, mod_time: 0, byte_size: -1, last_seen: Some(est), deleted_time: Some(est) })
                         })
                     };
                     View { state: Arc::clone(&l.state), live, line }
@@ -411,12 +413,6 @@ impl Walker {
             }
         }
 
-        // BAK cleanup piggybacks on the traversal.
-        if !self.cfg.dry_run {
-            for l in active.iter().filter(|l| l.has_bak) {
-                fsops::cleanup_bak(&l.state.peer, dir, self.cfg.keep_bak_days);
-            }
-        }
         kept
     }
 
@@ -493,16 +489,16 @@ impl Walker {
     }
 
     fn displace_view(&self, v: &View, rel: &str, name: &str, tags: &mut String) -> bool {
-        tags.push(v.peer().tag());
-        let Some(to) = fsops::displace_to(v.peer(), rel, self.cfg.dry_run) else { return false };
-        // Remember it: a copy later in this run may reuse it.
-        if let (Some(to), Some(e)) = (to, &v.live) {
-            let reuse = &self.queue.reuse;
-            if e.is_dir {
-                reuse.note_dir(v.peer().index, to);
-            } else {
-                reuse.note_file(v.peer().index, to, e.byte_size, system_to_micros(e.mod_time));
-            }
+        let peer = v.peer();
+        // Already moved away by a copy, or held by one that will move or
+        // displace it (specs/sync.md, "Moved Files"): nothing to do here.
+        if peer.moves.skip_displacement(rel) {
+            v.state.confirm_absent(name);
+            return true;
+        }
+        tags.push(peer.tag());
+        if !fsops::displace(peer, rel, v.live.as_ref(), self.cfg.dry_run) {
+            return false;
         }
         v.state.confirm_absent(name);
         true
@@ -530,6 +526,7 @@ impl Walker {
                             peer::note_failure();
                             continue;
                         }
+                        v.peer().journal('D', &rel, None, None, None);
                     }
                     v.state.created_dir(&name);
                     recurse.push(Arc::clone(v.peer()));
@@ -587,18 +584,33 @@ impl Walker {
         if dsts.is_empty() {
             return;
         }
-        // A large file's copy is held until the walk ends and prints its own
-        // line then (see concurrency.md, "Progress Output").
-        let held = !self.cfg.dry_run && byte_size >= super::reuse::HOLD_MIN;
-        if !held {
+        // A large file may already be on a destination under another name
+        // (specs/sync.md, "Moved Files"). Its copy prints its own line when it
+        // starts (see concurrency.md, "Progress Output"); a dry run checks
+        // and prints here.
+        let large = byte_size >= MOVE_MIN;
+        let may_move = |cand: &str| !self.excluded(cand, false) && src_peer.history.line(cand).is_some();
+        if self.cfg.dry_run {
+            let mut c_tags = String::new();
+            for v in &dsts {
+                if large && self.dry_run_move(&src_peer, v.peer(), rel, mod_time, byte_size, &may_move) {
+                    output::info(&format!("M{} {rel}", v.peer().tag()));
+                } else {
+                    c_tags.push(v.peer().tag());
+                }
+            }
+            if !c_tags.is_empty() {
+                output::info(&format!("{}C{c_tags} {rel}", src_peer.tag()));
+            }
+            return;
+        }
+        if !large {
             let c_tags: String = dsts.iter().map(|v| v.peer().tag()).collect();
             output::info(&format!("{}C{c_tags} {rel}", src_peer.tag()));
         }
-        if self.cfg.dry_run {
-            return;
-        }
         for v in dsts {
             v.state.intend_push(name, mod_time, byte_size);
+            let reserved = if large { v.peer().moves.reserve(byte_size, mod_time, rel, &[], &may_move) } else { None };
             self.queue.enqueue(CopyJob {
                 src: Arc::clone(&src_peer),
                 dst: Arc::clone(v.peer()),
@@ -606,10 +618,26 @@ impl Walker {
                 path: rel.to_string(),
                 mod_time,
                 byte_size,
-                held,
+                reserved,
                 tries: 0,
             });
         }
+    }
+
+    /// In a dry run: whether a candidate on `dst` passes the checks that need
+    /// no file content. One that does is marked used, so its old path prints
+    /// no `X` line, as in a real run.
+    fn dry_run_move(&self, src: &PeerRef, dst: &PeerRef, rel: &str, mod_time: i64, byte_size: i64, may_move: &dyn Fn(&str) -> bool) -> bool {
+        let mut tried = Vec::new();
+        while let Some(id) = dst.moves.reserve(byte_size, mod_time, rel, &tried, may_move) {
+            if super::copy::candidate_fits(self.queue.peers(), src, rel, dst, &dst.moves.path(id), byte_size, mod_time, false) {
+                dst.moves.used(id);
+                return true;
+            }
+            dst.moves.release(id);
+            tried.push(id);
+        }
+        false
     }
 
     fn apply_delete(&self, views: &[View], rel: &str, name: &str) {

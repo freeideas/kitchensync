@@ -18,7 +18,7 @@ Each `<peer>` argument is a URL or local path identifying a sync target. Bare pa
 Prefixes:
 - **`+`** - canon peer. Its state wins all conflicts. Example: `+c:/photos`
 - **`-`** - subordinate peer. Does not contribute to decisions; receives the group's outcome. Example: `-/mnt/usb/photos`
-- **(none)** - normal bidirectional peer. Contributes and receives based on the history in each directory's manifest.
+- **(none)** - normal bidirectional peer. Contributes and receives based on its history (see state.md).
 
 At most one `+` peer per run. Multiple `-` peers are allowed.
 
@@ -85,10 +85,10 @@ earlier ones:
    @<file>` reads patterns, one per line, from a local file instead.
 
 An excluded entry is skipped in scanning, decisions, copying, deletion,
-displacement, and manifest updates. Existing excluded files or directories on
-any peer are left untouched, and existing manifest lines for excluded paths are
-not consulted during the run; they are carried forward unchanged when a
-manifest is rewritten.
+displacement, and state updates. Existing excluded files or directories on
+any peer are left untouched, and existing state lines for excluded paths are
+not consulted during the run; they are carried forward unchanged when the
+state is written.
 
 Nothing can include `.kitchensync/`, `.git/`, symbolic links, or special files;
 those are excluded before patterns are considered.
@@ -145,8 +145,8 @@ Host keys verified via `~/.ssh/known_hosts`. Unknown hosts rejected.
 
 A canon peer is authoritative - its state wins all conflicts unconditionally.
 
-Canon is never required. History is kept per directory in a manifest (see
-manifest.md), and a directory for which no contributing peer has a manifest is
+Canon is never required. History is kept per peer in its state (see
+state.md), and a directory for which no contributing peer has history is
 merged additively: every live entry is New, the newest mod_time wins for files,
 directories exist everywhere, and nothing in that directory is deleted or
 displaced except for type conflicts and bringing subordinate peers into
@@ -154,7 +154,7 @@ conformance.
 
 Most people expect a first sync to copy one way, the way rsync does, so
 KitchenSync says plainly when it is doing something else. If the sync root has
-no `.kitchensync/manifest.txt` on any reachable contributing peer and no `+`
+no history (see state.md) on any reachable contributing peer and no `+`
 peer was given, KitchenSync prints exactly this one stdout line before any
 progress output, at every verbosity level, and continues:
 
@@ -168,11 +168,11 @@ Mark a peer with `+` when you want that peer's contents to win instead.
 
 A subordinate peer does not contribute to decisions. During the decision phase, its files are invisible - decisions are made using only normal and canon peers. After decisions are made, the subordinate peer is made to match the outcome: files it has that shouldn't exist are displaced to BAK/, files it lacks are copied to it.
 
-A peer is automatically treated as subordinate for the run when the sync root has no `.kitchensync/manifest.txt` on that peer while at least one other reachable peer's sync root does have one, unless it is the canon peer (`+`). The `-` prefix is redundant for such a peer but harmless. This means a peer joining an established group always receives the group's state without influencing decisions.
+A peer is automatically treated as subordinate for the run when that peer has no history at the sync root while at least one other reachable peer does, unless it is the canon peer (`+`). The `-` prefix is redundant for such a peer but harmless. This means a peer joining an established group always receives the group's state without influencing decisions.
 
-If no reachable peer has a manifest at the sync root, nobody is auto-subordinated: that is the first-sync merge described under "Canon Peer".
+If no reachable peer has history at the sync root, nobody is auto-subordinated: that is the first-sync merge described under "Canon Peer".
 
-A subordinate peer's manifests are still read and rewritten during the walk. On future runs (without `-`), the peer participates normally using that history.
+A subordinate peer's state is still read and written. On future runs (without `-`), the peer participates normally using that history.
 
 ## Startup
 
@@ -181,20 +181,23 @@ A subordinate peer's manifests are still read and rewritten during the walk. On 
 3. If fewer than two peers are reachable, exit with error.
 4. If canon peer (`+`) is unreachable, exit with error.
 5. Nothing is downloaded at startup. For each reachable peer, check only whether
-   the sync root has history: does `.kitchensync/manifest.txt` exist there? In
-   normal runs, repair an interrupted manifest replacement at the root first
-   (see manifest.md, "Writing"), so a run that was stopped mid-rewrite is not
-   mistaken for a peer with no history. In `--dry-run`, repair nothing and treat
-   the root as having history if `manifest.txt`, `manifest.txt.new`, or
-   `manifest.txt.old` is present. If the check fails with anything other than
+   the sync root has history: does `.kitchensync/state.txt` exist there (or,
+   failing that, `.kitchensync/manifest.txt`; see state.md, "Per-directory
+   manifests")? In normal runs, repair an interrupted replacement of
+   `state.txt` and `runs.txt` first (see state.md, "Writing"), so a run that was
+   stopped mid-rewrite is not mistaken for a peer with no history. In
+   `--dry-run`, repair nothing and treat the root as having history if any of
+   `state.txt`, `state.txt.new`, `state.txt.old`, or `manifest.txt` is present.
+   Then read the state into memory. In normal runs, delete expired `BAK/` folders
+   and journals (see state.md, "BAK"). If the check fails with anything other than
    'not found' (I/O error, permission denied), treat the peer as unreachable:
    log an error-level diagnostic and exclude it from the reachable set, then
    re-evaluate steps 3-4 against the updated set and exit with the corresponding
    error if either check now fails.
-6. A reachable peer whose sync root has no manifest is automatically treated as
+6. A reachable peer with no history is automatically treated as
    subordinate for the run, unless it is the canon peer (`+`), and unless no
-   reachable peer's sync root has a manifest at all. If no reachable
-   contributing peer's sync root has a manifest and no canon peer (`+`) is
+   reachable peer has history at all. If no reachable
+   contributing peer has history and no canon peer (`+`) is
    designated, nobody is auto-subordinated; print this line to stdout, exactly
    once, before any progress output and at every verbosity level (after the
    `dry run` line in a dry run), then continue the run:
@@ -208,24 +211,23 @@ A subordinate peer's manifests are still read and rewritten during the walk. On 
 2. Run combined-tree walk (see multi-tree-sync.md)
    - Directory creation and displacement (to BAK/) inline
    - File copies enqueued for concurrent execution
-   - Each directory's manifest read alongside its listing, and rewritten on a
-     peer once that directory's entries are decided and its copies into that
-     peer have finished or failed (see manifest.md). In `--dry-run` no manifest
-     is written.
+   - Each directory's state lines settled on a peer once that directory's
+     entries are decided and its copies into that peer have finished or failed
+     (see state.md, "Writing")
    - Global active-copy limit enforced (see concurrency.md)
-3. Wait for all enqueued file copies to complete, and for the manifest rewrites
-   that were waiting on them
-4. Disconnect all peers
+3. Wait for all enqueued file copies to complete
+4. Write each peer's state (see state.md, "Writing"; never in `--dry-run`),
+   close its journal, and disconnect
 5. Print the completion line and exit. If every copy succeeded and every
-   displacement and manifest write succeeded, print exactly `sync complete` as
+   displacement and state write succeeded, print exactly `sync complete` as
    one stdout line and exit 0. Otherwise print exactly
    `sync complete with N failures`, where N counts the copies given up on after
-   `--retries-copy` tries plus the failed displacements and failed manifest
+   `--retries-copy` tries plus the failed displacements and failed state
    writes, and exit 2.
 
 ## Operation Queue
 
-File copies are enqueued during the combined-tree walk and executed concurrently, subject to the global active-copy limit (see concurrency.md). There is no loading phase that scans the whole tree before copy work begins. As soon as the first scanned directory produces copy work, copy workers may begin reading and copying those files while traversal continues into later directories. The one exception is a copy of a large file, which is held until the walk ends so it can reuse a displaced file instead (see "Reusing A Displaced File").
+File copies are enqueued during the combined-tree walk and executed concurrently, subject to the global active-copy limit (see concurrency.md). There is no loading phase that scans the whole tree before copy work begins. As soon as the first scanned directory produces copy work, copy workers may begin reading and copying those files while traversal continues into later directories. No copy waits for the walk to finish.
 
 Each queued copy carries its own try count. `--retries-copy` is the maximum number of total tries for that copy, including the first try. Directory creation and displacement to BAK/ run inline during the walk - both are same-filesystem operations that subsequent steps may depend on.
 
@@ -247,8 +249,8 @@ If moving the existing destination to SWAP `old` fails, the original
 destination must remain in place, staged files must be cleaned up when possible,
 and the copy is skipped for that run.
 
-Manifests follow the same no-rename-over-existing rule, using their own
-`.new`/`.old` names inside `.kitchensync/` rather than SWAP; manifest.md
+`state.txt` and `runs.txt` follow the same no-rename-over-existing rule, using
+their own `.new`/`.old` names inside `.kitchensync/` rather than SWAP; state.md
 ("Writing") defines the exact sequence and how an interrupted replacement is
 repaired.
 
@@ -260,8 +262,10 @@ Each transfer is a `(src_peer, path, dst_peer, path)` pair. A transfer acquires 
 2. **If** the destination already has a file at the target path, rename it to SWAP `old`: `<target-parent>/.kitchensync/SWAP/<encoded-basename>/old`
 3. **Swap in** - rename SWAP `new` to the final path
 4. **Set mod_time** - set the destination file's modification time to the winning mod_time from the decision (not re-read from the source)
-5. **Archive old** - if SWAP `old` exists, rename it to `<target-parent>/.kitchensync/BAK/<timestamp>/<basename>`
+5. **Archive old** - if SWAP `old` exists, move it to BAK as a displacement of the target path (see "Displace to BAK")
 6. **Clean up** empty SWAP directories (see "SWAP Directory" for what counts as empty)
+
+When the copy completes, the journal gets the `X` line for old content that step 5 moved to BAK, if any, and then a `C` line for the target (see state.md, "Journal"); a rollback, undoing newest first, takes the new content away before it puts the old back. A copy that is tried again after a failure first recovers any SWAP directory its earlier try left for that target (see "SWAP Directory").
 
 Content is streamed with bounded buffering. Each active transfer uses one or
 more fixed-size buffers whose total size is independent of the file size.
@@ -279,35 +283,50 @@ that transfer before releasing the copy slot. If the queued copy has not yet rea
 `--retries-copy` total-try limit, move it to the back of the queue. Otherwise
 mark it failed for this run.
 
-### Reusing A Displaced File
+### Moved Files
 
-Moving or renaming a file on one peer looks to the walk like a deletion at the old path plus a new file at the new path. Every other peer then displaces its copy at the old path to BAK and receives the file at the new path again. For a reorganized media library that means sending hundreds of gigabytes that the receiving peer already holds. To avoid that, a copy first looks for a file that the walk displaced on the destination peer during this run and that has the same content, and moves that file into place instead of transferring it.
+Moving or renaming a file on one peer looks to the walk like a deletion at the old path plus a new file at the new path. Every other peer would then displace its copy at the old path to BAK and receive the file at the new path again: for a reorganized media library, hundreds of gigabytes the receiving peer already holds. Instead, a copy of a file of at least 1 MiB (1,048,576 bytes) first looks for that file on the destination peer under another name, and moves it into place when it finds it. Smaller files are always transferred: sending them costs little, and a match is less telling.
 
-**Held copies.** A copy of a file of at least 1 MiB (1,048,576 bytes) is held until the walk has finished, because the walk may reach the old path after the new one. Smaller files are copied as soon as they are found, as before: sending them is cheap, and small files are more likely to match by accident. When the walk ends, every held copy is released to the copy queue in the order it was found.
+**Candidates.** Each peer has an index of files it holds or recently held, built at startup without reading anything beyond what startup already reads:
 
-**Candidates.** Every displacement during the walk is remembered per peer: for a file, its BAK path, byte size and modification time; for a directory, its BAK path. Before held copies are released, each displaced directory on a peer that has a held copy is listed recursively (skipping `.kitchensync/`), and every file inside becomes a candidate too. A candidate is used at most once.
+- every live file line of 1 MiB or more in the peer's state (see state.md);
+- every file in the peer's BAK named by an `X` or `B` line of its journals.
 
-**Match.** When a held copy for a destination peer reaches a copy slot, it looks for a candidate on that peer whose byte size equals the decision's byte size and whose modification time is within the 5-second tolerance of the decision's mod_time. The name does not matter: renames are the common case. A candidate that passes is checked against the source by content: 64 KiB at the start of the file, 64 KiB in the middle (at offset `(size - 64 KiB) / 2`, rounded down), and the last 64 KiB are read from both and must be byte-for-byte equal. Any read error rules the candidate out. The first candidate that passes is used.
+During the run the index follows the peer: a displaced file or directory keeps its candidates, at their new BAK paths (the files inside a displaced directory are known from the state); a file displaced that the state did not list joins with the size and mod_time from its listing; a candidate moved into place leaves the index.
 
-**Reuse.** Step 1 of "File Copy" is skipped. Any existing destination file is moved to SWAP `old` (step 2), then the candidate is renamed from its BAK path straight to the final path (step 3), and steps 4 to 6 follow. The reused file never passes through SWAP `new`, so an interrupted run cannot mistake it for a cut-short transfer and delete it: until the final rename it is still in BAK, and after it the ordinary SWAP `old` recovery applies. If the final rename fails, SWAP `old` is moved back to the target path and the copy is retried as a normal transfer. A successful reuse records the candidate's former BAK path as the destination line's `origin` (see manifest.md), so a rollback can put it back.
+**Match.** A candidate is used for a copy of `path` to peer R when all of these hold:
 
-Dry runs do not reuse: nothing is displaced, so a dry run prints a `C` line for every copy it would make, including ones a real run may turn into reuses.
+1. Its byte size equals the decision's byte size, its modification time is within the 5-second tolerance of the decision's mod_time, and its path is not `path`. The name does not matter: renames are the common case.
+2. If it is a live path (not under `BAK/`): the path is not excluded, the source peer's state has a line for it (the source once had it), and it does not exist on any contributing peer other than R. So the group has removed it everywhere else, and the walk would displace R's copy anyway.
+3. A `stat` on R shows a file with that byte size and a modification time within the tolerance.
+4. 64 KiB at the start of the file, 64 KiB in the middle (at offset `(size - 64 KiB) / 2`, rounded down), and the last 64 KiB read from the source and from the candidate are byte-for-byte equal. Any read error rules the candidate out.
+
+When the walk queues the copy, it reserves the first unreserved candidate that meets rule 1 and, for a live path, the in-memory part of rule 2 (not excluded, and the source's state has a line for it). The rest of the check runs when the copy takes its copy slot, so copies never wait for the walk. If the reserved candidate fails, the copy tries the unreserved candidates in BAK that meet rule 1, then falls back to a transfer. Each candidate is used at most once.
+
+**Move.** Step 1 of "File Copy" is skipped. Any existing destination file is moved to SWAP `old` (step 2), then the candidate is renamed from where it is straight to the final path (step 3), and steps 4 to 6 follow. The journal gets an `M` line naming where the file came from. The moved file never passes through SWAP `new`, so an interrupted run cannot mistake it for a cut-short transfer and delete it. If the final rename fails, SWAP `old` is moved back to the target path and the copy is retried as a normal transfer.
+
+A move and a displacement on the same peer never run at the same time, and a move always uses the candidate's current location. When the walk decides to displace a file that is reserved by a copy still to come, it leaves the file for that copy and records it as displaced; it prints nothing for it. If the copy then does not use it, the copy displaces it then, printing the `X` line. When the walk reaches a path whose file was already moved away, there is nothing left to displace there, and that is not a failure. A directory is always displaced when the walk decides so; reserved files inside it are then moved from BAK.
+
+**Output.** A copy of a file of 1 MiB or more prints its line when it takes its copy slot: `M<dst> <path>` for a move, `<src>C<dst> <path>` for a transfer (see concurrency.md, "Progress Output").
+
+**Dry runs** check rules 1 to 3 in the walk, without reading file content, and print `M<dst> <path>` for a copy that would likely become a move. The candidate's old path then prints no `X` line, as in a real run.
 
 ### Displace to BAK
 
-Each displacement is a `(peer, path)` pair executed inline during the combined-tree walk. Before performing the rename, create the destination directory (`<parent>/.kitchensync/BAK/<timestamp>/`) and any missing parents if it does not already exist. The entry at `path` is renamed to `<parent>/.kitchensync/BAK/<timestamp>/<basename>`. A displaced directory is moved as a single rename, preserving its entire subtree.
+Each displacement is a `(peer, path)` pair executed inline during the combined-tree walk. The entry at `path` is renamed to `<root>/.kitchensync/BAK/<run>/<path>`, creating that path's parent directories first (see state.md, "BAK"). A displaced directory is moved as a single rename, preserving its entire subtree. The journal gets an `X` line, plus a `B` line for each file of 1 MiB or more that the state lists inside a displaced directory.
 
 ## Dry Run
 
 `--dry-run` shows what the run would do without touching any peer. KitchenSync
-connects to peers, lists directories, reads each directory's manifest, makes the
-same decisions, and emits the same `C`/`X` progress lines when progress output
+connects to peers, reads their state, lists directories, makes the same
+decisions, and emits the same `C`/`X`/`M` progress lines when progress output
 is enabled by verbosity.
 
-Nothing else happens. Source files are not read, the copy queue is not
-exercised, no copy slot is taken, and no manifest is written. A `C` line in a
-dry run means "this file would be copied", and an `X` line means "this path
-would be displaced".
+Nothing else happens. File contents are not read, the copy queue is not
+exercised, no copy slot is taken, and no state or journal is written. A `C` line
+in a dry run means "this file would be copied", an `M` line "this file would
+likely be moved into place from elsewhere on that peer" (see "Moved Files"), and
+an `X` line "this path would be displaced".
 
 In dry-run mode, KitchenSync must not create, modify, rename, delete, or
 displace anything through a `file://` or `sftp://` peer URL. This means:
@@ -319,8 +338,9 @@ displace anything through a `file://` or `sftp://` peer URL. This means:
 - no destination files are written;
 - no destination files are displaced or deleted;
 - no modification times are set on peers;
-- no manifest is written, replaced, or repaired;
-- BAK cleanup and SWAP recovery on peers are skipped.
+- no state, journal, or run log is written, replaced, or repaired;
+- BAK cleanup, SWAP recovery, and conversion of per-directory manifests on peers
+  are skipped.
 
 At the start of every dry-run sync, before progress or completion output,
 KitchenSync prints exactly `dry run` as one stdout line. Dry-run progress output
@@ -329,9 +349,8 @@ follows the same verbosity rules as normal progress output.
 ## Rollback
 
 `--rollback <timestamp>` and `--undo` run instead of a sync. They put the given
-peers back the way they were at a moment in the past, using the `BAK/`
-directories and the archived manifests that each synced directory keeps (see
-manifest.md, "Rollback").
+peers back the way they were at a moment in the past, using each peer's
+journals and `BAK/` (see state.md, "Rollback").
 
 ```
 kitchensync --rollback 2024-03-05_08-00-01_120394Z c:/photos
@@ -346,16 +365,15 @@ kitchensync --undo c:/photos sftp://user@host/photos
   (`YYYY-MM-DD_HH-mm-ss_ffffffZ`); anything else is an argument error.
 - `--rollback` and `--undo` cannot be used together.
 
-For each reachable peer, KitchenSync walks the tree from the peer root and
-applies the rollback procedure in manifest.md ("Rollback") for the target time.
+For each reachable peer, KitchenSync applies the rollback procedure in state.md
+("Rollback") for the target time.
 
 `--undo` picks the target time per peer from the run log: the start timestamp
 of the newest run recorded in `<root>/.kitchensync/runs.txt` on that peer (see
 "Run Log" below). A run's changes are spread over an interval, so the start
 timestamp is the only safe target: rolling back to it takes back everything
 the run did and nothing before. If the peer has no run log, KitchenSync falls
-back to one microsecond before the newest `BAK/<timestamp>/` name or manifest
-`placed` value found anywhere under the peer; if there is none of those either,
+back to one microsecond before the name of its newest journal; if there is none,
 print `nothing to undo for <peer>` (the peer URL as KitchenSync displays it) and
 treat that peer as done.
 
@@ -365,13 +383,13 @@ Every normal (non-dry-run) sync appends one line to `<root>/.kitchensync/runs.tx
 on each reachable peer, right after printing the rollback hint and before any
 peer changes: the run's start timestamp, a tab, and the peers as shown in the
 hint. The file is replaced through the same write-new, move-old, rename-in
-sequence as manifests (the old copy is deleted rather than archived) and is
+sequence as `state.txt` and is
 trimmed to its last 1000 lines. It is per sync root: syncing `/X/b/c` and later
 `/X/b` produces a log in each. Rollback and dry runs do not write to it.
 
 Progress output follows the usual verbosity rules (suppressed at `error`):
 
-- `R<peer> <relpath>` for each entry restored from `BAK/`;
+- `R<peer> <relpath>` for each entry put back where it was;
 - `X<peer> <relpath>` for each entry that was added after the target time and is
   therefore removed. Removals are displaced to `BAK/` like any other deletion,
   so a rollback can itself be rolled back.
@@ -381,8 +399,8 @@ nothing on any peer is changed.
 
 On completion, print exactly `rollback complete` as one stdout line and exit 0.
 If anything failed, print exactly `rollback complete with N failures` - N being
-the entries that could not be restored or removed plus the manifests that could
-not be written - and exit 2.
+the entries that could not be restored or removed plus the state writes that
+failed - and exit 2.
 
 ## Logging
 
@@ -420,7 +438,7 @@ sync complete
 ```
 
 When some work failed - a copy given up on after `--retries-copy` tries, a
-displacement that could not be made, or a manifest that could not be written -
+displacement that could not be made, or a state file that could not be written -
 the line says how many:
 
 ```text
@@ -453,9 +471,14 @@ an interrupted swap. For a target `<parent>/<basename>`, the SWAP paths are:
 - `<parent>/.kitchensync/SWAP/<encoded-basename>/old`
 
 `<encoded-basename>` is the basename percent-encoded when needed so it can be
-used as one path segment on every supported transport. Before starting a
-replacement for a path, KitchenSync must recover or fail any existing SWAP
-directory for that basename.
+used as one path segment on every supported transport. SWAP is the only thing
+KitchenSync keeps outside the root's `.kitchensync/`, and only while a copy into
+that directory is under way: when the last copy into a directory finishes, its
+`SWAP/` folder and its `.kitchensync/` folder are removed if they are empty.
+
+A leftover SWAP directory is found by the walk: when a directory's listing shows
+a `.kitchensync` folder, its `SWAP/` is recovered before the directory's entries
+are decided (see multi-tree-sync.md, "Reading A Directory").
 
 A SWAP directory counts as empty when it holds only operating-system litter
 files: names starting with `._` (the AppleDouble files macOS writes beside
@@ -463,16 +486,16 @@ anything it touches on exFAT and FAT drives) and `.DS_Store`. KitchenSync
 deletes that litter before removing the directory; any other leftover entry
 keeps the directory in place.
 
-SWAP is for user files only. A directory's manifest is replaced by the
-`.new`/`.old` rule in manifest.md instead.
+SWAP is for user files only. `state.txt` and `runs.txt` are replaced by the
+`.new`/`.old` rule in state.md instead.
 
 ## BAK Directory
 
-Displaced entries are recoverable from BAK/ until cleaned. BAK/ is created at the parent directory of each displacement (co-located in `.kitchensync/` at every directory level), not aggregated at the sync root. The `<timestamp>` in the path uses the format defined in manifest.md (`YYYY-MM-DD_HH-mm-ss_ffffffZ`). Cleaned after `--keep-bak-days` days (default: 90).
+Displaced entries are recoverable from `<root>/.kitchensync/BAK/<run>/<relpath>` until cleaned, after `--keep-bak-days` days (default: 90). The layout and cleanup are defined in state.md ("BAK"). BAK is on the same filesystem as the entries it holds, so a displacement is one rename. A sync root that spans more than one filesystem (a mount point inside the tree) cannot displace entries on the other filesystem: those displacements fail and are counted.
 
 ## Peer Transports
 
-Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. A directory listing must return each entry's name, type, size and modification time in as few filesystem calls as the platform allows: on macOS that is one bulk attribute call per directory (`getattrlistbulk`), falling back to a per-entry stat only where the call is unavailable. On an external exFAT drive a per-entry stat costs a disk seek and a round trip through the user-space filesystem driver, tens of milliseconds each, which made a large directory take longer to list locally than over SFTP. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
+Each peer is reached through filesystem operations selected by URL scheme. `sftp://` URLs use SSH/SFTP. `file://` URLs and bare paths use local filesystem operations. Both schemes must provide the same behavior to the sync engine. A directory listing must return each entry's name, type, size and modification time in as few filesystem calls as the platform allows: on macOS that is one bulk attribute call per directory (`getattrlistbulk`), falling back to a per-entry stat only where the call is unavailable. On an external exFAT drive a per-entry stat costs a disk seek and a round trip through the user-space filesystem driver, tens of milliseconds each. After startup, every root-bound operation receives the connected peer root handle for the winning URL and a path relative to that root.
 
 ### Required Operations
 
@@ -489,7 +512,7 @@ Every transport must support:
   Pull the next chunk; returns bytes or EOF.
 - `seek(handle, offset)`:
   Move the read position to a byte offset, so that the next `read` starts
-  there. Used for the content check in "Reusing A Displaced File".
+  there. Used for the content check in "Moved Files".
 - `close_read(handle)`:
   Close a read handle.
 - `open_write(peer, path)` -> handle:
@@ -527,7 +550,7 @@ The full sync is tested end-to-end via the CLI with mixed peer schemes. Typical 
 SFTP replacement behavior must be tested against a local SFTP fixture or fake
 transport that rejects plain rename-over-existing while allowing ordinary
 create, write, delete, and rename-to-new-path operations. KitchenSync must pass
-that fixture for both manifest replacement and user-file replacement by never
+that fixture for both state replacement and user-file replacement by never
 renaming over an existing file. Tests must not depend on a personal LAN
 host or external account.
 
@@ -536,7 +559,7 @@ host or external account.
 - **Argument errors** on non-help invocations (too few peers, multiple `+` peers, invalid settings) -> print to stdout, exit 1
 - **No history at the sync root and no canon** -> not an error: print `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative` and merge additively (see Canon Peer)
 - **Unreachable peer** -> skip, log at error level, continue with others
-- **Directory listing failure** -> try that listing up to `--retries-list` total times; if it still fails, exclude that peer for that directory subtree without modifying its manifests or peer files under that subtree. If the failed peer is the canon peer (`+`), skip decisions for that directory subtree for all peers
+- **Directory listing failure** -> try that listing up to `--retries-list` total times; if it still fails, exclude that peer for that directory subtree without modifying its state lines or peer files under that subtree. If the failed peer is the canon peer (`+`), skip decisions for that directory subtree for all peers
 - **Canon peer unreachable** -> exit 1
 - **Fewer than two reachable peers** -> exit 1
 - **No contributing peer reachable** (every reachable peer is subordinate, whether marked `-` on the command line or auto-subordinated) -> print `No contributing peer reachable - cannot make sync decisions`, exit 1
@@ -545,14 +568,14 @@ host or external account.
 - **Archive old failure** (cannot rename SWAP `old` to BAK after the replacement is in place) -> log error and leave SWAP `old` for later recovery
 - **Displacement failure** (cannot rename to BAK/) -> log error and skip the displacement (file remains in place); counts toward the failure count in the completion line
 - **SWAP staging failure** (cannot create staging directory or write staging file) -> treat as transfer failure
-- **`set_mod_time` failure** (after a completed copy - file is already in place) -> log at error level; the copy is not undone. The destination peer's manifest line already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
-- **Manifest write failure** -> log error at error level and leave whatever manifest the peer already had; the next normal run repairs an interrupted replacement before listing that directory (see manifest.md). Counts toward the failure count in the completion line
+- **`set_mod_time` failure** (after a completed copy - file is already in place) -> log at error level; the copy is not undone. The destination peer's state line already records the winning mod_time, so the discrepancy will be detected and corrected on the next run
+- **State write failure** -> log error at error level and leave whatever `state.txt` the peer already had; the next normal run repairs an interrupted replacement at startup (see state.md). Counts toward the failure count in the completion line
 
 ## Unicode Normalization
 
-The same visible name can be stored as different bytes. macOS reports an accented letter such as `é` decomposed (NFD: `e` followed by a combining accent), while Linux and Windows usually keep it composed (NFC: one character). KitchenSync compares names after converting them to NFC, so the two forms are one entry, not a file on one peer and a different file on the other. Manifest names are read and written in NFC; a manifest line in another form counts as the NFC name (when two lines collapse to one, the live line is kept over a tombstone, then the one with the later `last_seen`). Nothing is renamed on disk: an entry keeps the form its filesystem stores, and a new entry is created with its NFC name. If one directory holds two entries whose names differ only in Unicode form (possible only on a filesystem that compares bytes), the NFC one is synced, the other is left alone, and an error line names it.
+The same visible name can be stored as different bytes. macOS reports an accented letter such as `é` decomposed (NFD: `e` followed by a combining accent), while Linux and Windows usually keep it composed (NFC: one character). KitchenSync compares names after converting them to NFC, so the two forms are one entry, not a file on one peer and a different file on the other. State paths are read and written in NFC (see state.md, "Reading"). Nothing is renamed on disk: an entry keeps the form its filesystem stores, and a new entry is created with its NFC name. If one directory holds two entries whose names differ only in Unicode form (possible only on a filesystem that compares bytes), the NFC one is synced, the other is left alone, and an error line names it.
 
-An NFD name stored on an exFAT drive cannot be opened, renamed or deleted from macOS: the macOS exFAT driver lists it, but looks names up in NFC, and the name hash stored on disk is for the NFD form. Linux stores whatever bytes it is given, so a run from Linux that created entries before they were created in NFC could leave such names behind (seen on 2026-10-02 with a folder copied from a macOS SFTP peer, whose listings are NFD). On macOS the run then prints `listing failed ... No such file or directory` for that path every time. Repair it on Linux by renaming the entry to its NFC form, or on the Mac with `extart/exfat-fix-nfd-names.py`, which rewrites such names in NFC directly on the unmounted volume (its header explains how).
+An NFD name stored on an exFAT drive cannot be opened, renamed or deleted from macOS: the macOS exFAT driver lists it, but looks names up in NFC, and the name hash stored on disk is for the NFD form. Linux stores whatever bytes it is given, so a tool on Linux that copies names from a macOS SFTP listing (which is NFD) can leave such names on a drive. KitchenSync itself creates new entries with NFC names. On macOS the run then prints `listing failed ... No such file or directory` for that path every time. Repair it on Linux by renaming the entry to its NFC form, or on the Mac with `extart/exfat-fix-nfd-names.py`, which rewrites such names in NFC directly on the unmounted volume (its header explains how).
 
 ## Case Sensitivity
 

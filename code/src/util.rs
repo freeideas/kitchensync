@@ -1,5 +1,5 @@
-//! Timestamps, path hashing, and small helpers shared across modules.
-//! See specs/database.md, sections "Path Hashing" and "Timestamps".
+//! Timestamps and small helpers shared across modules.
+//! See specs/state.md, "Timestamps".
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

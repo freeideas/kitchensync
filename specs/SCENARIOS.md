@@ -7,10 +7,9 @@ below write `released/kitchensync.exe` as shorthand for whichever one applies. P
 are directories under a test-created temporary directory.
 
 Unless a scenario says otherwise, stdout and stderr are checked exactly, and
-the listed file trees ignore `.kitchensync/` metadata directories. When a
-scenario counts timestamp directories under `BAK/`, directories that contain
-only an archived `manifest.txt` are not counted, and `manifest.txt` files
-inside `BAK/` are never listed as user files.
+the listed file trees ignore `.kitchensync/` metadata directories. "BAK" means
+`<peer>/.kitchensync/BAK/`, and "the files in BAK" are the files beneath its
+timestamp-named directories, by their paths below those directories.
 
 ## S-01: Help With No Arguments
 
@@ -31,16 +30,15 @@ Setup:
 - `A/album/one.txt` exists with bytes `canon\n` and modification time
   `2024-01-01_12-00-00_000000Z`.
 - `B/` exists and has no user files.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error +A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
 empty. `B/album/one.txt` exists with bytes `canon\n` and modification time
 `2024-01-01_12-00-00_000000Z`. Both peers contain
-`.kitchensync/manifest.txt`, and so do the album directories:
-`A/album/.kitchensync/manifest.txt` and `B/album/.kitchensync/manifest.txt`
-exist.
+`.kitchensync/state.txt`, and neither `A/album/.kitchensync` nor
+`B/album/.kitchensync` exists.
 
 ## S-03: First Sync Without Canon Merges Both Ways
 
@@ -48,7 +46,7 @@ Setup:
 
 - `A/readme.txt` exists with bytes `from A\n`.
 - `B/other.txt` exists with bytes `from B\n`.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
@@ -56,7 +54,7 @@ Outcome: the process exits 0. stdout is exactly
 `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`.
 stderr is empty. `A/readme.txt` and `B/readme.txt` both contain `from A\n`, and
 `A/other.txt` and `B/other.txt` both contain `from B\n`. Both peers contain
-`.kitchensync/manifest.txt`.
+`.kitchensync/state.txt`.
 
 ## S-04: Bidirectional Sync Chooses Newer Modification Time
 
@@ -90,10 +88,9 @@ Setup:
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
-empty. `A/old.txt` and `B/old.txt` do not exist. Under `B/.kitchensync/BAK/`
-exactly one timestamp-named directory holds user files, and it contains only
-`old.txt` with bytes `remove me\n`. (Other timestamp directories may hold an
-archived `manifest.txt`; those are not user files.)
+empty. `A/old.txt` and `B/old.txt` do not exist. B's BAK holds exactly one
+timestamp-named directory, and it contains only `old.txt` with bytes
+`remove me\n`.
 
 ## S-06: Subordinate Peer Receives The Group Outcome
 
@@ -106,15 +103,15 @@ Setup:
   exit 0.
 - `C/shared.txt` exists with bytes `wrong\n`.
 - `C/extra.txt` exists with bytes `extra\n`.
-- `C/` has no `.kitchensync/manifest.txt`.
+- `C/` has no `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error A B -C`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
 empty. `C/shared.txt` exists with bytes `group\n` and modification time
-`2024-01-01_10-00-00_000000Z`. `C/extra.txt` does not exist. The files under
-`C/.kitchensync/BAK/*/` are exactly `shared.txt` with bytes `wrong\n` and
-`extra.txt` with bytes `extra\n`.
+`2024-01-01_10-00-00_000000Z`. `C/extra.txt` does not exist. The files in C's
+BAK are exactly `shared.txt` with bytes `wrong\n` and `extra.txt` with bytes
+`extra\n`.
 
 ## S-07: Command-Line Exclude Leaves Paths Untouched
 
@@ -123,7 +120,7 @@ Setup:
 - `A/keep.txt` exists with bytes `copy\n`.
 - `A/ignored/note.txt` exists with bytes `do not copy\n`.
 - `B/ignored/note.txt` exists with bytes `leave alone\n`.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error +A B -x ignored`.
 
@@ -138,7 +135,7 @@ Setup:
 
 - `A/dry.txt` exists with bytes `plan only\n`.
 - `B/` exists and has no user files.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --dry-run --verbosity error +A B`.
 
@@ -153,17 +150,17 @@ Setup:
 - `A/item` is a file with bytes `file wins\n` and modification time
   `2024-01-01_10-00-00_000000Z`.
 - `B/item/nested.txt` exists with bytes `directory loses\n`.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error +A B`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
 empty. `B/item` is a file with bytes `file wins\n` and modification time
-`2024-01-01_10-00-00_000000Z`. Under `B/.kitchensync/BAK/` there is exactly one
-timestamp-named directory containing the displaced directory `item/` with
-`nested.txt` inside it.
+`2024-01-01_10-00-00_000000Z`. B's BAK holds exactly one timestamp-named
+directory, containing the displaced directory `item/` with `nested.txt` inside
+it.
 
-## S-10: New Peer Without A Manifest Is Subordinate
+## S-10: New Peer Without History Is Subordinate
 
 Setup:
 
@@ -174,15 +171,15 @@ Setup:
   exit 0.
 - `C/shared.txt` exists with bytes `wrong\n`.
 - `C/extra.txt` exists with bytes `extra\n`.
-- `C/` has no `.kitchensync/manifest.txt`.
+- `C/` has no `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error A B C`.
 
 Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is
 empty. `C/shared.txt` exists with bytes `group\n` and modification time
-`2024-01-01_10-00-00_000000Z`. `C/extra.txt` does not exist. The files under
-`C/.kitchensync/BAK/*/` are exactly `shared.txt` with bytes `wrong\n` and
-`extra.txt` with bytes `extra\n`. `C/.kitchensync/manifest.txt` exists.
+`2024-01-01_10-00-00_000000Z`. `C/extra.txt` does not exist. The files in C's
+BAK are exactly `shared.txt` with bytes `wrong\n` and `extra.txt` with bytes
+`extra\n`. `C/.kitchensync/state.txt` exists.
 
 ## S-11: Info Verbosity Emits The Rollback Hint And Copy Progress
 
@@ -191,7 +188,7 @@ Setup:
 - `A/note.txt` exists with bytes `copy me\n` and modification time
   `2024-01-01_10-00-00_000000Z`.
 - `B/` exists and has no user files.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity info +A B`.
 
@@ -221,10 +218,11 @@ Action: run `released/kitchensync.exe --verbosity error A/b B/b`.
 Outcome: the process exits 0. stdout is exactly
 `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`.
 stderr is empty. `B/b/two.txt` exists with bytes `two\n`. `B/b/c/one.txt` does
-not exist: the deletion under `c` was found in `c`'s own manifest, which the
-earlier run wrote. Under `B/b/c/.kitchensync/BAK/` there is a timestamp-named
-directory containing `one.txt` with bytes `one\n`. The notice on the first line
-appears because the new sync root `b` has no manifest, even though `c` does.
+not exist: the deletion under `c` was found in `c`'s own state, which the
+earlier run wrote. The files in `B/b`'s BAK are exactly `c/one.txt` with bytes
+`one\n`. `B/b/c/.kitchensync/state.txt` no longer lists `one.txt` as live. The
+notice on the first line appears because the new sync root `b` has no state,
+even though `c` does.
 
 ## S-13: Undo Reverts A First-Sync Merge
 
@@ -232,7 +230,7 @@ Setup:
 
 - `A/mine.txt` exists with bytes `mine\n`.
 - `B/theirs.txt` exists with bytes `theirs\n`.
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 - First run `released/kitchensync.exe --verbosity error A B` and require it to
   exit 0. Both peers now have both files.
 
@@ -241,8 +239,8 @@ Action: run `released/kitchensync.exe --verbosity error --undo A B`.
 Outcome: the process exits 0. stdout is exactly `rollback complete\n`. stderr is
 empty. The user files under `A/` are exactly `mine.txt` with bytes `mine\n`, and
 the user files under `B/` are exactly `theirs.txt` with bytes `theirs\n`.
-`A/.kitchensync/BAK/` contains `theirs.txt` under one of its timestamp-named
-directories, and `B/.kitchensync/BAK/` contains `mine.txt` the same way.
+The files in A's BAK are exactly `theirs.txt`, and in B's BAK exactly
+`mine.txt`.
 
 ## S-14: Exclude Patterns, Ignore Files, And Negation
 
@@ -254,7 +252,7 @@ Setup:
 - `A/.kitchensync/ignore` contains the two lines `*.tmp` and `!other.tmp`.
 - A local file `myignore` outside the peers contains the lines `# my file`
   and `!.DS_Store`.
-- `B/` exists and has no user files. Neither peer has `.kitchensync/manifest.txt`.
+- `B/` exists and has no user files. Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error +A B -x @myignore -x sub/`.
 
@@ -285,11 +283,11 @@ Setup:
 
 - `A/café.txt` exists with the name in composed form (NFC: `é` is the single character U+00E9), bytes `same\n`, and modification time `2024-01-01_10-00-00_000000Z`.
 - `B/café.txt` exists with the name in decomposed form (NFD: `e` followed by the combining accent U+0301), the same bytes, and the same modification time. (macOS reports names this way.)
-- Neither peer has `.kitchensync/manifest.txt`.
+- Neither peer has a `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error A B` twice.
 
-Outcome: both runs exit 0 with empty stderr. The first run's stdout is the first-sync line (see sync.md, "Startup") followed by `sync complete\n`; the second run's stdout is exactly `sync complete\n`. After each run the user files under `A/` are exactly the composed `café.txt` and under `B/` exactly the decomposed `café.txt`, each with bytes `same\n`. Neither peer has anything under `.kitchensync/BAK/` except archived manifests.
+Outcome: both runs exit 0 with empty stderr. The first run's stdout is the first-sync line (see sync.md, "Startup") followed by `sync complete\n`; the second run's stdout is exactly `sync complete\n`. After each run the user files under `A/` are exactly the composed `café.txt` and under `B/` exactly the decomposed `café.txt`, each with bytes `same\n`. Neither peer has a BAK.
 
 ## S-17: An Interrupted Copy Is Not Put In Place
 
@@ -297,12 +295,12 @@ Setup:
 
 - `A/keep.txt` exists with bytes `keep\n` and `A/movie.bin` with bytes `0123456789\n`, both with modification time `2024-01-01_10-00-00_000000Z`.
 - `B/keep.txt` exists with bytes `keep\n` and the same modification time. `B/` has no `movie.bin`.
-- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have manifests and B has never had `movie.bin`.
+- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have state and B has never had `movie.bin`.
 - Simulate a copy of `movie.bin` to B that was cut short: create `B/.kitchensync/SWAP/movie.bin/new` with bytes `01234` and the current time as its modification time.
 
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
-Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `0123456789\n` with modification time `2024-01-01_10-00-00_000000Z`. `B/.kitchensync/SWAP` is absent or empty.
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `0123456789\n` with modification time `2024-01-01_10-00-00_000000Z`. `B/.kitchensync/SWAP` does not exist.
 
 ## S-18: Mac Litter In SWAP Does Not Block Cleanup
 
@@ -311,14 +309,14 @@ Setup:
 - `A/keep.txt` and `B/keep.txt` exist with bytes `keep\n` and modification time `2024-01-01_10-00-00_000000Z`.
 - `A/movie.bin` exists with bytes `new\n` and modification time `2024-01-02_10-00-00_000000Z`.
 - `B/movie.bin` exists with bytes `old\n` and modification time `2024-01-01_10-00-00_000000Z`.
-- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have manifests.
+- First run `released/kitchensync.exe --verbosity error A B -x movie.bin` and require it to exit 0, so both peers have state.
 - Simulate the files macOS leaves on an exFAT drive after touching an earlier swap: create `B/.kitchensync/SWAP/movie.bin/._new` and `B/.kitchensync/SWAP/._movie.bin`, each with 4096 zero bytes.
 
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
-Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `new\n`. `B/.kitchensync/SWAP` is absent or empty.
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. `A/movie.bin` and `B/movie.bin` both hold `new\n`. `B/.kitchensync/SWAP` does not exist.
 
-## S-19: A Moved File Is Reused, Not Copied Again
+## S-19: A Moved File Is Moved, Not Copied Again
 
 Setup:
 
@@ -328,7 +326,7 @@ Setup:
 
 Action: run `released/kitchensync.exe --verbosity info A B`.
 
-Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `M2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds the original 2 MiB content with modification time `2024-01-01_10-00-00_000000Z`, and B has no `movie.bin`. Nothing named `movie.bin` remains anywhere under `B/.kitchensync/BAK/`: the displaced file was moved into place rather than kept there.
+Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `M2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds the original 2 MiB content with modification time `2024-01-01_10-00-00_000000Z`, and B has no `movie.bin`. Nothing named `movie.bin` remains in B's BAK: the displaced file was moved into place rather than kept there.
 
 ## S-20: Same Size And Time But Different Content Is Copied
 
@@ -336,9 +334,9 @@ Setup: the same as S-19, except that after the move, `A/shows/film.bin` is rewri
 
 Action: run `released/kitchensync.exe --verbosity info A B`.
 
-Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `1C2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds A's changed content. `B/.kitchensync/BAK/` holds the original `movie.bin` content.
+Outcome: the process exits 0 with empty stderr. stdout is exactly four lines: the rollback hint, `X2 movie.bin`, `1C2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds A's changed content. B's BAK holds `movie.bin` with the original content.
 
-## S-21: Undo Puts A Reused File Back
+## S-21: Undo Puts A Moved File Back
 
 Setup: the same as S-19, including its action (run with `--verbosity error` instead of `info`).
 
@@ -346,17 +344,54 @@ Action: run `released/kitchensync.exe --verbosity error --undo B`.
 
 Outcome: the process exits 0. stdout is exactly `rollback complete\n`. stderr is empty. The user files under `B/` are exactly `movie.bin` with the original 2 MiB content and modification time `2024-01-01_10-00-00_000000Z`; there is no `B/shows/film.bin`.
 
-## S-22: A Run Over An Unchanged Tree Writes No Manifests
+## S-22: A Run Over An Unchanged Tree Writes No State
 
 Setup:
 
 - `A/top.txt` and `A/sub/inner.txt` exist with bytes `x\n`, both with modification time `2024-01-01_10-00-00_000000Z`. `B/` exists and is empty.
 - Run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
-- Record the bytes of every file under each peer's `.kitchensync/` directories, at every level.
+- Record the bytes of every file under each peer's `.kitchensync/` directory.
 
 Action: run `released/kitchensync.exe --verbosity error A B`.
 
-Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. On each peer, every file under every `.kitchensync/` directory is byte-for-byte as recorded, except the root's `.kitchensync/runs.txt`, which has one more line; no new `BAK/` directory was created anywhere.
+Outcome: the process exits 0. stdout is exactly `sync complete\n`. stderr is empty. On each peer, every file under `.kitchensync/` is byte-for-byte as recorded, except `.kitchensync/runs.txt`, which has one more line, and no file was added there. Neither peer has a `.kitchensync` directory anywhere but its root.
+
+## S-23: A Move Is Found Before The Walk Reaches The Old Path
+
+Setup:
+
+- `A/zz/movie.bin` exists with the 2 MiB content of S-19 and modification time `2024-01-01_10-00-00_000000Z`.
+- First run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
+- On A, move `A/zz/movie.bin` to `A/aa/film.bin`. (`aa` sorts before `zz`, so the walk reaches the new path first.)
+
+Action: run `released/kitchensync.exe --dry-run --verbosity info A B`, then `released/kitchensync.exe --verbosity info A B`.
+
+Outcome: both exit 0 with empty stderr. The dry run's stdout is exactly `dry run`, `M2 aa/film.bin`, `sync complete`, and B is unchanged by it. The second run's stdout is exactly three lines: the rollback hint, `M2 aa/film.bin`, and `sync complete`. The user files under B are exactly `aa/film.bin` with the original content and modification time; `B/zz` is an empty directory, as `A/zz` is. B has no BAK.
+
+## S-24: A File Displaced In An Earlier Run Is Moved Into Place
+
+Setup:
+
+- `A/movie.bin` exists with the 2 MiB content of S-19 and modification time `2024-01-01_10-00-00_000000Z`.
+- First run `released/kitchensync.exe --verbosity error +A B` and require it to exit 0.
+- On A, move `A/movie.bin` to `A/shows/film.bin`.
+- Run `released/kitchensync.exe --verbosity error A B -x shows` and require it to exit 0. B's `movie.bin` is now in B's BAK, and B has no `shows`.
+
+Action: run `released/kitchensync.exe --verbosity info A B`.
+
+Outcome: the process exits 0 with empty stderr. stdout is exactly three lines: the rollback hint, `M2 shows/film.bin`, and `sync complete`. `B/shows/film.bin` holds the original content with modification time `2024-01-01_10-00-00_000000Z`. B's BAK holds no file.
+
+## S-25: Per-Directory Manifests Are Read And Converted
+
+Setup, writing manifests by hand in the per-directory layout (see state.md, "Per-directory manifests"), every user file with modification time `2024-01-01_10-00-00_000000Z`:
+
+- `A/sub/keep.txt` and `B/sub/keep.txt` exist with bytes `keep\n`. `B/sub/gone.txt` exists with bytes `gone\n`; A has no `gone.txt`.
+- On both peers, `.kitchensync/manifest.txt` holds the line `sub	d	2024-01-01_10-00-00_000000Z	-1	2024-02-01_10-00-00_000000Z	-	-`, and `sub/.kitchensync/manifest.txt` holds the lines `gone.txt	f	2024-01-01_10-00-00_000000Z	5	2024-02-01_10-00-00_000000Z	-	-` and `keep.txt	f	2024-01-01_10-00-00_000000Z	5	2024-02-01_10-00-00_000000Z	-	-` (fields separated by single tabs).
+- `B/sub/.kitchensync/BAK/2024-01-15_10-00-00_000000Z/old.txt` exists with bytes `old\n`.
+
+Action: run `released/kitchensync.exe --verbosity error A B`.
+
+Outcome: the process exits 0. stdout is exactly `sync complete\n` (both peers have history, so there is no first-sync line). stderr is empty. The user files under both peers are exactly `sub/keep.txt`: B's `gone.txt` is displaced, because A's manifest shows A had it and lost it. Neither `A/sub/.kitchensync` nor `B/sub/.kitchensync` exists. Both peers have `.kitchensync/state.txt`. B's BAK holds `sub/old.txt` with bytes `old\n` in the directory `2024-01-15_10-00-00_000000Z`, and `sub/gone.txt` with bytes `gone\n`.
 
 # Properties
 
@@ -375,22 +410,21 @@ host.
 
 `.kitchensync/` and `.git/` entries, symbolic links, and special files are not
 part of the user file tree. They are omitted from listings, decisions, copies,
-and manifest entries unless a spec section explicitly describes direct metadata
+and state entries unless a spec section explicitly describes direct metadata
 maintenance inside `.kitchensync/`.
 
-## P-04: Manifest Replacement Never Renames Over A Live File
+## P-04: State Replacement Never Renames Over A Live File
 
-A directory's `.kitchensync/manifest.txt` is replaced only by the sequence in
-manifest.md: write `manifest.txt.new`, move the live `manifest.txt` aside to
-`manifest.txt.old`, rename `manifest.txt.new` into place, then move
-`manifest.txt.old` to `.kitchensync/BAK/<timestamp>/manifest.txt`. No step ever
-renames onto an existing path, so the run works on SFTP servers that reject
-rename-over-existing, and a later normal run repairs any replacement that was
-interrupted before it reads the directory.
+`.kitchensync/state.txt` is replaced only by the sequence in state.md: write
+`state.txt.new`, move the live `state.txt` aside to `state.txt.old`, rename
+`state.txt.new` into place, then delete `state.txt.old`. No step ever renames
+onto an existing path, so the run works on SFTP servers that reject
+rename-over-existing, and the next normal run repairs any replacement that was
+interrupted at startup, before it reads the state.
 
 ## P-05: Dry Run Does Not Write Peer State
 
-In `--dry-run`, KitchenSync connects, lists, reads manifests, decides, and
-prints the same progress lines, but it must not create, modify, rename, delete,
-or displace anything through a peer URL, and it writes no manifest. Source files
-are not read and the copy queue is not exercised.
+In `--dry-run`, KitchenSync connects, reads state, lists, decides, and prints
+the same progress lines, but it must not create, modify, rename, delete, or
+displace anything through a peer URL, and it writes no state, journal, or run
+log. File contents are not read and the copy queue is not exercised.

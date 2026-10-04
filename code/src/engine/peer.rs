@@ -1,14 +1,24 @@
-//! A reachable peer and the per-directory manifest state kept during a run.
+//! A reachable peer: its history (the state file held in memory), its
+//! journal, its BAK, and the per-directory record kept while a directory is
+//! being decided. See specs/state.md.
 
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::Role;
-use crate::manifest::{self, Line};
 use crate::output;
-use crate::transport::{join, Transport};
+use crate::state::{self, DirLines, JLine, Line, Tree};
+use crate::transport::{join, Result, Transport, WriteHandle};
 use crate::util::{now_micros, now_string};
+
+use super::moves::Index;
+
+pub const META: &str = ".kitchensync";
+
+/// How often a long run saves what it has learned so far.
+const CHECKPOINT: Duration = Duration::from_secs(300);
 
 pub struct Peer {
     pub index: usize,
@@ -16,11 +26,25 @@ pub struct Peer {
     /// Normalized URL of the winning connection (for diagnostics).
     pub url: String,
     pub transport: Arc<dyn Transport>,
-    /// Whether the sync root had a manifest at startup.
+    /// Whether the sync root had history at startup.
     pub had_history: bool,
+    /// The run's start timestamp: names this run's BAK folder and journal.
+    pub run: String,
+    pub dry_run: bool,
+    pub keep_del_days: u64,
+    pub history: History,
+    /// Files this peer holds or held, for finding moved files.
+    pub moves: Index,
+    journal: Mutex<Option<Box<dyn WriteHandle>>>,
+    /// Directories this run has already made (BAK parents), to skip the calls.
+    made: Mutex<HashSet<String>>,
 }
 
 impl Peer {
+    pub fn new(index: usize, role: Role, url: String, transport: Arc<dyn Transport>, had_history: bool, run: String, dry_run: bool, keep_del_days: u64, history: History) -> Peer {
+        Peer { index, role, url, transport, had_history, run, dry_run, keep_del_days, history, moves: Index::default(), journal: Mutex::new(None), made: Mutex::new(HashSet::new()) }
+    }
+
     pub fn is_canon(&self) -> bool {
         self.role == Role::Canon
     }
@@ -31,6 +55,110 @@ impl Peer {
     /// command-line position as a lower-case base-36 digit (1-9, then a-z).
     pub fn tag(&self) -> char {
         peer_tag(self.index)
+    }
+    pub fn t(&self) -> &dyn Transport {
+        self.transport.as_ref()
+    }
+
+    /// Append one change to this run's journal, opening it on first use.
+    pub fn journal(&self, op: char, path: &str, other: Option<&str>, byte_size: Option<i64>, mod_time: Option<i64>) {
+        if self.dry_run {
+            return;
+        }
+        let line = JLine { ts: now_micros(), op, path: path.to_string(), other: other.map(str::to_string), byte_size, mod_time }.format();
+        let mut g = self.journal.lock().unwrap();
+        if g.is_none() {
+            match self.t().open_write(&journal_path(&self.run)) {
+                Ok(w) => *g = Some(w),
+                Err(e) => {
+                    output::error(&format!("journal write failed for {}: {}", self.url, e));
+                    return;
+                }
+            }
+        }
+        if let Err(e) = g.as_mut().unwrap().write_all(line.as_bytes()) {
+            output::error(&format!("journal write failed for {}: {}", self.url, e));
+        }
+    }
+
+    pub fn close_journal(&self) {
+        if let Some(w) = self.journal.lock().unwrap().take() {
+            if let Err(e) = w.close() {
+                output::error(&format!("journal write failed for {}: {}", self.url, e));
+            }
+        }
+    }
+
+    /// Create a directory (and parents) once per run.
+    pub fn ensure_dir(&self, path: &str) -> Result<()> {
+        if self.made.lock().unwrap().contains(path) {
+            return Ok(());
+        }
+        self.t().create_dir(path)?;
+        self.made.lock().unwrap().insert(path.to_string());
+        Ok(())
+    }
+
+    /// Move `from` to BAK as the entry at `rel` (specs/state.md, "BAK") and
+    /// return where it went. Writes no journal line; the caller does.
+    pub fn move_to_bak(&self, from: &str, rel: &str) -> Result<String> {
+        let to = bak_path(&self.run, rel);
+        self.ensure_dir(crate::util::parent_path(&to))?;
+        match self.t().rename(from, &to) {
+            Ok(()) => Ok(to),
+            Err(e) => {
+                // Taken already in this run: use a fresh timestamp instead.
+                if self.t().stat(&to).is_err() {
+                    return Err(e);
+                }
+                let to = bak_path(&now_string(), rel);
+                self.ensure_dir(crate::util::parent_path(&to))?;
+                self.t().rename(from, &to)?;
+                Ok(to)
+            }
+        }
+    }
+
+    /// Write the state file if it changed (specs/state.md, "Writing").
+    pub fn write_state(&self) {
+        if self.dry_run {
+            return;
+        }
+        let _one = self.history.write_lock.lock().unwrap();
+        let cutoff = now_micros() - (self.keep_del_days as i64) * 86_400 * 1_000_000;
+        let (body, nested) = {
+            let mut g = self.history.inner.lock().unwrap();
+            g.last_write = Instant::now();
+            let body = state::serialize_body(&g.tree, cutoff, "");
+            if body == g.written_body {
+                return;
+            }
+            let nested: Vec<(String, String)> = g.nested.iter().map(|d| (d.clone(), state::serialize_body(&g.tree, cutoff, d))).collect();
+            (body, nested)
+        };
+        let now = now_micros();
+        match replace_meta_file(self.t(), "", state::STATE, &state::with_header(now, &body)) {
+            Ok(()) => self.history.inner.lock().unwrap().written_body = body,
+            Err(e) => {
+                output::error(&format!("state write failed for {}: {}", self.url, e));
+                note_failure();
+                return;
+            }
+        }
+        for (dir, body) in nested {
+            if let Err(e) = replace_meta_file(self.t(), &dir, state::STATE, &state::with_header(now, &body)) {
+                output::error(&format!("state write failed for {} at {}: {}", self.url, dir, e));
+                note_failure();
+            }
+        }
+    }
+
+    /// Save progress during a long run.
+    fn checkpoint(&self) {
+        let due = self.history.inner.lock().unwrap().last_write.elapsed() >= CHECKPOINT;
+        if due {
+            self.write_state();
+        }
     }
 }
 
@@ -43,10 +171,21 @@ pub fn peer_tag(index: usize) -> char {
     }
 }
 
-pub const META: &str = ".kitchensync";
+pub fn meta(path: &str) -> String {
+    join(META, path)
+}
 
-pub fn manifest_path(dir: &str) -> String {
-    join(&join(dir, META), manifest::NAME)
+pub fn bak_path(stamp: &str, rel: &str) -> String {
+    meta(&format!("BAK/{stamp}/{rel}"))
+}
+
+pub fn journal_path(stamp: &str) -> String {
+    meta(&format!("journal/{stamp}.txt"))
+}
+
+/// Whether `path` lies inside the root's BAK.
+pub fn in_bak(path: &str) -> bool {
+    path.starts_with(".kitchensync/BAK/")
 }
 
 /// Global count of failures that turn `sync complete` into exit code 2.
@@ -56,47 +195,160 @@ pub fn note_failure() {
     FAILURES.fetch_add(1, Ordering::SeqCst);
 }
 
-struct Inner {
-    lines: BTreeMap<String, Line>,
-    original: String,
-    outstanding: usize,
-    decided: bool,
-    written: bool,
+/// A peer's lines for the whole tree, held in memory for the run.
+pub struct History {
+    inner: Mutex<HistInner>,
+    write_lock: Mutex<()>,
 }
 
-/// One directory's manifest on one peer, updated as decisions are made and
-/// written once the directory is decided and its copies have finished.
+struct HistInner {
+    tree: Tree,
+    /// When the file this was read from was written.
+    written: Option<i64>,
+    /// The entry lines as last written (or read), to skip unchanged writes.
+    written_body: String,
+    /// Nested sync roots found during the run, rewritten at the end.
+    nested: Vec<String>,
+    last_write: Instant,
+}
+
+fn under(dir: &str, prefix: &str) -> bool {
+    prefix.is_empty() || dir == prefix || dir.strip_prefix(prefix).is_some_and(|r| r.starts_with('/'))
+}
+
+impl History {
+    pub fn new(text: Option<&str>, keep_del_days: u64) -> History {
+        let (written, tree) = text.map(state::parse_state).unwrap_or_default();
+        let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
+        let written_body = if text.is_some() { state::serialize_body(&tree, cutoff, "") } else { String::new() };
+        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), last_write: Instant::now() }), write_lock: Mutex::new(()) }
+    }
+
+    /// The lines for `dir`'s children.
+    pub fn dir_lines(&self, dir: &str) -> DirLines {
+        self.inner.lock().unwrap().tree.get(dir).cloned().unwrap_or_default()
+    }
+
+    pub fn line(&self, path: &str) -> Option<Line> {
+        let g = self.inner.lock().unwrap();
+        g.tree.get(crate::util::parent_path(path))?.get(crate::util::basename(path)).cloned()
+    }
+
+    pub fn has_dir_lines(&self, dir: &str) -> bool {
+        self.inner.lock().unwrap().tree.get(dir).is_some_and(|l| !l.is_empty())
+    }
+
+    /// Replace one directory's lines.
+    pub fn settle(&self, dir: &str, lines: DirLines) {
+        let mut g = self.inner.lock().unwrap();
+        if lines.is_empty() {
+            g.tree.remove(dir);
+        } else {
+            g.tree.insert(dir.to_string(), lines);
+        }
+    }
+
+    /// Forget everything beneath `path` (it no longer exists on this peer).
+    pub fn drop_subtree(&self, path: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.tree.retain(|dir, _| !under(dir, path));
+    }
+
+    /// Drop the line for `path` and everything beneath it.
+    pub fn forget(&self, path: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let (dir, name) = (crate::util::parent_path(path), crate::util::basename(path));
+        if let Some(lines) = g.tree.get_mut(dir) {
+            lines.remove(name);
+        }
+        g.tree.retain(|d, _| !under(d, path));
+    }
+
+    pub fn set_line(&self, path: &str, line: Line) {
+        let mut g = self.inner.lock().unwrap();
+        g.tree.entry(crate::util::parent_path(path).to_string()).or_default().insert(crate::util::basename(path).to_string(), line);
+    }
+
+    /// Every live file line beneath `path`: (relative path, size, mod_time).
+    pub fn files_under(&self, path: &str) -> Vec<(String, i64, i64)> {
+        let g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (dir, lines) in g.tree.iter().filter(|(dir, _)| under(dir, path)) {
+            for (name, l) in lines {
+                if !l.is_dir && l.deleted_time.is_none() {
+                    out.push((join(dir, name), l.byte_size, l.mod_time));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every live file line of at least `min` bytes.
+    pub fn all_files(&self, min: i64) -> Vec<(String, i64, i64)> {
+        let g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (dir, lines) in &g.tree {
+            for (name, l) in lines {
+                if !l.is_dir && l.deleted_time.is_none() && l.byte_size >= min {
+                    out.push((join(dir, name), l.byte_size, l.mod_time));
+                }
+            }
+        }
+        out
+    }
+
+    /// A nested sync root at `dir` (specs/state.md, "Nested sync roots"):
+    /// use its lines when its file is newer than ours, and keep it current.
+    pub fn nested_root(&self, dir: &str, text: &str) {
+        let (written, sub) = state::parse_state(text);
+        let mut g = self.inner.lock().unwrap();
+        if !g.nested.iter().any(|d| d == dir) {
+            g.nested.push(dir.to_string());
+        }
+        let has_ours = g.tree.keys().any(|d| under(d, dir));
+        if has_ours && written <= g.written {
+            return;
+        }
+        g.tree.retain(|d, _| !under(d, dir));
+        for (d, lines) in sub {
+            g.tree.insert(join(dir, &d), lines);
+        }
+    }
+}
+
+struct Inner {
+    lines: DirLines,
+    original: DirLines,
+    outstanding: usize,
+    decided: bool,
+    settled: bool,
+}
+
+/// One directory's lines on one peer, updated as decisions are made and
+/// settled into the peer's history once the directory is decided and its
+/// copies have finished (specs/multi-tree-sync.md, "State Updates").
 pub struct DirState {
     pub peer: Arc<Peer>,
     pub dir: String,
-    dry_run: bool,
-    keep_del_days: u64,
     inner: Mutex<Inner>,
 }
 
 impl DirState {
-    pub fn new(peer: Arc<Peer>, dir: &str, original: Option<String>, dry_run: bool, keep_del_days: u64) -> Arc<DirState> {
-        let lines = original.as_deref().map(manifest::parse).unwrap_or_default();
-        Arc::new(DirState {
-            peer,
-            dir: dir.to_string(),
-            dry_run,
-            keep_del_days,
-            inner: Mutex::new(Inner { lines, original: original.unwrap_or_default(), outstanding: 0, decided: false, written: false }),
-        })
+    /// `original` is what the history holds for the directory when it
+    /// differs from `lines` (lines read from a per-directory manifest).
+    pub fn new(peer: Arc<Peer>, dir: &str, lines: DirLines, original: Option<DirLines>) -> Arc<DirState> {
+        let original = original.unwrap_or_else(|| lines.clone());
+        Arc::new(DirState { peer, dir: dir.to_string(), inner: Mutex::new(Inner { original, lines, outstanding: 0, decided: false, settled: false }) })
     }
 
     pub fn get(&self, name: &str) -> Option<Line> {
         self.inner.lock().unwrap().lines.get(name).cloned()
     }
 
-    /// Entry confirmed present by a listing. `placed` survives only when the
-    /// entry is unchanged since KitchenSync put it there.
-    ///
-    /// An unchanged entry keeps its line as it is, `last_seen` included, so
-    /// that a directory where nothing changed is not rewritten (see
-    /// multi-tree-sync.md, "Manifest Updates"). `last_seen` is refreshed only
-    /// when it is not already later than the entry's own mod_time.
+    /// Entry confirmed present by a listing. An unchanged entry keeps its
+    /// line as it is, `last_seen` included, so that an unchanged tree leaves
+    /// the state as it was. `last_seen` is refreshed only when it is not
+    /// already later than the entry's own mod_time.
     pub fn confirm_present(&self, name: &str, is_dir: bool, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
         if let Some(l) = g.lines.get(name) {
@@ -107,180 +359,161 @@ impl DirState {
                 return;
             }
         }
-        let kept = g.lines.get(name).filter(|l| l.deleted_time.is_none() && (is_dir || ((l.mod_time - mod_time).abs() <= 5_000_000 && l.byte_size == byte_size)));
-        // `origin` belongs to `placed`: kept with it, dropped with it.
-        let (placed, origin) = kept.map(|l| (l.placed, l.origin.clone().filter(|_| l.placed.is_some()))).unwrap_or((None, None));
-        g.lines.insert(name.to_string(), Line { is_dir, mod_time, byte_size, last_seen: Some(now_micros()), deleted_time: None, placed, origin });
+        g.lines.insert(name.to_string(), Line { is_dir, mod_time, byte_size, last_seen: Some(now_micros()), deleted_time: None });
     }
 
     /// A directory KitchenSync just created here.
     pub fn created_dir(&self, name: &str) {
-        let mut g = self.inner.lock().unwrap();
         let now = now_micros();
-        g.lines.insert(name.to_string(), Line { is_dir: true, mod_time: now, byte_size: -1, last_seen: Some(now), deleted_time: None, placed: Some(now), origin: None });
+        self.inner.lock().unwrap().lines.insert(name.to_string(), Line { is_dir: true, mod_time: now, byte_size: -1, last_seen: Some(now), deleted_time: None });
     }
 
     /// Decision "push to this peer": intended state without `last_seen`.
     pub fn intend_push(&self, name: &str, mod_time: i64, byte_size: i64) {
         let mut g = self.inner.lock().unwrap();
         let last_seen = g.lines.get(name).and_then(|l| l.last_seen);
-        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen, deleted_time: None, placed: None, origin: None });
+        g.lines.insert(name.to_string(), Line { is_dir: false, mod_time, byte_size, last_seen, deleted_time: None });
         g.outstanding += 1;
     }
 
-    /// A queued copy finished (successfully or not). `origin` is the BAK
-    /// path of a reused file, None for a transfer.
-    pub fn copy_finished(self: &Arc<Self>, name: &str, ok: bool, origin: Option<String>) {
-        let write = {
+    /// A queued copy finished (successfully or not).
+    pub fn copy_finished(&self, name: &str, ok: bool) {
+        let settle = {
             let mut g = self.inner.lock().unwrap();
             if ok {
                 if let Some(l) = g.lines.get_mut(name) {
-                    let now = now_micros();
-                    l.last_seen = Some(now);
+                    l.last_seen = Some(now_micros());
                     l.deleted_time = None;
-                    l.placed = Some(now);
-                    l.origin = origin;
                 }
             }
             g.outstanding -= 1;
             g.outstanding == 0 && g.decided
         };
-        if write {
-            self.write();
+        if settle {
+            self.settle();
         }
     }
 
     /// Entry confirmed absent or displaced: tombstone with the line's own
-    /// `last_seen`, or a fresh timestamp when it never had one.
+    /// `last_seen`, or a fresh timestamp when it never had one. A directory's
+    /// lines beneath it go.
     pub fn confirm_absent(&self, name: &str) {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(l) = g.lines.get_mut(name) {
-            if l.deleted_time.is_none() {
-                l.deleted_time = Some(l.last_seen.unwrap_or_else(now_micros));
+        let was_dir = {
+            let mut g = self.inner.lock().unwrap();
+            match g.lines.get_mut(name) {
+                Some(l) => {
+                    if l.deleted_time.is_none() {
+                        l.deleted_time = Some(l.last_seen.unwrap_or_else(now_micros));
+                    }
+                    l.is_dir
+                }
+                None => false,
             }
+        };
+        if was_dir {
+            self.peer.history.drop_subtree(&join(&self.dir, name));
         }
     }
 
-    /// All entries in this directory are decided; write once copies finish.
-    pub fn finish_deciding(self: &Arc<Self>) {
-        let write = {
+    /// All entries in this directory are decided; settle once copies finish.
+    pub fn finish_deciding(&self) {
+        let settle = {
             let mut g = self.inner.lock().unwrap();
             g.decided = true;
             g.outstanding == 0
         };
-        if write {
-            self.write();
+        if settle {
+            self.settle();
         }
     }
 
-    fn write(&self) {
-        if self.dry_run {
-            return;
-        }
-        let text = {
+    fn settle(&self) {
+        let lines = {
             let mut g = self.inner.lock().unwrap();
-            if g.written {
+            if g.settled {
                 return;
             }
-            g.written = true;
-            let cutoff = now_micros() - (self.keep_del_days as i64) * 86_400 * 1_000_000;
-            let text = manifest::serialize(&g.lines, cutoff);
-            if text == g.original {
+            g.settled = true;
+            if g.lines == g.original {
                 return;
             }
-            text
+            g.lines.clone()
         };
-        if let Err(e) = write_manifest(self.peer.transport.as_ref(), &self.dir, &text) {
-            output::error(&format!("manifest write failed for {} at {}: {}", self.peer.url, self.dir, e));
-            note_failure();
-        }
+        self.peer.history.settle(&self.dir, lines);
+        self.peer.checkpoint();
     }
-}
-
-/// Write `.new`, move live to `.old`, rename `.new` in, archive `.old` to BAK.
-pub fn write_manifest(t: &dyn Transport, dir: &str, text: &str) -> crate::transport::Result<()> {
-    replace_meta_file(t, dir, manifest::NAME, text, true)
 }
 
 pub const RUNS: &str = "runs.txt";
 
 /// Append one line to `<root>/.kitchensync/runs.txt` (kept to the last 1000).
-pub fn append_run(t: &dyn Transport, line: &str) -> crate::transport::Result<()> {
-    let path = join(META, RUNS);
+pub fn append_run(t: &dyn Transport, line: &str) -> Result<()> {
+    let path = meta(RUNS);
     let mut text = read_text(t, &path)?.unwrap_or_default();
     text.push_str(line);
     text.push('\n');
     let lines: Vec<&str> = text.lines().collect();
     let keep = if lines.len() > 1000 { &lines[lines.len() - 1000..] } else { &lines[..] };
     let text = keep.join("\n") + "\n";
-    replace_meta_file(t, "", RUNS, &text, false)
+    replace_meta_file(t, "", RUNS, &text)
 }
 
 /// Start timestamp of the newest run recorded at the root, if any.
 pub fn last_run_start(t: &dyn Transport) -> Option<i64> {
-    let text = read_text(t, &join(META, RUNS)).ok()??;
+    let text = read_text(t, &meta(RUNS)).ok()??;
     text.lines().rev().find_map(|l| crate::util::parse_time(l.split('\t').next()?))
 }
 
-/// Replace `<dir>/.kitchensync/<name>` without renaming over a live file.
-fn replace_meta_file(t: &dyn Transport, dir: &str, name: &str, text: &str, archive: bool) -> crate::transport::Result<()> {
+/// Replace `<dir>/.kitchensync/<name>` without renaming over a live file:
+/// write `.new`, move live to `.old`, rename `.new` in, delete `.old`.
+pub fn replace_meta_file(t: &dyn Transport, dir: &str, name: &str, text: &str) -> Result<()> {
     let live = join(&join(dir, META), name);
     let new = format!("{live}.new");
     let old = format!("{live}.old");
     let mut w = t.open_write(&new)?;
     w.write_all(text.as_bytes())?;
     w.close()?;
-    let has_live = match t.stat(&live) {
-        Ok(_) => true,
-        Err(e) if e.is_not_found() => false,
-        Err(e) => return Err(e),
-    };
+    let has_live = exists(t, &live)?;
     if has_live {
         t.rename(&live, &old)?;
     }
     t.rename(&new, &live)?;
     if has_live {
-        if archive {
-            archive_old_manifest(t, dir, &old)?;
-        } else {
-            t.delete_file(&old)?;
-        }
+        t.delete_file(&old)?;
     }
     Ok(())
 }
 
-fn archive_old_manifest(t: &dyn Transport, dir: &str, old: &str) -> crate::transport::Result<()> {
-    let bak = join(&join(dir, META), &format!("BAK/{}", now_string()));
-    t.create_dir(&bak)?;
-    t.rename(old, &join(&bak, manifest::NAME))
-}
-
-/// Repair an interrupted manifest replacement (specs/manifest.md, "Writing").
-pub fn recover_manifest(t: &dyn Transport, dir: &str) -> crate::transport::Result<()> {
-    let live = manifest_path(dir);
-    let new = format!("{live}.new");
-    let old = format!("{live}.old");
-    let ex = |p: &str| match t.stat(p) {
+fn exists(t: &dyn Transport, p: &str) -> Result<bool> {
+    match t.stat(p) {
         Ok(_) => Ok(true),
         Err(e) if e.is_not_found() => Ok(false),
         Err(e) => Err(e),
-    };
-    let has_old = ex(&old)?;
-    if !has_old && !ex(&new)? {
+    }
+}
+
+/// Repair an interrupted replacement of `<root>/.kitchensync/<name>`
+/// (specs/state.md, "Writing").
+pub fn recover_meta_file(t: &dyn Transport, name: &str) -> Result<()> {
+    let live = meta(name);
+    let new = format!("{live}.new");
+    let old = format!("{live}.old");
+    let has_old = exists(t, &old)?;
+    let has_new = exists(t, &new)?;
+    if !has_old && !has_new {
         return Ok(());
     }
-    let has_new = ex(&new)?;
-    let has_live = ex(&live)?;
+    let has_live = exists(t, &live)?;
     match (has_old, has_new, has_live) {
         (true, _, true) => {
             if has_new {
                 t.delete_file(&new)?;
             }
-            archive_old_manifest(t, dir, &old)?;
+            t.delete_file(&old)?;
         }
         (true, true, false) => {
             t.rename(&new, &live)?;
-            archive_old_manifest(t, dir, &old)?;
+            t.delete_file(&old)?;
         }
         (true, false, false) => t.rename(&old, &live)?,
         (false, true, true) => t.delete_file(&new)?,
@@ -290,17 +523,13 @@ pub fn recover_manifest(t: &dyn Transport, dir: &str) -> crate::transport::Resul
     Ok(())
 }
 
-/// Read a directory's manifest text, or None when it does not exist.
-pub fn read_manifest(t: &dyn Transport, dir: &str) -> crate::transport::Result<Option<String>> {
-    read_text(t, &manifest_path(dir))
-}
-
 /// Read `<root>/.kitchensync/ignore`, or None when absent.
-pub fn read_ignore(t: &dyn Transport) -> crate::transport::Result<Option<String>> {
-    read_text(t, &join(META, "ignore"))
+pub fn read_ignore(t: &dyn Transport) -> Result<Option<String>> {
+    read_text(t, &meta("ignore"))
 }
 
-fn read_text(t: &dyn Transport, path: &str) -> crate::transport::Result<Option<String>> {
+/// Read a whole text file, or None when it does not exist.
+pub fn read_text(t: &dyn Transport, path: &str) -> Result<Option<String>> {
     let mut r = match t.open_read(path) {
         Ok(r) => r,
         Err(e) if e.is_not_found() => return Ok(None),

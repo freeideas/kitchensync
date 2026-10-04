@@ -2,8 +2,8 @@
 
 mod copy;
 mod fsops;
+mod moves;
 mod peer;
-mod reuse;
 mod rollback;
 mod walk;
 
@@ -12,11 +12,12 @@ use std::sync::Arc;
 
 use crate::config::{Config, Mode, PeerSpec, Role, Scheme};
 use crate::output;
-use crate::transport::{Transport, TransportError};
+use crate::state;
+use crate::transport::{join, Transport, TransportError};
 
 use copy::CopyQueue;
 use fsops::PeerRef;
-use peer::{Peer, FAILURES};
+use peer::{meta, History, Peer, FAILURES};
 
 const FIRST_SYNC_MSG: &str = "first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative";
 const NO_CONTRIBUTING_MSG: &str = "No contributing peer reachable - cannot make sync decisions";
@@ -34,30 +35,76 @@ pub fn run(cfg: Config) -> i32 {
         handles.into_iter().map(|h| h.join().unwrap_or(None)).collect()
     });
 
+    let run_start = crate::util::now_string();
     let mut peers: Vec<PeerRef> = Vec::new();
     for (index, (spec, conn)) in cfg.peers.iter().zip(connected).enumerate() {
         let Some((url, transport)) = conn else { continue };
-        if create_roots {
-            if let Err(e) = peer::recover_manifest(transport.as_ref(), "") {
-                output::error(&format!("peer unreachable: {}: {}", url, e));
-                continue;
-            }
+        match open_peer(cfg, index, spec.role, url.clone(), transport, &run_start) {
+            Ok(p) => peers.push(Arc::new(p)),
+            Err(e) => output::error(&format!("peer unreachable: {}: {}", url, e)),
         }
-        let had_history = match transport.stat(&peer::manifest_path("")) {
-            Ok(_) => true,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => {
-                output::error(&format!("peer unreachable: {}: {}", url, e));
-                continue;
-            }
-        };
-        peers.push(Arc::new(Peer { index, role: spec.role, url, transport, had_history }));
     }
 
     match cfg.mode {
         Mode::Sync => run_sync(cfg, peers),
         Mode::Rollback(ts) => rollback::run(cfg, &peers, Some(ts)),
         Mode::Undo => rollback::run(cfg, &peers, None),
+    }
+}
+
+/// Startup 5 for one peer: repair, then read its history into memory
+/// (specs/sync.md, "Startup"; specs/state.md, "Reading").
+fn open_peer(cfg: &Config, index: usize, role: Role, url: String, transport: Arc<dyn Transport>, run: &str) -> Result<Peer, TransportError> {
+    let t = transport.as_ref();
+    if !cfg.dry_run {
+        peer::recover_meta_file(t, state::STATE)?;
+        peer::recover_meta_file(t, peer::RUNS)?;
+    }
+    // A dry run repairs nothing, so it reads what a repair would keep.
+    let names: &[&str] = if cfg.dry_run { &["state.txt", "state.txt.new", "state.txt.old"] } else { &["state.txt"] };
+    let mut text = None;
+    for n in names {
+        text = peer::read_text(t, &meta(n))?;
+        if text.is_some() {
+            break;
+        }
+    }
+    let manifest = match text {
+        Some(_) => None,
+        None => peer::read_text(t, &meta(state::LEGACY_MANIFEST))?,
+    };
+    let history = History::new(text.as_deref(), cfg.keep_del_days);
+    if let Some(m) = &manifest {
+        history.settle("", state::parse_manifest(m));
+    }
+    let had_history = text.is_some() || manifest.is_some();
+    let p = Peer::new(index, role, url, transport, had_history, run.to_string(), cfg.dry_run, cfg.keep_del_days, history);
+    if !cfg.dry_run && cfg.mode == Mode::Sync {
+        fsops::cleanup_root(&p, cfg.keep_bak_days);
+    }
+    Ok(p)
+}
+
+/// Fill a peer's move index: its large live files, and the files its
+/// journals say are in BAK (specs/sync.md, "Moved Files").
+fn index_moves(p: &Peer) {
+    for (path, size, mt) in p.history.all_files(moves::MOVE_MIN) {
+        p.moves.add(path, size, mt);
+    }
+    let dir = meta("journal");
+    let Ok(entries) = p.t().list_dir(&dir) else { return };
+    let mut lines: Vec<state::JLine> = Vec::new();
+    for e in entries.iter().filter(|e| !e.is_dir) {
+        if let Ok(Some(text)) = peer::read_text(p.t(), &join(&dir, &e.name)) {
+            lines.extend(state::parse_journal(&text));
+        }
+    }
+    let moved_out: std::collections::HashSet<&str> = lines.iter().filter(|l| l.op == 'M').filter_map(|l| l.other.as_deref()).collect();
+    for l in &lines {
+        let (Some(other), Some(size), Some(mt)) = (&l.other, l.byte_size, l.mod_time) else { continue };
+        if (l.op == 'X' || l.op == 'B') && !moved_out.contains(other.as_str()) {
+            p.moves.add(other.clone(), size, mt);
+        }
     }
 }
 
@@ -90,7 +137,7 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         return 1;
     }
 
-    let run_start = crate::util::now_string();
+    let run_start = peers[0].run.clone();
     let list: Vec<String> = peers.iter().map(|p| quote(&p.url)).collect();
     if !cfg.dry_run {
         output::info(&format!("undo later with: kitchensync --rollback {} {}", run_start, list.join(" ")));
@@ -103,7 +150,10 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
     }
 
     // Run 1-3: walk and wait for copies.
-    let queue = CopyQueue::new(cfg.parallel, cfg.retries_copy);
+    for p in &peers {
+        index_moves(p);
+    }
+    let queue = CopyQueue::new(cfg.parallel, cfg.retries_copy, peers.clone());
     let workers = queue.start_workers();
     let walker = walk::Walker { cfg: cfg.clone(), queue: Arc::clone(&queue), ignore: build_ignore(cfg, &peers), prefetch: walk::Prefetch::new() };
     std::thread::scope(|s| {
@@ -113,13 +163,17 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         walker.sync_directory(&peers, "", &Default::default());
         walker.prefetch.stop();
     });
-    // Every displacement is known now: find the files inside displaced
-    // directories, then let the held copies run.
-    for p in queue.held_peers() {
-        queue.reuse.expand(p.index, p.transport.as_ref());
-    }
-    queue.release_held();
     queue.close_and_wait(workers);
+    for p in &peers {
+        p.write_state();
+        p.close_journal();
+        if !cfg.dry_run {
+            // The root's own per-directory manifest is now in the state file.
+            for n in ["manifest.txt", "manifest.txt.new", "manifest.txt.old"] {
+                let _ = p.t().delete_file(&meta(n));
+            }
+        }
+    }
 
     finish("sync complete")
 }

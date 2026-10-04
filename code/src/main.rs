@@ -2,7 +2,7 @@ mod cli;
 mod config;
 mod engine;
 mod ignore;
-mod manifest;
+mod state;
 mod output;
 mod transport;
 mod util;

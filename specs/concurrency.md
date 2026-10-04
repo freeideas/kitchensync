@@ -9,7 +9,7 @@ KitchenSync limits total file-copy work, not connections. By default, at most
 against this limit whether it is `file://` to `file://`, `file://` to `sftp://`,
 `sftp://` to `file://`, or `sftp://` to `sftp://`.
 
-Directory listing, manifest reads and writes, directory creation, and BAK/SWAP
+Directory listing, state and journal writes, directory creation, and BAK/SWAP
 cleanup do not count as file copies. They may still run concurrently where the
 sync algorithm requires it, but they must not allow more than `--parallel` active
 file-copy operations.
@@ -17,8 +17,8 @@ file-copy operations.
 Copying is incremental. KitchenSync does not first scan the whole tree and then
 start a copy phase. As soon as traversal finds copy work in an early directory,
 that work may occupy available copy slots while later directories are still
-being scanned. Copies of files of 1 MiB or more are the exception: they are held
-until the walk ends so that they can reuse a displaced file (see sync.md,
+being scanned. No copy waits for the walk to end, including a copy that turns
+out to be a move of a file the destination already holds (see sync.md,
 "Reusing A Displaced File").
 
 There is no per-peer, per-host, or per-connection transfer limit in the user
@@ -89,8 +89,7 @@ listing error for that subtree. A later transfer failure is a transfer failure.
 During multi-tree traversal, directory listings for all reachable peers at each
 directory level must be issued concurrently, not sequentially. The
 implementation starts listing operations for every reachable peer at that
-directory level before awaiting any listing result. A peer's listing and the
-read of that directory's manifest are likewise issued together.
+directory level before awaiting any listing result.
 
 Listings are also fetched ahead of the walk. A small pool of listing threads
 (8) works through the directories the walk has not reached yet, in the walk's
@@ -98,15 +97,17 @@ own order, and keeps a bounded number of finished listings (64) ready for it.
 As soon as a listing lands, the subdirectories it shows are queued too, on the
 peers that list them, so even a deep chain of single subdirectories is fetched
 ahead. A listing is mostly waiting on round trips, so overlapping them hides
-latency: on a tree of many small directories over SFTP this made the walk
-about ten times faster. Listing and manifest reading are read-only, so running
-them ahead of the walk's decisions is safe; the walk uses a ready listing only
+latency, which matters most on a tree of many small directories over SFTP.
+Listing makes no decisions, so running it ahead of the walk is safe (the SWAP
+recovery and per-directory conversion it may do touch only what an earlier
+run left behind, see multi-tree-sync.md, "Reading A Directory"); the walk uses a
+ready listing only
 if it was taken on exactly the peers the walk wants for that directory, and
 lists the directory itself otherwise (a directory the walk created on a peer,
 or a peer it dropped after a failure). Anything fetched for a directory the
 walk has passed is discarded. The order in which entries are decided and acted
-on, and the order of the progress lines, are unchanged: only listing and
-manifest reading run ahead, never decisions, copies, or displacements.
+on, and the order of the progress lines, are unchanged: only listing runs
+ahead, never decisions, copies, or displacements.
 
 An `sftp://` peer is served over several SFTP channels (4) on its one SSH
 connection, because OpenSSH answers each channel from its own single-threaded
@@ -168,8 +169,8 @@ and a `-` subordinate peer, so it does not change with the peer's role.
   peer in `<dsts>`, one digit per receiving peer. One line per path, regardless
   of how many peers receive it.
 - `M<peer> <relpath>` - instead of being copied to that peer, the file is
-  being moved into place from a file displaced on the same peer in this run
-  (see sync.md, "Reusing A Displaced File"). One line per receiving peer.
+  being moved into place from elsewhere on the same peer (see sync.md, "Moved
+  Files"). One line per receiving peer.
 - `X<peers> <relpath>` - the path is being deleted (displaced to BAK/) on each
   peer in `<peers>`. One line per path. Files and directories use the same
   letter.
@@ -181,16 +182,16 @@ and a `-` subordinate peer, so it does not change with the peer's role.
   unchanged tree does not look hung. It is printed at most once per 30 seconds
   of silence, and never when other lines are flowing.
 
-A held copy (a file of 1 MiB or more, see "Copy Concurrency") prints nothing
-when the walk decides it. When it starts after the walk, it prints
-`<src>C<dst> <relpath>` for a transfer or `M<dst> <relpath>` for a reuse, one
-line per receiving peer. In a dry run nothing is held: every copy prints its
-`C` line when it is decided.
+A copy of a file of 1 MiB or more prints nothing when the walk decides it.
+When it takes its copy slot, it prints `<src>C<dst> <relpath>` for a transfer
+or `M<dst> <relpath>` for a move, one line per receiving peer. In a dry run
+every copy prints its line when it is decided: `M<dst>` for a likely move, and
+`<src>C<dsts>` otherwise.
 
 A type conflict prints an `X` line for the directory being displaced followed
 by the `C` line for the file replacing it.
 
-No line is emitted for directory creation, listing, manifest work, or BAK
+No line is emitted for directory creation, listing, state work, or BAK
 cleanup. These lines are `info`-level. Errors and the final `sync complete`
 message are separate output and remain visible.
 
