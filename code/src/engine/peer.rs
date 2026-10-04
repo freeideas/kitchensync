@@ -264,7 +264,9 @@ impl History {
     pub fn new(text: Option<&str>, keep_del_days: u64) -> History {
         let (written, tree) = text.map(state::parse_state).unwrap_or_default();
         let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
-        let written_body = if text.is_some() { state::serialize_body(&tree, cutoff, "") } else { String::new() };
+        // An older format counts as changed, so the next write upgrades it.
+        let current = text.is_some_and(|t| state::version(t) == state::FORMAT);
+        let written_body = if current { state::serialize_body(&tree, cutoff, "") } else { String::new() };
         History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), outer: None }), write_lock: Mutex::new(()) }
     }
 
@@ -273,7 +275,7 @@ impl History {
     pub fn from_ancestor(text: &str, prefix: &str, keep_del_days: u64) -> History {
         let (written, outer) = state::parse_state(text);
         let cutoff = now_micros() - (keep_del_days as i64) * 86_400 * 1_000_000;
-        let written_body = state::serialize_body(&outer, cutoff, "");
+        let written_body = if state::version(text) == state::FORMAT { state::serialize_body(&outer, cutoff, "") } else { String::new() };
         let mut tree = Tree::new();
         for (d, lines) in outer.iter().filter(|(d, _)| under(d, prefix)) {
             let rel = if d == prefix { String::new() } else { d[prefix.len() + 1..].to_string() };

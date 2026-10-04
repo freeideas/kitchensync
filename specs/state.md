@@ -44,7 +44,7 @@ The lines for a directory's direct children are that directory's history on this
 
 ### Format version
 
-The state and every journal declare the format they are written in, currently `2`. Format 1 kept the whole state uncompressed in `state.txt`; it is still read, and the next write replaces it with format 2. A journal's format is unchanged from 1 to 2. A KitchenSync that finds a newer format than it reads does not guess: a sync treats that peer as unreachable, with an error line naming the format; a nested root with a newer format is left out of the run's history and not written; and a rollback skips that peer and counts a failure. A peer in an older layout is converted when a run first meets it, as the per-directory layout is (see "Per-directory manifests").
+The state and every journal declare the format they are written in, currently `2`. Format 1 kept the whole state uncompressed in `state.txt`; it is still read, and the end of the next normal run rewrites it in format 2 even when nothing else changed. A journal's format is unchanged from 1 to 2. A KitchenSync that finds a newer format than it reads does not guess: a sync treats that peer as unreachable, with an error line naming the format; a nested root with a newer format is left out of the run's history and not written; and a rollback skips that peer and counts a failure. A peer in an older layout is converted when a run first meets it, as the per-directory layout is (see "Per-directory manifests").
 
 ### Reading
 
