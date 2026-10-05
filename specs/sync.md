@@ -265,7 +265,7 @@ For each reachable peer, KitchenSync applies the rollback procedure in state.md 
 
 ### Run Log
 
-Every normal (non-dry-run) sync appends one line to `<root>/.kitchensync/runs.txt` on each reachable peer, right after printing the rollback hint and before any peer changes: the run's start timestamp, a tab, and the peers as shown in the hint. The file is replaced through the same write-new, move-old, rename-in sequence as `state.txt` and is trimmed to its last 1000 lines. It is per sync root: syncing `/X/b/c` and later `/X/b` produces a log in each. Rollback and dry runs do not write to it.
+Every normal (non-dry-run) sync appends one line to the `runs.txt` beside the peer's state (`<root>/.kitchensync/runs.txt`, or the ancestor's when the state is kept there; see state.md, "Syncing part of a tree") on each reachable peer, right after printing the rollback hint and before any peer changes: the run's start timestamp, a tab, and the peers as shown in the hint. The file is replaced through the same write-new, move-old, rename-in sequence as `state.txt` and is trimmed to its last 1000 lines. A run log of an absorbed nested root is merged into it (see state.md, "Nested sync roots"). Rollback and dry runs do not write to it.
 
 Progress output follows the usual verbosity rules (suppressed at `error`):
 

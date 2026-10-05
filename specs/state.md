@@ -90,7 +90,16 @@ A rollback started at the sync root finds the same ancestor and undoes the journ
 
 ### Nested sync roots
 
-A folder that has a state of its own (written when it was synced as a root while no ancestor had one) is a nested sync root. When the walk lists a directory below the root and the listing shows a `.kitchensync` folder there holding `state.txt`, that directory is a nested sync root. If its state was written later than the outer root's, its lines replace the outer state's lines for that subtree on that peer (with the nested directory's path prefixed). At the end of the run, the outer run writes the nested root's state too, with the run's lines for that subtree, so both roots stay current. A nested root's `journal/`, `BAK/` and `runs.txt` belong to it and are left alone.
+A folder below the sync root that has a state of its own is a nested sync root: it was synced as a root at a time when nothing above it had a state. The walk finds it when a listing shows a `.kitchensync` folder holding `state.txt`. If its state was written later than the state this run reads from (or this run's has no lines for that subtree), its lines replace this run's lines for the subtree, with the nested folder's path prefixed.
+
+A normal run then absorbs the nested root, so that every record of the tree is kept in one place and a later sync of the subfolder takes its history from above (see "Syncing part of a tree"):
+
+- each of its journals is rewritten into the journal of the same name where this peer's state is kept, with every path given the nested folder's path, and a `BAK/<ts>/<path>` path becoming `BAK/<ts>/<folder>/<path>`;
+- each entry of its `BAK/<ts>/` moves to `BAK/<ts>/<folder>/` there, operating-system litter aside;
+- its run log is merged into the run log there, in time order;
+- once this peer's state has been written with the subtree's lines, its `state.txt` and `state.gz` are deleted, and its `.kitchensync` folder if that leaves it empty.
+
+A run stopped before its state is written leaves the nested state in place, and the next run absorbs it again. A nested root's own `.kitchensync/ignore` stays where it is, since it applies whenever that folder is synced as the root. A dry run absorbs nothing. A nested state in a newer format than this KitchenSync reads is left alone and not used.
 
 ### Per-directory manifests
 

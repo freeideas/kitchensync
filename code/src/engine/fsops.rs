@@ -246,6 +246,112 @@ pub fn convert_meta(peer: &Peer, dir: &str) {
     let _ = delete_litter_dir(t, &meta);
 }
 
+/// Absorb the nested sync root at `dir` into the folder that holds this
+/// peer's state (specs/state.md, "Nested sync roots"): its journals and BAK
+/// move there with paths rewritten, and its run log is merged. Its state is
+/// deleted later, by `drop_absorbed_state`, once the peer's state is written.
+pub fn absorb_meta(peer: &Peer, dir: &str) {
+    // Listing threads may meet several nested roots at once; their run logs
+    // and journals merge into the same files.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let t = peer.t();
+    let meta = meta_dir(dir);
+    let home = join(&peer.prefix, dir);
+    let fail = |what: &str, e: &dyn std::fmt::Display| output::error(&format!("absorbing {} on {}: {}: {}", meta, peer.url, what, e));
+    // A path in the nested root's terms, in the terms of the state's folder.
+    let rebase = |p: &str| -> String {
+        match p.strip_prefix(".kitchensync/BAK/") {
+            Some(rest) => {
+                let (stamp, below) = rest.split_once('/').unwrap_or((rest, ""));
+                format!(".kitchensync/BAK/{stamp}/{}", join(&home, below))
+            }
+            None => join(&home, p),
+        }
+    };
+    let journals = join(&meta, "journal");
+    if let Ok(files) = t.list_dir(&journals) {
+        for f in files.iter().filter(|f| !f.is_dir && !is_litter(f)) {
+            let from = join(&journals, &f.name);
+            let text = match super::peer::read_text(t, &from) {
+                Ok(Some(text)) => text,
+                Ok(None) => continue,
+                Err(e) => {
+                    fail("reading a journal", &e);
+                    continue;
+                }
+            };
+            let target = format!("journal/{}", f.name);
+            let mut out = match super::peer::read_text(t, &peer.meta_at(&target)) {
+                Ok(Some(existing)) => existing,
+                Ok(None) => crate::state::journal_header(),
+                Err(e) => {
+                    fail("reading a journal", &e);
+                    continue;
+                }
+            };
+            for mut l in crate::state::parse_journal(&text) {
+                l.path = rebase(&l.path);
+                l.other = l.other.as_deref().map(rebase);
+                out.push_str(&l.format());
+            }
+            let written = super::peer::replace_meta_file(t, &peer.up, &target, out.as_bytes()).and_then(|_| t.delete_file(&from));
+            if let Err(e) = written {
+                fail("moving a journal", &e);
+            }
+        }
+        let _ = delete_litter_dir(t, &journals);
+    }
+    let bak = join(&meta, "BAK");
+    if let Ok(stamps) = t.list_dir(&bak) {
+        for s in stamps.iter().filter(|s| s.is_dir) {
+            let from_dir = join(&bak, &s.name);
+            let Ok(items) = t.list_dir(&from_dir) else { continue };
+            let kept: Vec<&Entry> = items.iter().filter(|e| !is_litter(e)).collect();
+            let to_dir = peer.meta_at(&format!("BAK/{}/{}", s.name, home));
+            if !kept.is_empty() {
+                if let Err(e) = peer.ensure_dir(&to_dir) {
+                    fail("making BAK folder", &e);
+                    continue;
+                }
+            }
+            for it in kept {
+                if let Err(e) = t.rename(&join(&from_dir, &it.name), &join(&to_dir, &it.name)) {
+                    fail("moving BAK entry", &e);
+                }
+            }
+            let _ = delete_litter_dir(t, &from_dir);
+        }
+        let _ = delete_litter_dir(t, &bak);
+    }
+    let runs = join(&meta, super::peer::RUNS);
+    match super::peer::read_text(t, &runs) {
+        Ok(Some(text)) => {
+            if let Err(e) = peer.merge_runs(&text).and_then(|_| t.delete_file(&runs)) {
+                fail("merging the run log", &e);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => fail("reading the run log", &e),
+    }
+    peer.absorbed.lock().unwrap().push(dir.to_string());
+}
+
+/// Delete the state of the nested roots this run absorbed, now that the
+/// peer's own state holds their lines, and their `.kitchensync` if empty.
+pub fn drop_absorbed_state(peer: &Peer) {
+    let t = peer.t();
+    for dir in std::mem::take(&mut *peer.absorbed.lock().unwrap()) {
+        let meta = meta_dir(&dir);
+        for base in [crate::state::STATE_GZ, crate::state::STATE] {
+            for sfx in [".new", ".old", ""] {
+                let _ = t.delete_file(&join(&meta, &format!("{base}{sfx}")));
+            }
+        }
+        let _ = delete_litter_dir(t, &meta);
+    }
+}
+
 /// Whether a file reads as a manifest: every line that is not blank parses.
 fn is_manifest(t: &dyn Transport, path: &str) -> bool {
     match super::peer::read_text(t, path) {

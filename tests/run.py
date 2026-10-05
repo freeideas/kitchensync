@@ -489,9 +489,22 @@ def s12(tmp: Path) -> None:
 
     merged = merged_bak_files(peer_b / "b")
     expect(merged == {"c/one.txt": b"one\n"}, f"files in {peer_b / 'b'}'s BAK: {merged}")
-    nested = gzip.decompress((peer_b / "b" / "c" / ".kitchensync" / "state.gz").read_bytes()).decode()
-    live = [line for line in nested.splitlines() if line.startswith("one.txt\t") and line.endswith("\t-")]
-    expect(not live, f"{peer_b / 'b' / 'c'}'s state still lists one.txt as live: {nested!r}")
+    for peer in (peer_a, peer_b):
+        meta = peer / "b" / ".kitchensync"
+        expect(not (peer / "b" / "c" / ".kitchensync").exists(), f"{peer}/b/c/.kitchensync should have been absorbed")
+        state_text = gzip.decompress((meta / "state.gz").read_bytes()).decode()
+        expect("c/one.txt\t" in state_text, f"{meta}: state lacks c/one.txt: {state_text!r}")
+        runs = (meta / "runs.txt").read_text().splitlines()
+        expect(len(runs) == 2, f"{meta}/runs.txt should hold both runs: {runs!r}")
+    journals = "".join(j.read_text() for j in (peer_b / "b" / ".kitchensync" / "journal").iterdir())
+    expect("\tC\tc/one.txt\t" in journals, f"the first run's journal should be absorbed in root terms: {journals!r}")
+    undo = run_ks(["--dry-run", "--verbosity", "info", "--undo", str(peer_b / "b")], tmp)
+    lines = undo.stdout.decode().splitlines()
+    expect(undo.returncode == 0 and lines[0] == "dry run" and lines[-1] == "rollback complete", f"undo output: {lines!r}")
+    expect(sorted(lines[1:-1]) == ["R1 c/one.txt", "X1 two.txt"], f"undo should put one.txt back and take two.txt away: {lines!r}")
+    again = run_ks(["--verbosity", "error", str(peer_a / "b" / "c"), str(peer_b / "b" / "c")], tmp)
+    assert_result(again, b"sync complete\n")
+    expect(not (peer_b / "b" / "c" / ".kitchensync").exists(), "a subfolder sync after absorption keeps its history above")
 
 
 def s13(tmp: Path) -> None:

@@ -153,7 +153,9 @@ Setup:
 
 Action: run `released/kitchensync.exe --verbosity error A/b B/b`.
 
-Outcome: the process exits 0. stdout is exactly `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`. stderr is empty. `B/b/two.txt` exists with bytes `two\n`. `B/b/c/one.txt` does not exist: the deletion under `c` was found in `c`'s own state, which the earlier run wrote. The files in `B/b`'s BAK are exactly `c/one.txt` with bytes `one\n`. The state at `B/b/c/.kitchensync/` (`state.gz`) no longer lists `one.txt` as live. The notice on the first line appears because the new sync root `b` has no state, even though `c` does.
+Outcome: the process exits 0. stdout is exactly `first sync: no history found, merging both ways (nothing will be deleted); use + to make one peer authoritative\nsync complete\n`. stderr is empty. `B/b/two.txt` exists with bytes `two\n`. `B/b/c/one.txt` does not exist: the deletion under `c` was found in `c`'s own state, which the earlier run wrote. The files in `B/b`'s BAK are exactly `c/one.txt` with bytes `one\n`. The notice on the first line appears because the new sync root `b` has no state, even though `c` does.
+
+The run absorbed `c`'s records into `b`'s, on both peers: neither `A/b/c` nor `B/b/c` holds a `.kitchensync` folder any more; the state at `b` lists `c/one.txt`; `b`'s run log holds both runs; and `b`'s journal holds the first run's copy of `one.txt` as a `C` line for `c/one.txt`. `released/kitchensync.exe --dry-run --verbosity info --undo B/b` then prints `dry run`, then the two lines `R1 c/one.txt` and `X1 two.txt` in either order (they undo actions of the same run that finished in either order), then `rollback complete`. A later `released/kitchensync.exe --verbosity error A/b/c B/b/c` prints exactly `sync complete` and leaves `B/b/c` without a `.kitchensync` folder: its history is now kept at `b`.
 
 ## S-13: Undo Reverts A First-Sync Merge
 

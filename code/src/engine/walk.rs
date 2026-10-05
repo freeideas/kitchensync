@@ -179,7 +179,13 @@ impl Walker {
                 let meta = fsops::meta_dir(dir);
                 if m.state {
                     match peer::read_state(t, dir, self.cfg.dry_run) {
-                        Ok(Some(text)) => p.history.nested_root(dir, &text),
+                        // A normal run moves the nested root's records into
+                        // this peer's own (specs/state.md, "Nested sync roots").
+                        Ok(Some(text)) => {
+                            if p.history.nested_root(dir, &text) && !dry {
+                                fsops::absorb_meta(p, dir);
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => return failed("state read", &e),
                     }

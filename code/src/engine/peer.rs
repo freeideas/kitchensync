@@ -46,11 +46,14 @@ pub struct Peer {
     /// The sync root's path relative to that ancestor ("" for the root).
     /// The state, journal and BAK use paths relative to the ancestor.
     pub prefix: String,
+    /// Nested sync roots this run absorbed; their own state is deleted once
+    /// this peer's state has been written (specs/state.md, "Nested sync roots").
+    pub absorbed: Mutex<Vec<String>>,
 }
 
 impl Peer {
     pub fn new(index: usize, role: Role, url: String, transport: Arc<dyn Transport>, had_history: bool, run: String, dry_run: bool, keep_del_days: u64, history: History) -> Peer {
-        Peer { index, role, url, transport, had_history, run, dry_run, keep_del_days, history, moves: Index::default(), journal: Mutex::new(None), made: Mutex::new(HashSet::new()), up: String::new(), prefix: String::new() }
+        Peer { index, role, url, transport, had_history, run, dry_run, keep_del_days, history, moves: Index::default(), journal: Mutex::new(None), made: Mutex::new(HashSet::new()), up: String::new(), prefix: String::new(), absorbed: Mutex::new(Vec::new()) }
     }
 
     /// A path inside the `.kitchensync` folder that holds this peer's state.
@@ -162,14 +165,15 @@ impl Peer {
         }
     }
 
-    /// Write the state file if it changed (specs/state.md, "Writing").
-    pub fn write_state(&self) {
+    /// Write the state if it changed (specs/state.md, "Writing"). Returns
+    /// whether the state on disk now holds this run's lines.
+    pub fn write_state(&self) -> bool {
         if self.dry_run {
-            return;
+            return false;
         }
         let _one = self.history.write_lock.lock().unwrap();
         let cutoff = now_micros() - (self.keep_del_days as i64) * 86_400 * 1_000_000;
-        let (body, nested) = {
+        let body = {
             let g = self.history.inner.lock().unwrap();
             let body = match &g.outer {
                 // Part of a larger tree: our lines replace that subtree's.
@@ -183,26 +187,33 @@ impl Peer {
                 None => state::serialize_body(&g.tree, cutoff, ""),
             };
             if body == g.written_body {
-                return;
+                return true;
             }
-            let nested: Vec<(String, String)> = g.nested.iter().map(|d| (d.clone(), state::serialize_body(&g.tree, cutoff, d))).collect();
-            (body, nested)
+            body
         };
-        let now = now_micros();
-        match write_state_files(self.t(), &self.up, now, &body) {
-            Ok(()) => self.history.inner.lock().unwrap().written_body = body,
+        match write_state_files(self.t(), &self.up, now_micros(), &body) {
+            Ok(()) => {
+                self.history.inner.lock().unwrap().written_body = body;
+                true
+            }
             Err(e) => {
                 output::error(&format!("state write failed for {}: {}", self.url, e));
                 note_failure();
-                return;
+                false
             }
         }
-        for (dir, body) in nested {
-            if let Err(e) = write_state_files(self.t(), &dir, now, &body) {
-                output::error(&format!("state write failed for {} at {}: {}", self.url, dir, e));
-                note_failure();
-            }
-        }
+    }
+
+    /// Merge run-log lines into this peer's run log, oldest first.
+    pub fn merge_runs(&self, text: &str) -> Result<()> {
+        let path = self.meta_at(RUNS);
+        let mut lines: Vec<String> = read_text(self.t(), &path)?.unwrap_or_default().lines().map(str::to_string).collect();
+        lines.extend(text.lines().map(str::to_string));
+        lines.retain(|l| !l.trim().is_empty());
+        lines.sort();
+        lines.dedup();
+        let keep = if lines.len() > 1000 { &lines[lines.len() - 1000..] } else { &lines[..] };
+        replace_meta_file(self.t(), &self.up, RUNS, (keep.join("\n") + "\n").as_bytes())
     }
 
 }
@@ -249,8 +260,6 @@ struct HistInner {
     written: Option<i64>,
     /// The entry lines as last written (or read), to skip unchanged writes.
     written_body: String,
-    /// Nested sync roots found during the run, rewritten at the end.
-    nested: Vec<String>,
     /// The ancestor's whole tree, when this root takes its history from an
     /// ancestor; `tree` is then that tree's subtree, rebased here.
     outer: Option<Tree>,
@@ -267,7 +276,7 @@ impl History {
         // An older format counts as changed, so the next write upgrades it.
         let current = text.is_some_and(|t| state::version(t) == state::FORMAT);
         let written_body = if current { state::serialize_body(&tree, cutoff, "") } else { String::new() };
-        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), outer: None }), write_lock: Mutex::new(()) }
+        History { inner: Mutex::new(HistInner { tree, written, written_body, outer: None }), write_lock: Mutex::new(()) }
     }
 
     /// History taken from an ancestor's state: the subtree at `prefix`,
@@ -281,7 +290,7 @@ impl History {
             let rel = if d == prefix { String::new() } else { d[prefix.len() + 1..].to_string() };
             tree.insert(rel, lines.clone());
         }
-        History { inner: Mutex::new(HistInner { tree, written, written_body, nested: Vec::new(), outer: Some(outer) }), write_lock: Mutex::new(()) }
+        History { inner: Mutex::new(HistInner { tree, written, written_body, outer: Some(outer) }), write_lock: Mutex::new(()) }
     }
 
     /// The lines for `dir`'s children.
@@ -358,25 +367,24 @@ impl History {
     }
 
     /// A nested sync root at `dir` (specs/state.md, "Nested sync roots"):
-    /// use its lines when its file is newer than ours, and keep it current.
-    pub fn nested_root(&self, dir: &str, text: &str) {
+    /// use its lines when its state is newer than ours. Returns false when
+    /// its format is newer than this KitchenSync reads (it is then left alone).
+    pub fn nested_root(&self, dir: &str, text: &str) -> bool {
         if state::version(text) > state::FORMAT {
             output::error(&format!("{dir}/.kitchensync/state.txt has a newer format than this KitchenSync reads; its history is not used"));
-            return;
+            return false;
         }
         let (written, sub) = state::parse_state(text);
         let mut g = self.inner.lock().unwrap();
-        if !g.nested.iter().any(|d| d == dir) {
-            g.nested.push(dir.to_string());
-        }
         let has_ours = g.tree.keys().any(|d| under(d, dir));
         if has_ours && written <= g.written {
-            return;
+            return true;
         }
         g.tree.retain(|d, _| !under(d, dir));
         for (d, lines) in sub {
             g.tree.insert(join(dir, &d), lines);
         }
+        true
     }
 }
 

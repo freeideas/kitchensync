@@ -218,7 +218,9 @@ fn run_sync(cfg: &Config, mut peers: Vec<PeerRef>) -> i32 {
         done.1.notify_all();
     });
     for p in &peers {
-        p.write_state();
+        if p.write_state() {
+            fsops::drop_absorbed_state(p);
+        }
         p.close_journal();
         // The root's own per-directory manifest is now in the state file,
         // once that file is there.
