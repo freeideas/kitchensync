@@ -40,6 +40,7 @@ Options:
   --retries-list N   Give up listing after this many tries (default: 3)
   --timeout-conn N   SSH handshake timeout in seconds (default: 30)
   --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)
+  --sftp-only        List remote peers over SFTP alone; run no program on them
   --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)
   --rollback TS      Roll the given peers back to timestamp TS, then exit
   --undo             Roll the given peers back to just before their newest run
@@ -83,6 +84,11 @@ pub fn parse(args: &[String]) -> Parsed {
 
         if a == "--dry-run" {
             cfg.dry_run = true;
+            i += 1;
+            continue;
+        }
+        if a == "--sftp-only" {
+            cfg.sftp_only = true;
             i += 1;
             continue;
         }
@@ -642,6 +648,18 @@ mod tests {
                 assert_eq!(cfg.peers[1].urls[0].path, "/tmp/b");
                 assert_eq!(cfg.peers[1].urls[1].path, "/tmp/c");
             }
+            other => panic!("expected Run, got {:?}", debug_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn sftp_only_flag() {
+        match parse(&args(&["/tmp/a", "/tmp/b"])) {
+            Parsed::Run(cfg) => assert!(!cfg.sftp_only),
+            other => panic!("expected Run, got {:?}", debug_kind(&other)),
+        }
+        match parse(&args(&["--sftp-only", "/tmp/a", "/tmp/b"])) {
+            Parsed::Run(cfg) => assert!(cfg.sftp_only),
             other => panic!("expected Run, got {:?}", debug_kind(&other)),
         }
     }

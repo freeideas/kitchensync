@@ -37,6 +37,7 @@ Options:
   --retries-list N   Give up listing after this many tries (default: 3)
   --timeout-conn N   SSH handshake timeout in seconds (default: 30)
   --timeout-idle N   SFTP idle keep-alive TTL in seconds (default: 30)
+  --sftp-only        List remote peers over SFTP alone; run no program on them
   --verbosity LEVEL  Verbosity: error, info, debug, trace (default: info)
   --rollback TS      Roll the given peers back to timestamp TS, then exit
   --undo             Roll the given peers back to just before their newest run

@@ -110,4 +110,4 @@ copy-slots active=<n>/<max>
 
 These events describe global active copy slots, not network connections.
 
-At `trace`, each `sftp://` peer also reports its whole-tree listing (see sync.md, "Listing A Whole Tree"): `whole-tree listing of <root> by <program>: <n> directories in <ms> ms` when it arrives, or `whole-tree listing of <root> unavailable; listing over SFTP`.
+At `trace`, each `sftp://` peer also reports its whole-tree listing (see sync.md, "Listing A Whole Tree"): `whole-tree listing of <root> by <program>: <n> directories in <ms> ms` when it arrives, or `whole-tree listing of <root> unavailable; listing over SFTP`. With `--sftp-only` no whole-tree listing is asked for, so neither line appears.

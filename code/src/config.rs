@@ -60,6 +60,8 @@ pub struct Config {
     pub retries_list: u32,
     pub timeout_conn: u64,
     pub timeout_idle: u64,
+    /// List `sftp://` peers over SFTP alone, without the whole-tree lister.
+    pub sftp_only: bool,
     pub verbosity: Verbosity,
     /// Patterns from `-x`, in command-line order (applied after built-ins and peer ignore files).
     pub ignore: crate::ignore::IgnoreSet,
@@ -78,6 +80,7 @@ impl Default for Config {
             retries_list: 3,
             timeout_conn: 30,
             timeout_idle: 30,
+            sftp_only: false,
             verbosity: Verbosity::Info,
             ignore: crate::ignore::IgnoreSet::new(),
             keep_bak_days: 90,
